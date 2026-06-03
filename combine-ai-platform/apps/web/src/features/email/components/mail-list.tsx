@@ -25,11 +25,12 @@ interface Conversation {
 interface MailListProps {
   folder?: string
   inboxId?: string
+  department?: string
   onSelectConversation: (id: string) => void
   selectedId?: string | null
 }
 
-export function MailList({ folder = "inbox", inboxId, onSelectConversation, selectedId }: MailListProps) {
+export function MailList({ folder = "inbox", inboxId, department, onSelectConversation, selectedId }: MailListProps) {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState("")
@@ -38,14 +39,19 @@ export function MailList({ folder = "inbox", inboxId, onSelectConversation, sele
   const loadConversations = useCallback(async () => {
     setLoading(true)
     try {
-      const data = await listConversations({ folder, inboxId, q: search || undefined })
+      const data = await listConversations({
+        folder,
+        inboxId,
+        department,
+        q: search || undefined,
+      })
       setConversations(data)
     } catch (err) {
       console.error("Failed to load conversations:", err)
     } finally {
       setLoading(false)
     }
-  }, [folder, inboxId, search])
+  }, [folder, inboxId, department, search])
 
   useEffect(() => {
     loadConversations()
