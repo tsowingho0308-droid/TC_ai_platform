@@ -1,8 +1,25 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
+import { generateEmbedding } from "@combine-ai/ai-provider"
 
 export const dynamic = "force-dynamic"
+
+/**
+ * Check if pgvector extension is available in the current database.
+ */
+async function checkPgVector(): Promise<boolean> {
+  try {
+    const result = await prisma.$queryRaw<Array<{ available: boolean }>>`
+      SELECT EXISTS(
+        SELECT 1 FROM pg_type WHERE typname = 'vector'
+      ) as available
+    `
+    return result[0]?.available ?? false
+  } catch {
+    return false
+  }
+}
 
 async function callAI(req: {
   model?: string
@@ -82,48 +99,130 @@ export async function POST(request: NextRequest) {
           return NextResponse.json({ error: "question required" }, { status: 400 })
         }
 
-        // Search knowledge base articles
-        const where: Record<string, unknown> = {
-          workspaceId: session.workspaceId,
-          OR: [
-            { title: { contains: question } },
-            { content: { contains: question } },
-          ],
-        }
+        // Search knowledge base articles using vector search (with keyword fallback)
+        const vectorAvailable = await checkPgVector()
 
-        // Filter by department knowledge base if specified
-        if (department && department !== "GENERAL") {
-          where.knowledgeBase = {
-            department: department as string,
+        let articles: Array<{
+          id: string
+          title: string
+          content: string
+          knowledgeBaseName: string
+          knowledgeBaseSlug: string
+          department: string
+          similarity?: number
+        }> = []
+
+        if (vectorAvailable) {
+          try {
+            const embedding = await generateEmbedding(question)
+
+            let deptFilter = ""
+            if (department && department !== "GENERAL") {
+              deptFilter = `AND kb.department = '${department}'`
+            }
+
+            const rawResults = await prisma.$queryRaw<Array<{
+              article_id: string
+              title: string
+              content: string
+              kb_name: string
+              kb_slug: string
+              department: string
+              similarity: number
+            }>>`
+              SELECT DISTINCT ON (ka.id)
+                ka.id as article_id,
+                ka.title,
+                ka.content,
+                kb.name as kb_name,
+                kb.slug as kb_slug,
+                kb.department,
+                1 - (kc.embedding <=> ${embedding}::vector) as similarity
+              FROM "KnowledgeChunk" kc
+              JOIN "KnowledgeArticle" ka ON ka.id = kc.article_id
+              JOIN "KnowledgeBase" kb ON kb.id = ka.knowledge_base_id
+              WHERE kb.workspace_id = ${session.workspaceId}
+              ORDER BY ka.id, kc.embedding <=> ${embedding}::vector
+              LIMIT 5
+            `
+
+            articles = rawResults.map((r) => ({
+              id: r.article_id,
+              title: r.title,
+              content: r.content,
+              knowledgeBaseName: r.kb_name,
+              knowledgeBaseSlug: r.kb_slug,
+              department: r.department,
+              similarity: Math.round(r.similarity * 100) / 100,
+            }))
+          } catch (err) {
+            console.warn("Vector search failed, falling back to keyword search:", err)
           }
         }
 
-        const articles = await prisma.knowledgeArticle.findMany({
-          where,
-          take: 5,
-          orderBy: { updatedAt: "desc" },
-        })
+        // Fallback to keyword search if vector unavailable or failed
+        if (articles.length === 0) {
+          const where: Record<string, unknown> = {
+            workspaceId: session.workspaceId,
+            OR: [
+              { title: { contains: question } },
+              { content: { contains: question } },
+            ],
+          }
 
-        // Also try broader search if no results
-        let allArticles = articles
-        if (allArticles.length === 0 && department && department !== "GENERAL") {
-          allArticles = await prisma.knowledgeArticle.findMany({
-            where: {
-              OR: [
-                { title: { contains: question } },
-                { content: { contains: question } },
-              ],
-            },
+          if (department && department !== "GENERAL") {
+            where.knowledgeBase = {
+              department: department as string,
+            }
+          }
+
+          const articleResults = await prisma.knowledgeArticle.findMany({
+            where,
             take: 5,
             orderBy: { updatedAt: "desc" },
+            include: {
+              knowledgeBase: {
+                select: { name: true, slug: true, department: true },
+              },
+            },
           })
+
+          // Also try broader search if no results
+          let allArticles = articleResults
+          if (allArticles.length === 0 && department && department !== "GENERAL") {
+            allArticles = await prisma.knowledgeArticle.findMany({
+              where: {
+                knowledgeBase: { workspaceId: session.workspaceId },
+                OR: [
+                  { title: { contains: question } },
+                  { content: { contains: question } },
+                ],
+              },
+              take: 5,
+              orderBy: { updatedAt: "desc" },
+              include: {
+                knowledgeBase: {
+                  select: { name: true, slug: true, department: true },
+                },
+              },
+            })
+          }
+
+          articles = allArticles.map((a) => ({
+            id: a.id,
+            title: a.title,
+            content: a.content,
+            knowledgeBaseName: a.knowledgeBase.name,
+            knowledgeBaseSlug: a.knowledgeBase.slug,
+            department: a.knowledgeBase.department,
+          }))
         }
 
-        // Build sources text
-        const sourcesText = allArticles.length > 0
-          ? allArticles.map((a, i) =>
-              `[Article ${i + 1}] Title: ${a.title}\nContent: ${a.content.slice(0, 1500)}`
-            ).join("\n\n")
+        // Build sources text using context articles from search
+        const sourcesText = articles.length > 0
+          ? articles.map((a, i) =>
+              `[Article ${i + 1}] Title: ${a.title}\nDepartment: ${a.department}\nContent: ${a.content.slice(0, 1500)}${a.similarity !== undefined ? `\nRelevance: ${Math.round(a.similarity * 100)}%` : ""}`
+            ).join("\n\n") + "\n\n---\nWhen answering, cite the article title(s) you used."
           : "No relevant policy documents found in the knowledge base."
 
         const prompt = QA_PROMPT
@@ -183,7 +282,7 @@ export async function POST(request: NextRequest) {
               kind: "HELPDESK_QA",
               status: "COMPLETED",
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              input: { question: question as string, department: department as string } as any,
+              input: { question: question as string, department: department as string, searchMethod: vectorAvailable ? "vector" : "keyword" } as any,
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               output: { ticketId: ticket.id, ...qaResult } as any,
             },

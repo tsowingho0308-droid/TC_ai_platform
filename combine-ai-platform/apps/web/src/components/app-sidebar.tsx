@@ -11,6 +11,7 @@ import {
   MessageCircleQuestion,
   GitBranch,
   LayoutDashboard,
+  BookOpen,
   ChevronLeft,
   type LucideIcon,
 } from "lucide-react"
@@ -22,6 +23,7 @@ import { TenderSidebarContent } from "@/features/tender/components/tender-sideba
 import { FinanceSidebarContent } from "@/features/finance/components/finance-sidebar-content"
 import { HelpdeskSidebarContent } from "@/features/helpdesk/components/helpdesk-sidebar-content"
 import { WorkflowSidebarContent } from "@/features/workflow/components/workflow-sidebar-content"
+import { ContextSidebarContent } from "@/features/context/components/context-sidebar-content"
 
 interface AgentNavItem {
   slug: string
@@ -38,6 +40,7 @@ const AGENTS: AgentNavItem[] = [
   { slug: "finance", name: "Finance Agent", nameZh: "財務代理", icon: Receipt, href: "/finance" },
   { slug: "helpdesk", name: "Helpdesk Agent", nameZh: "知識問答代理", icon: MessageCircleQuestion, href: "/helpdesk" },
   { slug: "workflow", name: "Workflow Agent", nameZh: "流程管理代理", icon: GitBranch, href: "/workflow" },
+  { slug: "context", name: "Context", nameZh: "知識庫管理", icon: BookOpen, href: "/context" },
 ]
 
 function getActiveAgent(pathname: string): string | null {
@@ -129,6 +132,7 @@ export function AppSidebar() {
           {activeAgent === "finance" && <FinanceSidebarContent />}
           {activeAgent === "helpdesk" && <HelpdeskSidebarContent />}
           {activeAgent === "workflow" && <WorkflowSidebarContent />}
+          {activeAgent === "context" && <ContextSidebarContent />}
           {!activeAgent && (
             <div className="px-4 py-6 text-center text-sm text-muted-foreground">
               Select an agent to get started

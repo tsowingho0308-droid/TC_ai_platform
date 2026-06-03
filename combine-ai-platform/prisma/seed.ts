@@ -1,4 +1,5 @@
 import { PrismaClient } from "@prisma/client"
+import { chunkText, generateEmbedding } from "../packages/ai-provider/src/index"
 
 const prisma = new PrismaClient()
 
@@ -182,6 +183,54 @@ async function main() {
         })
       }
     }
+  }
+
+  // Generate chunks and embeddings for articles (if API key is available)
+  const apiKey = process.env.LLM_API_KEY
+  console.log("  Generating chunks and embeddings...")
+
+  const allArticles = await prisma.knowledgeArticle.findMany()
+  let chunksCreated = 0
+  let embeddingsGenerated = 0
+
+  for (const article of allArticles) {
+    if (!article.content || article.content.trim().length === 0) continue
+
+    const chunks = chunkText(article.content)
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = await prisma.knowledgeChunk.create({
+        data: {
+          articleId: article.id,
+          content: chunks[i],
+          chunkIndex: i,
+          tokenCount: Math.ceil(chunks[i].length / 4),
+        },
+      })
+      chunksCreated++
+
+      // Generate embedding if API key is configured
+      if (apiKey) {
+        try {
+          const embedding = await generateEmbedding(chunks[i])
+          await prisma.$executeRaw`
+            UPDATE "KnowledgeChunk"
+            SET embedding = ${embedding}::vector
+            WHERE id = ${chunk.id}
+          `
+          embeddingsGenerated++
+        } catch (err) {
+          console.warn(`    Failed to embed chunk ${i} of article "${article.title}":`, err instanceof Error ? err.message : err)
+        }
+      }
+    }
+  }
+
+  if (!apiKey) {
+    console.log("  ⚠ LLM_API_KEY not set — skipping embedding generation")
+    console.log(`  ✓ ${chunksCreated} chunks created (no embeddings)`)
+  } else {
+    console.log(`  ✓ ${chunksCreated} chunks created, ${embeddingsGenerated} embeddings generated`)
   }
 
   // Seed default onboarding workflow template

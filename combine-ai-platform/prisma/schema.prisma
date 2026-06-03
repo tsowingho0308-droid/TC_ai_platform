@@ -763,6 +763,21 @@ model KnowledgeArticle {
   @@index([knowledgeBaseId, language])
 }
 
+model KnowledgeChunk {
+  id         String   @id @default(cuid())
+  articleId  String
+  content    String
+  chunkIndex Int
+  tokenCount Int?
+  createdAt  DateTime @default(now())
+  article    KnowledgeArticle @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  // embedding vector(1536) is managed via raw SQL migration (scripts/run-vector-migration.ts)
+
+  @@index([articleId])
+  @@index([articleId, chunkIndex])
+}
+
 model HelpdeskTicket {
   id              String               @id @default(cuid())
   workspaceId     String
