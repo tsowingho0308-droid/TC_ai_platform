@@ -759,6 +759,7 @@ model KnowledgeArticle {
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
   knowledgeBase   KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  chunks         KnowledgeChunk[]
 
   @@index([knowledgeBaseId, language])
 }

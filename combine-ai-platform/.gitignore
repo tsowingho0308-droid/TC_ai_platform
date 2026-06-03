@@ -32,7 +32,7 @@ Thumbs.db
 .turbo/
 
 # Prisma
-prisma/migrations/
+# (migrations are committed for team sync)
 
 # Logs
 *.log
