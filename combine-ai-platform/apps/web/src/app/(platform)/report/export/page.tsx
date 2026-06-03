@@ -2,18 +2,22 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
-import { ArrowLeft, Download, FileSpreadsheet } from "lucide-react"
+import { ArrowLeft, Download, FileSpreadsheet, Loader2 } from "lucide-react"
+import { cn } from "@combine-ai/shared-ui"
 
 interface ReportSession {
   id: string
   title: string
+  status: string
   updatedAt: string
+  rows?: Array<{ field: string; value: string }>
 }
 
 export default function BatchExportPage() {
   const [sessions, setSessions] = useState<ReportSession[]>([])
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(true)
+  const [exporting, setExporting] = useState(false)
 
   useEffect(() => {
     fetch("/api/report/sessions")
@@ -21,7 +25,7 @@ export default function BatchExportPage() {
       .then((data) => {
         if (data.sessions) setSessions(data.sessions)
       })
-      .catch(() => {})
+      .catch(console.error)
       .finally(() => setLoading(false))
   }, [])
 
@@ -42,6 +46,61 @@ export default function BatchExportPage() {
     }
   }
 
+  async function exportSelected() {
+    if (selected.size === 0) return
+
+    setExporting(true)
+    try {
+      // Collect all rows from selected sessions
+      const allRows: Array<{ field: string; value: string }> = []
+
+      for (const session of sessions) {
+        if (!selected.has(session.id)) continue
+
+        // Fetch full session data
+        const res = await fetch(`/api/report/sessions`)
+        const data = await res.json()
+        const fullSession = (data.sessions || []).find(
+          (s: ReportSession) => s.id === session.id
+        )
+
+        if (fullSession?.rows && Array.isArray(fullSession.rows)) {
+          // Add section header
+          allRows.push({ field: `=== ${session.title} ===`, value: "" })
+          for (const row of fullSession.rows) {
+            allRows.push(row)
+          }
+          allRows.push({ field: "", value: "" }) // spacer
+        }
+      }
+
+      if (allRows.length === 0) {
+        console.error("No data to export")
+        return
+      }
+
+      const res = await fetch("/api/report/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rows: allRows, format: "xlsx" }),
+      })
+
+      if (!res.ok) throw new Error("Export failed")
+
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = `batch-report-${Date.now()}.xlsx`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error("Batch export error:", err)
+    } finally {
+      setExporting(false)
+    }
+  }
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between border-b px-6 py-3">
@@ -52,11 +111,19 @@ export default function BatchExportPage() {
           <h1 className="text-lg font-semibold">Batch Export</h1>
         </div>
         <button
-          disabled={selected.size === 0}
-          className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-50"
+          disabled={selected.size === 0 || exporting}
+          onClick={exportSelected}
+          className={cn(
+            "inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
+            "disabled:opacity-50"
+          )}
         >
-          <Download className="h-4 w-4" />
-          Export Selected ({selected.size})
+          {exporting ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Download className="h-4 w-4" />
+          )}
+          {exporting ? "Exporting..." : `Export Selected (${selected.size})`}
         </button>
       </header>
 
@@ -72,6 +139,9 @@ export default function BatchExportPage() {
             <p className="mt-1 text-sm text-muted-foreground">
               Create report sessions first, then export them in batch.
             </p>
+            <Link href="/report" className="mt-4 text-sm text-primary hover:underline">
+              Go to Report Agent
+            </Link>
           </div>
         ) : (
           <div className="mx-auto max-w-2xl">
@@ -97,15 +167,31 @@ export default function BatchExportPage() {
                     type="checkbox"
                     checked={selected.has(session.id)}
                     onChange={() => toggleSession(session.id)}
-                    className="h-4 w-4 rounded border-primary"
+                    className="h-4 w-4 rounded border-primary accent-primary"
                   />
                   <FileSpreadsheet className="h-5 w-5 shrink-0 text-muted-foreground" />
                   <div className="flex-1 min-w-0">
                     <p className="truncate text-sm font-medium">{session.title}</p>
                     <p className="text-xs text-muted-foreground">
-                      {new Date(session.updatedAt).toLocaleDateString()}
+                      {new Date(session.updatedAt).toLocaleDateString("en-HK", {
+                        year: "numeric",
+                        month: "short",
+                        day: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
                     </p>
                   </div>
+                  <span
+                    className={cn(
+                      "rounded-full px-2 py-0.5 text-xs font-medium",
+                      session.status === "active"
+                        ? "bg-green-500/10 text-green-600"
+                        : "bg-muted text-muted-foreground"
+                    )}
+                  >
+                    {session.status || "active"}
+                  </span>
                 </label>
               ))}
             </div>

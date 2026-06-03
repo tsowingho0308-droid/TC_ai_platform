@@ -1,30 +1,69 @@
 import { NextResponse } from "next/server"
+import { requireSession } from "@/lib/server/auth-helpers"
+import * as XLSX from "xlsx"
+
+export const dynamic = "force-dynamic"
 
 export async function POST(request: Request) {
+  const session = await requireSession().catch(() => null)
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+
   try {
-    const { rows } = await request.json() as {
+    const { rows, format } = (await request.json()) as {
       rows?: Array<{ field: string; value: string }>
+      format?: "xlsx" | "csv"
     }
 
     if (!rows || rows.length === 0) {
       return NextResponse.json({ error: "No rows provided" }, { status: 400 })
     }
 
-    // Generate simple CSV (placeholder for full XLSX with SheetJS)
-    const header = "Field,Value"
-    const body = rows
-      .map((r) => `"${(r.field || "").replace(/"/g, '""')}","${(r.value || "").replace(/"/g, '""')}"`)
-      .join("\n")
-    const csv = `${header}\n${body}`
+    const exportFormat = format || "xlsx"
 
-    return new NextResponse(csv, {
+    // Build worksheet data: header row + data rows
+    const sheetData: string[][] = [["Field", "Value"]]
+    for (const row of rows) {
+      sheetData.push([row.field || "", row.value || ""])
+    }
+
+    if (exportFormat === "csv") {
+      const csv = sheetData
+        .map((r) => r.map((c) => `"${c.replace(/"/g, '""')}"`).join(","))
+        .join("\n")
+      const bom = "﻿"
+
+      return new NextResponse(bom + csv, {
+        headers: {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `attachment; filename="report-export-${Date.now()}.csv"`,
+        },
+      })
+    }
+
+    // Generate XLSX using SheetJS
+    const workbook = XLSX.utils.book_new()
+    const worksheet = XLSX.utils.aoa_to_sheet(sheetData)
+
+    // Set column widths
+    worksheet["!cols"] = [
+      { wch: 30 }, // Field column
+      { wch: 50 }, // Value column
+    ]
+
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Report")
+    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" })
+
+    return new NextResponse(buffer, {
       headers: {
-        "Content-Type": "text/csv",
-        "Content-Disposition": `attachment; filename="report-${Date.now()}.csv"`,
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": `attachment; filename="report-export-${Date.now()}.xlsx"`,
       },
     })
   } catch (error) {
     console.error("Export error:", error)
-    return NextResponse.json({ error: "Export failed" }, { status: 500 })
+    return NextResponse.json(
+      { error: "Export failed", detail: error instanceof Error ? error.message : "Unknown error" },
+      { status: 500 }
+    )
   }
 }
