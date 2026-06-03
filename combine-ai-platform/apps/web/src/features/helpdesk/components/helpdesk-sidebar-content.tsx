@@ -169,8 +169,15 @@ export function HelpdeskSidebarContent() {
         )}
       </div>
 
-      {/* Knowledge Base Management */}
-      <div className="mt-4 border-t pt-3">
+      {/* Quick Links */}
+      <div className="mt-4 border-t pt-3 space-y-0.5">
+        <Link
+          href="/helpdesk/tickets"
+          className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
+        >
+          <Ticket className="h-4 w-4" />
+          View All Tickets
+        </Link>
         <Link
           href="/helpdesk/knowledge"
           className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
