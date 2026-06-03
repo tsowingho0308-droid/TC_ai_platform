@@ -8,15 +8,25 @@ export async function GET() {
   const session = await requireSession().catch(() => null)
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
-  const folders = ["inbox", "starred", "sent", "drafts", "archive", "trash"] as const
-
+  const folderIds = ["inbox", "starred", "sent", "drafts", "archive", "trash"] as const
   const counts = await Promise.all(
-    folders.map(async (folderId) => {
+    folderIds.map(async (folderId) => {
+      if (folderId === "starred") {
+        const count = await prisma.conversation.count({
+          where: {
+            workspaceId: session.workspaceId,
+            parentConversationId: null,
+            starred: true,
+          },
+        })
+        return { id: folderId, count }
+      }
+
       const count = await prisma.conversation.count({
         where: {
           workspaceId: session.workspaceId,
-          folderId,
           parentConversationId: null,
+          folderId,
         },
       })
       return { id: folderId, count }

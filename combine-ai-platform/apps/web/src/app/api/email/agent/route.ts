@@ -12,7 +12,11 @@ async function callAI(req: CompletionRequest): Promise<CompletionResponse> {
   const model = req.model || process.env.LLM_MODEL || "Claude-Sonnet-4.5"
 
   if (!apiKey) {
-    throw new Error("LLM_API_KEY not configured. Set it in .env.local")
+    return {
+      messageContent: "",
+      toolCalls: [],
+      model,
+    }
   }
 
   const response = await fetch(`${apiUrl}/chat/completions`, {
@@ -97,6 +101,17 @@ Respond ONLY JSON:
 
 type SupportedDepartment = "commercial" | "it" | "hr"
 
+type ClassificationResult = {
+  workType: SupportedDepartment
+  summary: string
+  confidence: number
+  department: string
+}
+
+function normalizeText(value: string) {
+  return value.replace(/\s+/g, " ").trim()
+}
+
 function normalizeDepartment(value: string | undefined): SupportedDepartment {
   const raw = (value || "").toLowerCase().trim()
   if (raw === "it" || raw.includes("tech")) return "it"
@@ -114,12 +129,155 @@ function mapDepartmentToInboxSlug(department: SupportedDepartment): string {
   return "commercial"
 }
 
-function clampConfidence(value: unknown): number {
+function clampConfidence(value: unknown, fallback = 0.5): number {
   const n = typeof value === "number" ? value : Number(value)
-  if (Number.isNaN(n)) return 0.5
+  if (!Number.isFinite(n)) return fallback
   if (n < 0) return 0
   if (n > 1) return 1
   return n
+}
+
+function splitSentences(value: string) {
+  return value
+    .split(/[\n\r]+|(?<=[.!?])\s+/)
+    .map((part) => normalizeText(part))
+    .filter(Boolean)
+}
+
+function titleFromSentence(sentence: string) {
+  const cleaned = sentence.replace(/[?!.]+$/g, "").trim()
+  if (!cleaned) return "Customer inquiry"
+  if (cleaned.length <= 70) return cleaned
+  return `${cleaned.slice(0, 67).trimEnd()}...`
+}
+
+function scoreWorkType(text: string, keywords: string[]) {
+  const lower = text.toLowerCase()
+  return keywords.reduce((score, keyword) => score + (lower.includes(keyword) ? 1 : 0), 0)
+}
+
+function classifyWithRules(subject: string, body: string): ClassificationResult {
+  const text = `${subject}\n${body}`
+  const itScore = scoreWorkType(text, [
+    "bug",
+    "error",
+    "api",
+    "system",
+    "integration",
+    "login",
+    "password",
+    "software",
+    "technical",
+    "server",
+  ])
+  const hrScore = scoreWorkType(text, [
+    "leave",
+    "onboarding",
+    "salary",
+    "benefit",
+    "recruit",
+    "hiring",
+    "staff",
+    "policy",
+    "holiday",
+    "employee",
+  ])
+  const commercialScore = scoreWorkType(text, [
+    "quote",
+    "pricing",
+    "invoice",
+    "contract",
+    "purchase",
+    "procurement",
+    "tender",
+    "proposal",
+    "payment",
+    "business",
+  ])
+
+  const ranked: Array<{ type: SupportedDepartment; score: number; department: string }> = [
+    { type: "commercial", score: commercialScore, department: "Commercial" },
+    { type: "it", score: itScore, department: "IT Support" },
+    { type: "hr", score: hrScore, department: "Human Resources" },
+  ].sort((a, b) => b.score - a.score)
+
+  const best = ranked[0]
+  const second = ranked[1]
+  const confidence = best.score === 0 ? 0.55 : clampConfidence(0.65 + (best.score - second.score) * 0.08, 0.62)
+
+  return {
+    workType: best.type,
+    summary: normalizeText(`Customer inquiry routed to ${best.department}.`),
+    confidence,
+    department: best.department,
+  }
+}
+
+function routeSentenceToDepartment(sentence: string, defaultType: SupportedDepartment): SupportedDepartment {
+  const text = sentence.toLowerCase()
+  if (
+    /(bug|error|api|login|password|software|system|technical|server|integration)/.test(text)
+  ) {
+    return "it"
+  }
+  if (
+    /(leave|onboarding|salary|benefit|recruit|hiring|staff|policy|holiday|employee)/.test(text)
+  ) {
+    return "hr"
+  }
+  if (
+    /(quote|pricing|invoice|contract|purchase|procurement|tender|proposal|payment|business)/.test(text)
+  ) {
+    return "commercial"
+  }
+  return defaultType
+}
+
+function safeParseClassification(value: string): ClassificationResult | null {
+  try {
+    const parsed = JSON.parse(value) as {
+      workType?: string
+      summary?: string
+      confidence?: number
+      department?: string
+    }
+    const workType = normalizeWorkType(parsed.workType)
+    return {
+      workType,
+      summary: normalizeText(parsed.summary || `Customer inquiry routed to ${parsed.department || workType}.`),
+      confidence: clampConfidence(parsed.confidence, 0.6),
+      department: normalizeText(parsed.department || workType),
+    }
+  } catch {
+    return null
+  }
+}
+
+function buildFallbackTriagePlan(subject: string, body: string, fallbackType: SupportedDepartment) {
+  const sentences = splitSentences(body)
+  const candidateSentences = sentences
+    .filter((item) => item.includes("?") || item.length > 24)
+    .slice(0, 6)
+
+  const picked = (candidateSentences.length ? candidateSentences : [normalizeText(subject), normalizeText(body)])
+    .filter(Boolean)
+    .slice(0, 6)
+
+  return {
+    overallSummary: normalizeText(`Customer inquiry split into ${picked.length} department task(s).`),
+    primaryWorkType: fallbackType,
+    tasks: picked.map((sentence, index) => {
+      const department = routeSentenceToDepartment(sentence, fallbackType)
+      return {
+        title: titleFromSentence(sentence),
+        body: sentence,
+        department,
+        workType: department,
+        confidence: clampConfidence(0.58 + index * 0.03, 0.6),
+        quote: sentence,
+      }
+    }),
+  }
 }
 
 export async function POST(request: NextRequest) {
@@ -150,7 +308,7 @@ export async function POST(request: NextRequest) {
         const emailBody = conversation.messages[0]?.bodyText || conversation.messages[0]?.body || ""
         const subject = conversation.subject || ""
 
-        const result = await callAI({
+        const aiResult = await callAI({
           temperature: 0.3,
           maxTokens: 500,
           responseFormat: "json",
@@ -160,26 +318,19 @@ export async function POST(request: NextRequest) {
           ],
         })
 
-        const classification = JSON.parse(result.messageContent || "{}") as {
-          workType?: string
-          summary?: string
-          confidence?: number
-          department?: string
-        }
+        const classification = safeParseClassification(aiResult.messageContent) ?? classifyWithRules(subject, emailBody)
 
-        // Update conversation with classification
         await prisma.conversation.update({
           where: { id: conversationId },
           data: {
-            workType: classification.workType || null,
-            aiIntentSummary: classification.summary || null,
-            aiRouteConfidence: classification.confidence ?? null,
+            workType: classification.workType,
+            aiIntentSummary: classification.summary,
+            aiRouteConfidence: classification.confidence,
             aiTriagedAt: new Date(),
-            labels: classification.workType ? [classification.workType] : [],
+            labels: [classification.workType],
           },
         })
 
-        // Create an AgentRun record
         await prisma.agentRun.create({
           data: {
             workspaceId: session.workspaceId,
@@ -187,7 +338,10 @@ export async function POST(request: NextRequest) {
             kind: "TRIAGE",
             status: "COMPLETED",
             input: { subject, bodyPreview: emailBody.slice(0, 500) },
-            output: classification,
+            output: {
+              classification,
+              mode: aiResult.messageContent ? "llm" : "rule-only",
+            },
           },
         })
 
@@ -223,7 +377,26 @@ export async function POST(request: NextRequest) {
           ],
         })
 
-        const draftReply = result.messageContent || ""
+        const latestInbound =
+          [...conversation.messages].reverse().find((m) => m.direction === "INBOUND")?.bodyText ||
+          [...conversation.messages].reverse().find((m) => m.direction === "INBOUND")?.body ||
+          conversation.preview
+        const fallbackDraft = [
+          `Subject: Re: ${conversation.subject}`,
+          "",
+          `Hi ${conversation.senderName || "there"},`,
+          "",
+          "Thank you for your email.",
+          "We have received your request and our team is reviewing the details now.",
+          "",
+          `Summary we captured: ${normalizeText(latestInbound).slice(0, 240)}`,
+          "",
+          "We will get back to you with a concrete update shortly.",
+          "",
+          "Best regards,",
+          "Combine AI Team",
+        ].join("\n")
+        const draftReply = result.messageContent?.trim() || fallbackDraft
 
         // Save as AgentSuggestion
         const suggestion = await prisma.agentSuggestion.create({
@@ -272,7 +445,7 @@ export async function POST(request: NextRequest) {
           ],
         })
 
-        const parsed = JSON.parse(aiResult.messageContent || "{}") as {
+        let parsed: {
           overallSummary?: string
           primaryWorkType?: string
           tasks?: Array<{
@@ -283,6 +456,14 @@ export async function POST(request: NextRequest) {
             confidence?: number
             quote?: string
           }>
+        }
+
+        try {
+          parsed = aiResult.messageContent
+            ? JSON.parse(aiResult.messageContent)
+            : buildFallbackTriagePlan(subject, emailBody, classifyWithRules(subject, emailBody).workType)
+        } catch {
+          parsed = buildFallbackTriagePlan(subject, emailBody, classifyWithRules(subject, emailBody).workType)
         }
 
         const rawTasks = Array.isArray(parsed.tasks) ? parsed.tasks.slice(0, 6) : []

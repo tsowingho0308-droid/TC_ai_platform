@@ -10,12 +10,13 @@ export async function GET(request: NextRequest) {
 
   const url = new URL(request.url)
   const kind = url.searchParams.get("kind")
+  const normalizedKind = kind?.toUpperCase()
+  const where = normalizedKind === "PRIMARY" || normalizedKind === "DEPARTMENT"
+    ? { workspaceId: session.workspaceId, kind: normalizedKind as "PRIMARY" | "DEPARTMENT" }
+    : { workspaceId: session.workspaceId }
 
   const inboxes = await prisma.inbox.findMany({
-    where: {
-      workspaceId: session.workspaceId,
-      ...(kind ? { kind: kind.toUpperCase() as "PRIMARY" | "DEPARTMENT" } : {}),
-    },
+    where,
     orderBy: [
       { kind: "asc" },
       { name: "asc" },

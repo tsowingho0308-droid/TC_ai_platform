@@ -90,6 +90,8 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
             }
           : prev
       )
+      const refreshed = await getConversation(conversationId)
+      setConversation(refreshed)
     } catch (err) {
       console.error("Classification failed:", err)
     } finally {
