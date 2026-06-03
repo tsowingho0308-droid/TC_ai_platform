@@ -55,3 +55,22 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Failed to create template" }, { status: 500 })
   }
 }
+
+export async function DELETE(request: NextRequest) {
+  const session = await requireSession().catch(() => null)
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+
+  try {
+    const { id } = await request.json() as { id?: string }
+    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 })
+
+    await prisma.workflowTemplate.deleteMany({
+      where: { id, workspaceId: session.workspaceId },
+    })
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    console.error("Template DELETE error:", error)
+    return NextResponse.json({ error: "Failed to delete template" }, { status: 500 })
+  }
+}
