@@ -191,7 +191,7 @@ export default function TenderPage() {
     }
   }
 
-  function parseSseRecord(raw: string): { event: string; data: Record<string, unknown> | null } {
+  function parseSseRecord(raw: string): { event: string; data: Record<string, any> | null } {
     const lines = raw.split(/\r?\n/)
     let eventType = "message"
     const dataLines: string[] = []

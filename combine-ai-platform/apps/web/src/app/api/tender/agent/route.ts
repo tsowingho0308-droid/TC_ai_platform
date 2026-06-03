@@ -453,7 +453,7 @@ async function performExtraction(
     await prisma.agentRun.create({
       data: {
         workspaceId: session.workspaceId,
-        kind: "TENDER_EXTRACTION",
+        kind: "TENDER_ANALYSIS",
         status: "COMPLETED",
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         input: { fileName, hasText: !!documentText } as any,
@@ -483,7 +483,10 @@ async function handleStreamExtract(
   session: { sub: string; workspaceId: string },
   body: Record<string, unknown>
 ) {
-  const { sessionId, documentText, fileName, instructions } = body
+  const sessionId = body.sessionId as string | undefined
+  const documentText = body.documentText as string | undefined
+  const fileName = body.fileName as string | undefined
+  const instructions = body.instructions as string | undefined
 
   if (!documentText) {
     return NextResponse.json({ error: "documentText required" }, { status: 400 })

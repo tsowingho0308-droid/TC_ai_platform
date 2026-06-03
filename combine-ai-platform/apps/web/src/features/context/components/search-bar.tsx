@@ -24,7 +24,7 @@ export function SearchBar({
   const dropdownRef = useRef<HTMLDivElement>(null)
 
   // Debounced search call
-  const debounceRef = useRef<ReturnType<typeof setTimeout>>()
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const handleChange = useCallback(
     (q: string) => {
       if (debounceRef.current) clearTimeout(debounceRef.current)

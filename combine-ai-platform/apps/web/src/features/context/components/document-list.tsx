@@ -119,7 +119,7 @@ export function DocumentList({
               <div className="flex items-center gap-2">
                 <h4 className="truncate text-sm font-medium">{doc.title}</h4>
                 {doc.chunkCount > 0 && (
-                  <BadgeCheck className="h-3.5 w-3.5 text-green-500" title="Vector search enabled" />
+                  <BadgeCheck className="h-3.5 w-3.5 text-green-500" aria-label="Vector search enabled" />
                 )}
               </div>
               <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">

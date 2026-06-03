@@ -196,9 +196,9 @@ function classifyWithRules(subject: string, body: string): ClassificationResult 
   ])
 
   const ranked: Array<{ type: SupportedDepartment; score: number; department: string }> = [
-    { type: "commercial", score: commercialScore, department: "Commercial" },
-    { type: "it", score: itScore, department: "IT Support" },
-    { type: "hr", score: hrScore, department: "Human Resources" },
+    { type: "commercial" as const, score: commercialScore, department: "Commercial" },
+    { type: "it" as const, score: itScore, department: "IT Support" },
+    { type: "hr" as const, score: hrScore, department: "Human Resources" },
   ].sort((a, b) => b.score - a.score)
 
   const best = ranked[0]

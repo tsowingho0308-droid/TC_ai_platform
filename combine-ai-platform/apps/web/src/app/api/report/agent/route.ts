@@ -251,7 +251,11 @@ async function handleExtract(
   session: { sub: string; workspaceId: string },
   body: Record<string, unknown>
 ) {
-  const { sessionId, fileBase64, fileName, instructions, documentText } = body
+  const sessionId = body.sessionId as string | undefined
+  const fileBase64 = body.fileBase64 as string | undefined
+  const fileName = body.fileName as string | undefined
+  const instructions = body.instructions as string | undefined
+  const documentText = body.documentText as string | undefined
 
   if (!fileBase64 && !documentText) {
     return NextResponse.json({ error: "fileBase64 or documentText required" }, { status: 400 })
@@ -447,7 +451,11 @@ async function handleStreamExtract(
   session: { sub: string; workspaceId: string },
   body: Record<string, unknown>
 ) {
-  const { sessionId, fileBase64, fileName, instructions, documentText } = body
+  const sessionId = body.sessionId as string | undefined
+  const fileBase64 = body.fileBase64 as string | undefined
+  const fileName = body.fileName as string | undefined
+  const instructions = body.instructions as string | undefined
+  const documentText = body.documentText as string | undefined
 
   if (!fileBase64 && !documentText) {
     return NextResponse.json({ error: "fileBase64 or documentText required" }, { status: 400 })
