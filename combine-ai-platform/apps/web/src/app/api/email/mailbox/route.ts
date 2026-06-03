@@ -12,6 +12,7 @@ export async function GET(request: NextRequest) {
   const url = new URL(request.url)
   const folder = (url.searchParams.get("folder") || "inbox") as FolderId
   const inboxId = url.searchParams.get("inboxId")
+  const department = url.searchParams.get("department")
   const q = url.searchParams.get("q")
   const conversationId = url.searchParams.get("conversationId")
 
@@ -42,6 +43,7 @@ export async function GET(request: NextRequest) {
 
   // List conversations
   const inboxCondition = inboxId ? { inboxId } : {}
+  const departmentCondition = department ? { inbox: { slug: department } } : {}
   const searchCondition = q
     ? { OR: [{ subject: { contains: q, mode: "insensitive" as const } }, { senderName: { contains: q, mode: "insensitive" as const } }, { senderEmail: { contains: q, mode: "insensitive" as const } }] }
     : {}
@@ -52,6 +54,7 @@ export async function GET(request: NextRequest) {
       folderId: folder,
       parentConversationId: null, // only root conversations
       ...inboxCondition,
+      ...departmentCondition,
       ...searchCondition,
     },
     orderBy: { createdAt: "desc" },

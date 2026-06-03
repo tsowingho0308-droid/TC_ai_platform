@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react"
 import { Loader2, Bot, Send, FileText, ExternalLink } from "lucide-react"
-import { getConversation, generateReplySuggestion, classifyConversation } from "../api/email-client"
+import { getConversation, generateReplySuggestion, classifyConversation, runConversationTriage } from "../api/email-client"
 import { cn } from "@combine-ai/shared-ui"
 
 interface ConversationDetail {
@@ -46,6 +46,7 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
   const [replyDraft, setReplyDraft] = useState("")
   const [generating, setGenerating] = useState(false)
   const [classifying, setClassifying] = useState(false)
+  const [triaging, setTriaging] = useState(false)
 
   useEffect(() => {
     if (!conversationId) {
@@ -93,6 +94,20 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
       console.error("Classification failed:", err)
     } finally {
       setClassifying(false)
+    }
+  }
+
+  async function handleTriage() {
+    if (!conversationId) return
+    setTriaging(true)
+    try {
+      await runConversationTriage(conversationId)
+      const refreshed = await getConversation(conversationId)
+      setConversation(refreshed)
+    } catch (err) {
+      console.error("Triage failed:", err)
+    } finally {
+      setTriaging(false)
     }
   }
 
@@ -167,6 +182,14 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
               {classifying ? "Classifying..." : "AI Classify"}
             </button>
           )}
+          <button
+            onClick={handleTriage}
+            disabled={triaging}
+            className="inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs hover:bg-accent disabled:opacity-50"
+          >
+            <Bot className="h-3.5 w-3.5" />
+            {triaging ? "Triaging..." : "AI Triage Split"}
+          </button>
           <button
             onClick={handleGenerateReply}
             disabled={generating}

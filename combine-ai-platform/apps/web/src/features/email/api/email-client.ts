@@ -57,11 +57,13 @@ interface InquiryTaskSummary {
 export async function listConversations(params: {
   folder?: string
   inboxId?: string
+  department?: string
   q?: string
 }): Promise<ConversationSummary[]> {
   const sp = new URLSearchParams()
   if (params.folder) sp.set("folder", params.folder)
   if (params.inboxId) sp.set("inboxId", params.inboxId)
+  if (params.department) sp.set("department", params.department)
   if (params.q) sp.set("q", params.q)
 
   const res = await fetch(`/api/email/mailbox?${sp}`)
@@ -105,6 +107,29 @@ export async function generateReplySuggestion(conversationId: string): Promise<{
   return res.json()
 }
 
+export async function runConversationTriage(conversationId: string): Promise<{
+  triage: {
+    summary: string | null
+    workType: string | null
+    confidence: number | null
+    tasks: Array<{
+      id: string
+      questionTitle: string
+      questionBody: string
+      status: string
+      confidence: number | null
+    }>
+  }
+}> {
+  const res = await fetch("/api/email/agent?action=triage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversationId }),
+  })
+  if (!res.ok) throw new Error("Triage failed")
+  return res.json()
+}
+
 export async function updateConversation(
   id: string,
   action: string,
@@ -133,7 +158,7 @@ export async function getIntegrationStatus(): Promise<Array<{
 }
 
 export async function connectGmail(inboxId: string): Promise<string> {
-  const res = await fetch("/api/email/integrations?action=connect-url")
+  const res = await fetch(`/api/email/integrations?action=connect-url&inboxId=${encodeURIComponent(inboxId)}`)
   if (!res.ok) throw new Error("Failed to get connect URL")
   const data = await res.json()
   return data.url
@@ -147,5 +172,5 @@ export async function syncGmail(inboxId: string): Promise<string> {
   })
   if (!res.ok) throw new Error("Failed to start sync")
   const data = await res.json()
-  return data.syncRun.id
+  return data.syncRunId
 }
