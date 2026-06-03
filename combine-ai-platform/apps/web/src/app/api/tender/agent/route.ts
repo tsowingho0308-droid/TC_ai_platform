@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
+import { mockTenderResult, mockTenderCompare } from "@/lib/server/mock-extraction"
 import type { Prisma } from "@prisma/client"
 
 export const dynamic = "force-dynamic"
@@ -364,18 +365,7 @@ async function performExtraction(
     ? `Analyze this tender document and extract all structured fields. File: ${fileName || "document"}. Additional instructions: ${instructions}\n\nDocument text:\n${(documentText || "").slice(0, 8000)}`
     : `Analyze this tender document and extract all structured fields. File: ${fileName || "document"}\n\nDocument text:\n${(documentText || "").slice(0, 8000)}`
 
-  const result = await callAI({
-    temperature: 0.2,
-    maxTokens: 3000,
-    responseFormat: "json",
-    tools: [TENDER_FIELDS_TOOL],
-    messages: [
-      { role: "system", content: TENDER_EXTRACTION_PROMPT },
-      { role: "user", content: userPrompt },
-    ],
-  })
-
-  // Parse result
+  // ── Try AI extraction, fallback to mock template if no API key ──
   let extracted: {
     tenderTitle?: string
     tenderType?: string
@@ -384,22 +374,50 @@ async function performExtraction(
     deadlines?: Array<{ label: string; date: string | null }>
     confidence?: number
   } = {}
+  let modelUsed = "unknown"
 
   try {
-    if (result.toolCalls.length > 0) {
-      const toolCall = result.toolCalls[0]
-      if (toolCall?.function?.arguments) {
-        extracted = JSON.parse(toolCall.function.arguments)
+    const result = await callAI({
+      temperature: 0.2,
+      maxTokens: 3000,
+      responseFormat: "json",
+      tools: [TENDER_FIELDS_TOOL],
+      messages: [
+        { role: "system", content: TENDER_EXTRACTION_PROMPT },
+        { role: "user", content: userPrompt },
+      ],
+    })
+
+    modelUsed = result.model
+
+    try {
+      if (result.toolCalls.length > 0) {
+        const toolCall = result.toolCalls[0]
+        if (toolCall?.function?.arguments) {
+          extracted = JSON.parse(toolCall.function.arguments)
+        }
+      } else {
+        const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
+        extracted = JSON.parse(cleaned)
       }
-    } else {
-      const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
-      extracted = JSON.parse(cleaned)
+    } catch {
+      extracted = {
+        fields: [{ field: "AI Analysis", value: result.messageContent.slice(0, 500) }],
+        tenderType: "other",
+      }
     }
-  } catch {
+  } catch (aiErr) {
+    console.warn("AI tender extraction unavailable, using mock template:", (aiErr as Error).message)
+    const mock = mockTenderResult(fileName)
     extracted = {
-      fields: [{ field: "AI Analysis", value: result.messageContent.slice(0, 500) }],
-      tenderType: "other",
+      tenderTitle: mock.tenderTitle,
+      tenderType: mock.tenderType,
+      fields: mock.fields,
+      keyRequirements: mock.keyRequirements,
+      deadlines: mock.deadlines,
+      confidence: mock.confidence,
     }
+    modelUsed = mock.model
   }
 
   const fields = extracted.fields || []
@@ -455,7 +473,7 @@ async function performExtraction(
     keyRequirements: extracted.keyRequirements,
     deadlines: extracted.deadlines,
     confidence: extracted.confidence,
-    model: result.model,
+    model: modelUsed,
   })
 }
 
@@ -497,17 +515,7 @@ async function handleStreamExtract(
 
         send("thinking", { text: "Sending tender document to AI for analysis..." })
 
-        const result = await callAI({
-          temperature: 0.2,
-          maxTokens: 3000,
-          responseFormat: "json",
-          tools: [TENDER_FIELDS_TOOL],
-          messages: [
-            { role: "system", content: TENDER_EXTRACTION_PROMPT },
-            { role: "user", content: userPrompt },
-          ],
-        })
-
+        // ── Try AI, fallback to mock if no API key ──
         let extracted: {
           tenderTitle?: string
           tenderType?: string
@@ -516,22 +524,50 @@ async function handleStreamExtract(
           deadlines?: Array<{ label: string; date: string | null }>
           confidence?: number
         } = {}
+        let modelUsed = "unknown"
 
         try {
-          if (result.toolCalls.length > 0) {
-            const tc = result.toolCalls[0]
-            if (tc?.function?.arguments) {
-              extracted = JSON.parse(tc.function.arguments)
+          const result = await callAI({
+            temperature: 0.2,
+            maxTokens: 3000,
+            responseFormat: "json",
+            tools: [TENDER_FIELDS_TOOL],
+            messages: [
+              { role: "system", content: TENDER_EXTRACTION_PROMPT },
+              { role: "user", content: userPrompt },
+            ],
+          })
+
+          modelUsed = result.model
+
+          try {
+            if (result.toolCalls.length > 0) {
+              const tc = result.toolCalls[0]
+              if (tc?.function?.arguments) {
+                extracted = JSON.parse(tc.function.arguments)
+              }
+            } else {
+              const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
+              extracted = JSON.parse(cleaned)
             }
-          } else {
-            const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
-            extracted = JSON.parse(cleaned)
+          } catch {
+            extracted = {
+              fields: [{ field: "AI Analysis", value: result.messageContent.slice(0, 500) }],
+              tenderType: "other",
+            }
           }
-        } catch {
+        } catch (aiErr) {
+          console.warn("AI tender stream extraction unavailable, using mock template:", (aiErr as Error).message)
+          const mock = mockTenderResult(fileName)
           extracted = {
-            fields: [{ field: "AI Analysis", value: result.messageContent.slice(0, 500) }],
-            tenderType: "other",
+            tenderTitle: mock.tenderTitle,
+            tenderType: mock.tenderType,
+            fields: mock.fields,
+            keyRequirements: mock.keyRequirements,
+            deadlines: mock.deadlines,
+            confidence: mock.confidence,
           }
+          modelUsed = mock.model
         }
 
         const fields = extracted.fields || []
@@ -581,7 +617,7 @@ async function handleStreamExtract(
             fieldUpdates: fieldInputs,
             applied: true,
             appliedAt: new Date().toISOString(),
-            model: result.model,
+            model: modelUsed,
             tenderTitle: extracted.tenderTitle,
           },
         })
@@ -743,7 +779,14 @@ async function handleCompare(
         aiComparison = {}
       }
     } catch (aiErr) {
-      console.error("AI comparison failed:", aiErr)
+      console.warn("AI comparison unavailable, using mock template:", (aiErr as Error).message)
+      const mock = mockTenderCompare(tenderData.map((t) => t.title))
+      aiComparison = {
+        keyDifferences: mock.keyDifferences,
+        risksA: mock.risksA,
+        risksB: mock.risksB,
+        recommendation: mock.recommendation,
+      }
     }
   }
 

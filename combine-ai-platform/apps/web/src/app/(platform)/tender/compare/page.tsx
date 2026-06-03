@@ -56,7 +56,7 @@ export default function ComparePage() {
 
     setComparing(true)
     try {
-      const res = await fetch("/api/tender/agent/run?action=compare", {
+      const res = await fetch("/api/tender/agent?action=compare", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

@@ -92,7 +92,7 @@ export default function TenderPage() {
       setStreamingStatus("thinking")
 
       // Stream AI extraction
-      const response = await fetch("/api/tender/agent/run?action=extract&stream=1", {
+      const response = await fetch("/api/tender/agent?action=extract&stream=1", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

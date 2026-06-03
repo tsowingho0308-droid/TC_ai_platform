@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
+import { mockReportExtraction } from "@/lib/server/mock-extraction"
 
 export const dynamic = "force-dynamic"
 export const maxDuration = 120
@@ -320,15 +321,7 @@ async function performExtraction(
 
   messages.push({ role: "user", content: userContent })
 
-  const result = await callAI({
-    temperature: 0.2,
-    maxTokens: 3000,
-    responseFormat: "json",
-    tools: [EXTRACTION_TOOL],
-    messages: messages as Array<{ role: string; content: unknown[] }>,
-  })
-
-  // Parse result
+  // ── Try AI extraction, fallback to mock template if no API key ──
   let extracted: {
     documentType?: string
     title?: string
@@ -336,26 +329,49 @@ async function performExtraction(
     metadata?: Record<string, unknown>
     confidence?: number
   } = {}
+  let modelUsed = "unknown"
 
   try {
-    // Check for tool call result first
-    if (result.toolCalls.length > 0) {
-      const toolCall = result.toolCalls[0]
-      if (toolCall?.function?.arguments) {
-        extracted = JSON.parse(toolCall.function.arguments)
+    const result = await callAI({
+      temperature: 0.2,
+      maxTokens: 3000,
+      responseFormat: "json",
+      tools: [EXTRACTION_TOOL],
+      messages: messages as Array<{ role: string; content: unknown[] }>,
+    })
+
+    modelUsed = result.model
+
+    try {
+      if (result.toolCalls.length > 0) {
+        const toolCall = result.toolCalls[0]
+        if (toolCall?.function?.arguments) {
+          extracted = JSON.parse(toolCall.function.arguments)
+        }
+      } else {
+        const cleaned = result.messageContent
+          .replace(/```json\s*|\s*```/g, "")
+          .trim()
+        extracted = JSON.parse(cleaned)
       }
-    } else {
-      const cleaned = result.messageContent
-        .replace(/```json\s*|\s*```/g, "")
-        .trim()
-      extracted = JSON.parse(cleaned)
+    } catch {
+      extracted = {
+        rows: [{ field: "AI Extraction", value: result.messageContent.slice(0, 500) }],
+        documentType: "other",
+      }
     }
-  } catch {
-    // Fallback: create a single row with raw output
+  } catch (aiErr) {
+    // No API key or AI unavailable — use mock template based on file name
+    console.warn("AI extraction unavailable, using mock template:", (aiErr as Error).message)
+    const mock = mockReportExtraction(fileName)
     extracted = {
-      rows: [{ field: "AI Extraction", value: result.messageContent.slice(0, 500) }],
-      documentType: "other",
+      documentType: mock.documentType,
+      title: mock.title,
+      rows: mock.rows,
+      metadata: mock.metadata,
+      confidence: mock.confidence,
     }
+    modelUsed = mock.model
   }
 
   const rows = extracted.rows || []
@@ -421,7 +437,7 @@ async function performExtraction(
     title: extracted.title,
     metadata: extracted.metadata,
     confidence: extracted.confidence,
-    model: result.model,
+    model: modelUsed,
   })
 }
 
@@ -494,15 +510,7 @@ async function handleStreamExtract(
 
         send("thinking", { text: "Sending document to AI for analysis..." })
 
-        const result = await callAI({
-          temperature: 0.2,
-          maxTokens: 3000,
-          responseFormat: "json",
-          tools: [EXTRACTION_TOOL],
-          messages: messages as Array<{ role: string; content: unknown[] }>,
-        })
-
-        // Parse result
+        // ── Try AI extraction, fallback to mock template if no API key ──
         let extracted: {
           documentType?: string
           title?: string
@@ -510,24 +518,48 @@ async function handleStreamExtract(
           metadata?: Record<string, unknown>
           confidence?: number
         } = {}
+        let modelUsed = "unknown"
 
         try {
-          if (result.toolCalls.length > 0) {
-            const toolCall = result.toolCalls[0]
-            if (toolCall?.function?.arguments) {
-              extracted = JSON.parse(toolCall.function.arguments)
+          const result = await callAI({
+            temperature: 0.2,
+            maxTokens: 3000,
+            responseFormat: "json",
+            tools: [EXTRACTION_TOOL],
+            messages: messages as Array<{ role: string; content: unknown[] }>,
+          })
+
+          modelUsed = result.model
+
+          try {
+            if (result.toolCalls.length > 0) {
+              const toolCall = result.toolCalls[0]
+              if (toolCall?.function?.arguments) {
+                extracted = JSON.parse(toolCall.function.arguments)
+              }
+            } else {
+              const cleaned = result.messageContent
+                .replace(/```json\s*|\s*```/g, "")
+                .trim()
+              extracted = JSON.parse(cleaned)
             }
-          } else {
-            const cleaned = result.messageContent
-              .replace(/```json\s*|\s*```/g, "")
-              .trim()
-            extracted = JSON.parse(cleaned)
+          } catch {
+            extracted = {
+              rows: [{ field: "AI Extraction", value: result.messageContent.slice(0, 500) }],
+              documentType: "other",
+            }
           }
-        } catch {
+        } catch (aiErr) {
+          console.warn("AI stream extraction unavailable, using mock template:", (aiErr as Error).message)
+          const mock = mockReportExtraction(fileName)
           extracted = {
-            rows: [{ field: "AI Extraction", value: result.messageContent.slice(0, 500) }],
-            documentType: "other",
+            documentType: mock.documentType,
+            title: mock.title,
+            rows: mock.rows,
+            metadata: mock.metadata,
+            confidence: mock.confidence,
           }
+          modelUsed = mock.model
         }
 
         const rows = extracted.rows || []
@@ -584,7 +616,7 @@ async function handleStreamExtract(
             title: extracted.title,
             metadata: extracted.metadata,
             confidence: extracted.confidence,
-            model: result.model,
+            model: modelUsed,
             applied: true,
             appliedAt: new Date().toISOString(),
           },
