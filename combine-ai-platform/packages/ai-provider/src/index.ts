@@ -169,12 +169,10 @@ export function chunkText(
   return chunks.length > 0 ? chunks : [text]
 }
 
-// ── Provider Exports ──────────────────────────────────────────
+// ── Client-safe Exports (models / constants) ─────────────────
 
-export {
-  DashScopeProvider,
-  getDashScopeProvider,
-  DASHSCOPE_MODELS,
-  ALL_MODELS,
-  DEFAULT_MODELS,
-} from "./providers/dashscope.js"
+export { DASHSCOPE_MODELS, ALL_MODELS, DEFAULT_MODELS } from "./models"
+
+// ── Server-only Exports (provider) ────────────────────────────
+
+export { DashScopeProvider, getDashScopeProvider } from "./providers/dashscope"
