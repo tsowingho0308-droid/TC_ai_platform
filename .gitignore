@@ -1,3 +1,8 @@
+# Other AI systems (not part of this repo)
+ai-email-system-main/
+ai-note-system-main/
+ai-notice-system-main/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
