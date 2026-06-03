@@ -3,6 +3,8 @@
 import { useState, useRef, useCallback, useEffect } from "react"
 import { Upload, FileSpreadsheet, Download, Plus, Trash2, Loader2, Brain, BarChart3 } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
+import { ModelSelector } from "@/features/shared/model-selector"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
 interface TableRow {
   field: string
@@ -21,6 +23,7 @@ interface TraceEvent {
 export default function ReportPage() {
   const [rows, setRows] = useState<TableRow[]>([])
   const [extracting, setExtracting] = useState(false)
+  const [model, setModel] = useState(DEFAULT_MODELS.report)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [previewFile, setPreviewFile] = useState<File | null>(null)
   const [note, setNote] = useState("")
@@ -111,6 +114,7 @@ export default function ReportPage() {
           fileBase64: fileData,
           fileName: file.name,
           instructions: instructions || undefined,
+          model,
         }),
         signal: controller.signal,
       })
@@ -286,6 +290,7 @@ export default function ReportPage() {
             )}
           </div>
           <div className="flex items-center gap-2">
+            <ModelSelector value={model} onChange={setModel} />
             <button
               onClick={() => rows.length > 0 && exportToXlsx(rows)}
               disabled={rows.length === 0}

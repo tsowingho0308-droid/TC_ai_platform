@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
-import { generateEmbedding } from "@combine-ai/ai-provider"
+import { generateEmbedding, getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
 export const dynamic = "force-dynamic"
 
@@ -28,41 +28,18 @@ async function callAI(req: {
   responseFormat?: "json" | "text"
   messages: Array<{ role: string; content: string }>
 }) {
-  const apiUrl = process.env.LLM_API_URL || "https://api.poe.com/v1"
-  const apiKey = process.env.LLM_API_KEY || ""
-  const model = req.model || process.env.LLM_MODEL || "Claude-Sonnet-4.5"
-
-  if (!apiKey) {
-    throw new Error("LLM_API_KEY not configured. Set it in .env.local")
-  }
-
-  const response = await fetch(`${apiUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: req.messages,
-      temperature: req.temperature ?? 0.3,
-      max_tokens: req.maxTokens ?? 1500,
-      response_format: req.responseFormat === "json" ? { type: "json_object" } : undefined,
-    }),
+  const provider = getDashScopeProvider()
+  const result = await provider.createCompletion({
+    model: req.model || DEFAULT_MODELS.helpdesk,
+    temperature: req.temperature ?? 0.3,
+    maxTokens: req.maxTokens ?? 1500,
+    responseFormat: req.responseFormat,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    messages: req.messages as any,
   })
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "Unknown error")
-    throw new Error(`AI provider error: ${response.status} - ${errorText}`)
-  }
-
-  const data = await response.json() as Record<string, unknown>
-  const choice = (data.choices as Array<Record<string, unknown>>)?.[0]
-  const message = choice?.message as Record<string, unknown> | undefined
-
   return {
-    messageContent: (message?.content as string) || "",
-    model,
+    messageContent: result.messageContent,
+    model: result.model,
   }
 }
 
@@ -317,6 +294,147 @@ export async function POST(request: NextRequest) {
           confidence: qaResult.confidence || 0.5,
           needsEscalation: false,
           suggestedDepartment: qaResult.suggestedDepartment || department || "GENERAL",
+        })
+      }
+
+      case "ask-stream": {
+        const { question: qStream, department: deptStream, model: modelStream } = body
+        if (!qStream || typeof qStream !== "string") {
+          return NextResponse.json({ error: "question required" }, { status: 400 })
+        }
+
+        // Same RAG search as "ask"
+        const streamVectorAvailable = await checkPgVector()
+        let streamArticles: Array<{
+          id: string; title: string; content: string
+          knowledgeBaseName: string; knowledgeBaseSlug: string
+          department: string; similarity?: number
+        }> = []
+
+        if (streamVectorAvailable) {
+          try {
+            const streamEmbedding = await generateEmbedding(qStream)
+            const rawStreamResults = await prisma.$queryRaw<Array<{
+              article_id: string; title: string; content: string
+              kb_name: string; kb_slug: string; department: string; similarity: number
+            }>>`
+              SELECT DISTINCT ON (ka.id)
+                ka.id as article_id, ka.title, ka.content,
+                kb.name as kb_name, kb.slug as kb_slug, kb.department,
+                1 - (kc.embedding <=> ${streamEmbedding}::vector) as similarity
+              FROM "KnowledgeChunk" kc
+              JOIN "KnowledgeArticle" ka ON ka.id = kc.article_id
+              JOIN "KnowledgeBase" kb ON kb.id = ka.knowledge_base_id
+              WHERE kb.workspace_id = ${session.workspaceId}
+              ORDER BY ka.id, kc.embedding <=> ${streamEmbedding}::vector
+              LIMIT 5
+            `
+            streamArticles = rawStreamResults.map((r) => ({
+              id: r.article_id, title: r.title, content: r.content,
+              knowledgeBaseName: r.kb_name, knowledgeBaseSlug: r.kb_slug,
+              department: r.department,
+              similarity: Math.round(r.similarity * 100) / 100,
+            }))
+          } catch (err) {
+            console.warn("Vector search failed for stream:", err)
+          }
+        }
+
+        if (streamArticles.length === 0) {
+          const articleResults = await prisma.knowledgeArticle.findMany({
+            where: {
+              knowledgeBase: { workspaceId: session.workspaceId },
+              OR: [{ title: { contains: qStream } }, { content: { contains: qStream } }],
+            },
+            take: 5, orderBy: { updatedAt: "desc" },
+            include: { knowledgeBase: { select: { name: true, slug: true, department: true } } },
+          })
+          streamArticles = articleResults.map((a) => ({
+            id: a.id, title: a.title, content: a.content,
+            knowledgeBaseName: a.knowledgeBase.name, knowledgeBaseSlug: a.knowledgeBase.slug,
+            department: a.knowledgeBase.department,
+          }))
+        }
+
+        const streamSourcesText = streamArticles.length > 0
+          ? streamArticles.map((a, i) =>
+              `[Article ${i + 1}] Title: ${a.title}\nDepartment: ${a.department}\nContent: ${a.content.slice(0, 1500)}${a.similarity !== undefined ? `\nRelevance: ${Math.round(a.similarity * 100)}%` : ""}`
+            ).join("\n\n") + "\n\n---\nWhen answering, cite the article title(s) you used."
+          : "No relevant policy documents found."
+
+        const streamPrompt = QA_PROMPT
+          .replace("{sources}", streamSourcesText)
+          .replace("{question}", qStream)
+
+        // SSE streaming
+        const streamEncoder = new TextEncoder()
+        const stream = new ReadableStream({
+          async start(controller) {
+            const sendSSE = (event: string, data: Record<string, unknown>) => {
+              controller.enqueue(streamEncoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
+            }
+            try {
+              sendSSE("trace", { trace: { id: "helpdesk-start", at: new Date().toISOString(), stage: "qa", status: "running", title: "Searching knowledge base", detail: `Found ${streamArticles.length} articles` } })
+
+              const provider = getDashScopeProvider()
+              let fullThinking = ""
+              let fullContent = ""
+
+              await provider.createStreamingCompletion(
+                {
+                  model: (modelStream as string) || DEFAULT_MODELS.helpdesk,
+                  temperature: 0.3,
+                  maxTokens: 1500,
+                  responseFormat: "json",
+                  messages: [{ role: "system", content: streamPrompt }],
+                },
+                {
+                  onThinkingToken: (text) => {
+                    fullThinking += text
+                    sendSSE("thinking", { text })
+                  },
+                  onToken: (text) => {
+                    fullContent += text
+                    sendSSE("token", { text })
+                  },
+                }
+              )
+
+              // Parse result
+              let qaStreamResult: Record<string, unknown> = {}
+              try {
+                const cleaned = fullContent.replace(/```json\s*|\s*```/g, "").trim()
+                qaStreamResult = JSON.parse(cleaned)
+              } catch {
+                qaStreamResult = { answer: fullContent, confidence: 0.5, needsEscalation: false }
+              }
+
+              // Save AgentRun
+              await prisma.agentRun.create({
+                data: {
+                  workspaceId: session.workspaceId,
+                  kind: "HELPDESK_QA",
+                  status: "COMPLETED",
+                  input: { question: qStream, department: deptStream || "GENERAL" } as any,
+                  output: { ...qaStreamResult, thinkingLength: fullThinking.length } as any,
+                },
+              })
+
+              sendSSE("result", { result: qaStreamResult, thinkingProcess: fullThinking || undefined })
+              controller.close()
+            } catch (err) {
+              sendSSE("error", { detail: err instanceof Error ? err.message : "Unknown error" })
+              controller.close()
+            }
+          },
+        })
+
+        return new Response(stream, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          },
         })
       }
 

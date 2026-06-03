@@ -1,58 +1,29 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
-import type { CompletionRequest, CompletionResponse } from "@combine-ai/ai-provider"
+import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
 export const dynamic = "force-dynamic"
 
-// Simple AI provider call using Poe API (from existing email system pattern)
-async function callAI(req: CompletionRequest): Promise<CompletionResponse> {
-  const apiUrl = process.env.LLM_API_URL || "https://api.poe.com/v1"
-  const apiKey = process.env.LLM_API_KEY || ""
-  const model = req.model || process.env.LLM_MODEL || "Claude-Sonnet-4.5"
-
-  if (!apiKey) {
-    return {
-      messageContent: "",
-      toolCalls: [],
-      model,
-    }
-  }
-
-  const response = await fetch(`${apiUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: req.messages,
-      temperature: req.temperature ?? 0.3,
-      max_tokens: req.maxTokens ?? 2000,
-      tools: req.tools,
-      response_format: req.responseFormat === "json" ? { type: "json_object" } : undefined,
-    }),
+/** Unified AI call via DashScope provider */
+async function callAI(req: {
+  model?: string
+  temperature?: number
+  maxTokens?: number
+  responseFormat?: "json" | "text"
+  messages: Array<{ role: string; content: string | unknown[] }>
+  tools?: unknown[]
+}) {
+  const provider = getDashScopeProvider()
+  return provider.createCompletion({
+    model: req.model || DEFAULT_MODELS.email,
+    temperature: req.temperature ?? 0.3,
+    maxTokens: req.maxTokens ?? 2000,
+    responseFormat: req.responseFormat,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    messages: req.messages as any,
+    tools: req.tools as any,
   })
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "Unknown error")
-    throw new Error(`AI provider error: ${response.status} - ${errorText}`)
-  }
-
-  const data = await response.json() as Record<string, unknown>
-  const choice = (data.choices as Array<Record<string, unknown>>)?.[0]
-  const message = choice?.message as Record<string, unknown> | undefined
-
-  return {
-    messageContent: (message?.content as string) || "",
-    toolCalls: (message?.tool_calls as Array<{
-      id: string
-      type: "function"
-      function: { name: string; arguments: string }
-    }>) || [],
-    model,
-  }
 }
 
 const WORK_TYPE_CLASSIFICATION_PROMPT = `You are an email classifier. Analyze the email and classify it into ONE of these work types:

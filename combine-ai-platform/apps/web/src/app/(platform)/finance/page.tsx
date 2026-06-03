@@ -4,9 +4,12 @@ import { useState, useRef } from "react"
 import Link from "next/link"
 import { Upload, Receipt, GitCompare, Loader2, Download, ArrowRight } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
+import { ModelSelector } from "@/features/shared/model-selector"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
 export default function FinancePage() {
   const [activeTab, setActiveTab] = useState<"expense" | "matching">("expense")
+  const [model, setModel] = useState(DEFAULT_MODELS.finance)
   const [extracting, setExtracting] = useState(false)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [rows, setRows] = useState<Array<{ field: string; value: string }>>([])
@@ -43,6 +46,7 @@ export default function FinancePage() {
             sessionId: session.id,
             fileBase64: base64,
             fileName: file.name,
+            model,
           }),
         })
 
@@ -67,6 +71,7 @@ export default function FinancePage() {
           <p className="text-xs text-muted-foreground">Receipt OCR, expense policy check & 3-way matching</p>
         </div>
         <div className="flex items-center gap-2">
+          <ModelSelector value={model} onChange={setModel} />
           <Link
             href="/finance/policies"
             className="inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent"

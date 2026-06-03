@@ -58,6 +58,7 @@ export interface CompletionResponse {
 
 export interface StreamHandlers {
   onToken?: (text: string) => void
+  onThinkingToken?: (text: string) => void
   onTrace?: (event: AgentTraceEvent) => void
   signal?: AbortSignal
 }
@@ -88,13 +89,14 @@ export interface IAiProvider {
 export async function generateEmbedding(text: string): Promise<number[]> {
   const apiUrl =
     process.env.EMBEDDING_API_URL ||
+    process.env.DASHSCOPE_BASE_URL ||
     process.env.LLM_API_URL ||
-    "https://api.poe.com/v1"
-  const apiKey = process.env.LLM_API_KEY || ""
-  const model = process.env.EMBEDDING_MODEL || "text-embedding-3-small"
+    "https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1"
+  const apiKey = process.env.DASHSCOPE_API_KEY || process.env.LLM_API_KEY || ""
+  const model = process.env.EMBEDDING_MODEL || "text-embedding-v4"
 
   if (!apiKey) {
-    throw new Error("LLM_API_KEY not configured. Cannot generate embeddings.")
+    throw new Error("DASHSCOPE_API_KEY or LLM_API_KEY not configured. Cannot generate embeddings.")
   }
 
   const response = await fetch(`${apiUrl}/embeddings`, {
@@ -166,3 +168,13 @@ export function chunkText(
 
   return chunks.length > 0 ? chunks : [text]
 }
+
+// ── Provider Exports ──────────────────────────────────────────
+
+export {
+  DashScopeProvider,
+  getDashScopeProvider,
+  DASHSCOPE_MODELS,
+  ALL_MODELS,
+  DEFAULT_MODELS,
+} from "./providers/dashscope.js"

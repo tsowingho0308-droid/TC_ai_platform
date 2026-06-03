@@ -3,6 +3,7 @@ import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
 import { mockTenderResult, mockTenderCompare } from "@/lib/server/mock-extraction"
 import type { Prisma } from "@prisma/client"
+import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
 export const dynamic = "force-dynamic"
 export const maxDuration = 120
@@ -17,60 +18,16 @@ async function callAI(req: {
   messages: Array<{ role: string; content: string | unknown[] }>
   tools?: unknown[]
 }) {
-  const apiUrl = process.env.LLM_API_URL || "https://api.poe.com/v1"
-  const apiKey = process.env.LLM_API_KEY || ""
-  const model = req.model || process.env.LLM_MODEL || "Claude-Sonnet-4.5"
-
-  if (!apiKey) {
-    throw new Error("LLM_API_KEY not configured. Set it in .env.local")
-  }
-
-  const body: Record<string, unknown> = {
-    model,
-    messages: req.messages,
+  const provider = getDashScopeProvider()
+  return provider.createCompletion({
+    model: req.model || DEFAULT_MODELS.tender,
     temperature: req.temperature ?? 0.3,
-    max_tokens: req.maxTokens ?? 2000,
-  }
-
-  if (req.responseFormat === "json") {
-    body.response_format = { type: "json_object" }
-  }
-
-  if (req.tools && Array.isArray(req.tools) && req.tools.length > 0) {
-    body.tools = req.tools
-  }
-
-  const response = await fetch(`${apiUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
+    maxTokens: req.maxTokens ?? 2000,
+    responseFormat: req.responseFormat,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    messages: req.messages as any,
+    tools: req.tools as any,
   })
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "Unknown error")
-    throw new Error(`AI provider error: ${response.status} - ${errorText}`)
-  }
-
-  const data = (await response.json()) as Record<string, unknown>
-  const choice = (data.choices as Array<Record<string, unknown>>)?.[0]
-  const message = choice?.message as Record<string, unknown> | undefined
-
-  if (!message) {
-    throw new Error("AI provider returned no message")
-  }
-
-  return {
-    messageContent: (message.content as string) || "",
-    model,
-    toolCalls: (message.tool_calls as Array<{
-      id: string
-      type: "function"
-      function: { name: string; arguments: string }
-    }>) || [],
-  }
 }
 
 // ── Prompt Templates ──────────────────────────────────────────
@@ -333,6 +290,7 @@ async function handleExtract(
   body: Record<string, unknown>
 ) {
   const { sessionId, documentText, fileName, instructions, templateId } = body
+  const model = body.model as string | undefined
 
   if (!documentText) {
     return NextResponse.json({ error: "documentText required" }, { status: 400 })
@@ -344,6 +302,7 @@ async function handleExtract(
     sessionId: sessionId as string | undefined,
     instructions: instructions as string | undefined,
     templateId: templateId as string | undefined,
+    model,
   })
 }
 
@@ -353,13 +312,14 @@ interface TenderExtractionParams {
   sessionId?: string
   instructions?: string
   templateId?: string
+  model?: string
 }
 
 async function performExtraction(
   session: { sub: string; workspaceId: string },
   params: TenderExtractionParams
 ) {
-  const { documentText, fileName, sessionId, instructions } = params
+  const { documentText, fileName, sessionId, instructions, model } = params
 
   const userPrompt = instructions
     ? `Analyze this tender document and extract all structured fields. File: ${fileName || "document"}. Additional instructions: ${instructions}\n\nDocument text:\n${(documentText || "").slice(0, 8000)}`
@@ -378,6 +338,7 @@ async function performExtraction(
 
   try {
     const result = await callAI({
+      model,
       temperature: 0.2,
       maxTokens: 3000,
       responseFormat: "json",
@@ -487,6 +448,7 @@ async function handleStreamExtract(
   const documentText = body.documentText as string | undefined
   const fileName = body.fileName as string | undefined
   const instructions = body.instructions as string | undefined
+  const model = body.model as string | undefined
 
   if (!documentText) {
     return NextResponse.json({ error: "documentText required" }, { status: 400 })
@@ -531,6 +493,7 @@ async function handleStreamExtract(
 
         try {
           const result = await callAI({
+            model,
             temperature: 0.2,
             maxTokens: 3000,
             responseFormat: "json",

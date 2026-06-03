@@ -4,6 +4,8 @@ import { useState, useRef, useCallback, useEffect } from "react"
 import { useRouter } from "next/navigation"
 import { Upload, FileText, Download, Plus, Trash2, Loader2, GitCompare, Brain, BarChart3, Search } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
+import { ModelSelector } from "@/features/shared/model-selector"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
 interface TenderField {
   field: string
@@ -32,6 +34,7 @@ export default function TenderPage() {
   const router = useRouter()
   const [tenders, setTenders] = useState<Array<{ id: string; name: string; fields: TenderField[]; type: string | null }>>([])
   const [analyzing, setAnalyzing] = useState(false)
+  const [model, setModel] = useState(DEFAULT_MODELS.tender)
   const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null)
   const [templates, setTemplates] = useState<Template[]>([])
   const [traceEvents, setTraceEvents] = useState<TraceEvent[]>([])
@@ -99,6 +102,7 @@ export default function TenderPage() {
           documentText: fileText,
           fileName: file.name,
           templateId: selectedTemplate || undefined,
+          model,
         }),
         signal: controller.signal,
       })
@@ -270,6 +274,7 @@ export default function TenderPage() {
             )}
           </div>
           <div className="flex items-center gap-2">
+            <ModelSelector value={model} onChange={setModel} />
             {tenders.length >= 2 && (
               <button
                 onClick={navigateToCompare}

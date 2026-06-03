@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
+import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
 export const dynamic = "force-dynamic"
 
@@ -11,41 +12,18 @@ async function callAI(req: {
   responseFormat?: "json" | "text"
   messages: Array<{ role: string; content: string | unknown[] }>
 }) {
-  const apiUrl = process.env.LLM_API_URL || "https://api.poe.com/v1"
-  const apiKey = process.env.LLM_API_KEY || ""
-  const model = req.model || process.env.LLM_MODEL || "Claude-Sonnet-4.5"
-
-  if (!apiKey) {
-    throw new Error("LLM_API_KEY not configured. Set it in .env.local")
-  }
-
-  const response = await fetch(`${apiUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: req.messages,
-      temperature: req.temperature ?? 0.3,
-      max_tokens: req.maxTokens ?? 2000,
-      response_format: req.responseFormat === "json" ? { type: "json_object" } : undefined,
-    }),
+  const provider = getDashScopeProvider()
+  const result = await provider.createCompletion({
+    model: req.model || DEFAULT_MODELS.finance,
+    temperature: req.temperature ?? 0.3,
+    maxTokens: req.maxTokens ?? 2000,
+    responseFormat: req.responseFormat,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    messages: req.messages as any,
   })
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "Unknown error")
-    throw new Error(`AI provider error: ${response.status} - ${errorText}`)
-  }
-
-  const data = await response.json() as Record<string, unknown>
-  const choice = (data.choices as Array<Record<string, unknown>>)?.[0]
-  const message = choice?.message as Record<string, unknown> | undefined
-
   return {
-    messageContent: (message?.content as string) || "",
-    model,
+    messageContent: result.messageContent,
+    model: result.model,
   }
 }
 
