@@ -1,0 +1,24 @@
+{
+  "name": "combine-ai-platform",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w apps/web",
+    "build": "npm run build -w apps/web",
+    "start": "npm run start -w apps/web",
+    "lint": "npm run lint -w apps/web",
+    "db:generate": "npm run -w @combine-ai/database prisma:generate",
+    "db:migrate": "npm run -w @combine-ai/database prisma:migrate",
+    "db:seed": "npm run -w @combine-ai/database prisma:seed",
+    "db:studio": "npm run -w @combine-ai/database prisma:studio",
+    "clean": "rimraf apps/web/.next packages/*/dist node_modules"
+  },
+  "overrides": {
+    "lodash": "4.18.1"
+  }
+}
