@@ -16,7 +16,10 @@ export async function POST(request: NextRequest) {
 
     switch (action) {
       case "upload": {
-        const { text, title, knowledgeBaseId, tags, language } = body
+        const {
+          text, title, knowledgeBaseId, tags, language,
+          targetAudience, businessProcesses, documentType,
+        } = body
 
         if (!text || typeof text !== "string") {
           return NextResponse.json(
@@ -52,6 +55,9 @@ export async function POST(request: NextRequest) {
             content: text,
             tags: (tags as string[]) || [],
             language: (language as string) || "zh-HK",
+            targetAudience: (targetAudience as never) || "ALL_EMPLOYEES",
+            businessProcesses: (businessProcesses as string[]) || [],
+            documentType: (documentType as never) || "STANDARD",
           },
         })
 
@@ -101,6 +107,9 @@ export async function POST(request: NextRequest) {
               content: article.content.slice(0, 500),
               tags: article.tags,
               language: article.language,
+              targetAudience: article.targetAudience,
+              businessProcesses: article.businessProcesses,
+              documentType: article.documentType,
             },
             chunksCreated: chunks.length,
           },

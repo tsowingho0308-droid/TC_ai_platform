@@ -21,6 +21,9 @@ export function UploadDropzone({ onUploadComplete, onError }: UploadDropzoneProp
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([])
   const [selectedKb, setSelectedKb] = useState("")
   const [title, setTitle] = useState("")
+  const [targetAudience, setTargetAudience] = useState("ALL_EMPLOYEES")
+  const [businessProcesses, setBusinessProcesses] = useState("")
+  const [documentType, setDocumentType] = useState("STANDARD")
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Fetch knowledge bases for selection
@@ -71,7 +74,11 @@ export function UploadDropzone({ onUploadComplete, onError }: UploadDropzoneProp
 
     try {
       setProgress(30)
-      const result = await uploadDocument(file, selectedKb, title || undefined)
+      const result = await uploadDocument(file, selectedKb, title || undefined, {
+        targetAudience,
+        businessProcesses: businessProcesses ? businessProcesses.split(",").map(s => s.trim()).filter(Boolean) : undefined,
+        documentType,
+      })
       setProgress(100)
       setState("success")
 

@@ -56,6 +56,7 @@ model Workspace {
   expensePolicies ExpensePolicy[]
   knowledgeBases  KnowledgeBase[]
   helpdeskTickets HelpdeskTicket[]
+  helpdeskConversations HelpdeskConversation[]
   workflowTemplates WorkflowTemplate[]
   workflowRuns     WorkflowRun[]
   crossAgentLinks  CrossAgentLink[]
@@ -90,6 +91,7 @@ model User {
   financeSessions FinanceSession[]
   helpdeskTickets HelpdeskTicket[]
   assignedHelpdeskTickets HelpdeskTicket[] @relation("HelpdeskTicketAssignee")
+  helpdeskConversations HelpdeskConversation[]
   workflowRuns    WorkflowRun[]
   assignedWorkflowSteps WorkflowStepRun[] @relation("WorkflowStepAssignee")
   uiLanguage      String             @default("zh-HK")
@@ -731,6 +733,25 @@ enum HelpdeskTicketStatus {
   CLOSED
 }
 
+enum TargetAudience {
+  ALL_EMPLOYEES
+  NEW_JOINER
+  MANAGERS
+}
+
+enum LanguageCode {
+  ZH_HK
+  ZH_CN
+  EN
+}
+
+enum DocumentType {
+  STANDARD
+  PLAYBOOK
+  PROCESS_MAP
+  FAQ
+}
+
 model KnowledgeBase {
   id          String            @id @default(cuid())
   workspaceId String
@@ -756,6 +777,11 @@ model KnowledgeArticle {
   tags            String[]
   language        String       @default("zh-HK")
   sourceDocName   String?
+  targetAudience   TargetAudience @default(ALL_EMPLOYEES)
+  businessProcesses String[]      @default([])
+  documentType     DocumentType   @default(STANDARD)
+  linkedArticleIds String[]       @default([])
+  languageCode     LanguageCode   @default(ZH_HK)
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
   knowledgeBase   KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
@@ -802,7 +828,33 @@ model HelpdeskTicket {
 
   @@index([workspaceId, status, createdAt])
   @@index([workspaceId, department, status])
+  conversations HelpdeskConversation[]
+
   @@index([workspaceId, assignedToId, status])
+}
+
+enum HelpdeskConversationStatus {
+  ACTIVE
+  RESOLVED
+  ESCALATED
+}
+
+model HelpdeskConversation {
+  id          String                       @id @default(cuid())
+  workspaceId String
+  userId      String?
+  title       String                       @default("Helpdesk Query")
+  status      HelpdeskConversationStatus   @default(ACTIVE)
+  department  HelpdeskDepartment           @default(GENERAL)
+  ticketId    String?
+  createdAt   DateTime                     @default(now())
+  updatedAt   DateTime                     @updatedAt
+  workspace   Workspace                    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user        User?                        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  ticket      HelpdeskTicket?              @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, userId, updatedAt])
+  @@index([workspaceId, status])
 }
 
 // ── Workflow Agent ───────────────────────────────────────

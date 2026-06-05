@@ -63,6 +63,11 @@ export async function GET(request: NextRequest) {
       tags: doc.tags,
       language: doc.language,
       sourceDocName: doc.sourceDocName,
+      targetAudience: doc.targetAudience,
+      businessProcesses: doc.businessProcesses,
+      documentType: doc.documentType,
+      linkedArticleIds: doc.linkedArticleIds,
+      languageCode: doc.languageCode,
       knowledgeBase: doc.knowledgeBase,
       chunkCount: doc._count.chunks,
       createdAt: doc.createdAt,
@@ -91,6 +96,10 @@ export async function POST(request: NextRequest) {
     const file = formData.get("file") as File | null
     const knowledgeBaseId = formData.get("knowledgeBaseId") as string | null
     const title = formData.get("title") as string | null
+    const targetAudience = formData.get("targetAudience") as string | null
+    const businessProcessesRaw = formData.get("businessProcesses") as string | null
+    const documentType = formData.get("documentType") as string | null
+    const linkedArticleIdsRaw = formData.get("linkedArticleIds") as string | null
 
     if (!file) {
       return NextResponse.json({ error: "No file provided" }, { status: 400 })
@@ -132,13 +141,32 @@ export async function POST(request: NextRequest) {
     const { processDocument } = await import(
       "@/lib/server/document-processor"
     )
+    // Parse comma-separated or JSON array fields
+    const businessProcesses = businessProcessesRaw
+      ? businessProcessesRaw.split(",").map((s) => s.trim()).filter(Boolean)
+      : undefined
+    let linkedArticleIds: string[] | undefined
+    if (linkedArticleIdsRaw) {
+      try {
+        linkedArticleIds = JSON.parse(linkedArticleIdsRaw) as string[]
+      } catch {
+        linkedArticleIds = linkedArticleIdsRaw.split(",").map((s) => s.trim()).filter(Boolean)
+      }
+    }
+
     const { articleId, chunkCount } = await processDocument(
       buffer,
       file.name,
       file.type,
       knowledgeBaseId,
       session.workspaceId,
-      title || file.name.replace(/\.[^.]+$/, "")
+      title || file.name.replace(/\.[^.]+$/, ""),
+      {
+        targetAudience: targetAudience || undefined,
+        businessProcesses,
+        documentType: documentType || undefined,
+        linkedArticleIds,
+      }
     )
 
     // Broadcast context update event

@@ -7,6 +7,11 @@ export interface ContextDocument {
   tags: string[]
   language: string
   sourceDocName?: string
+  targetAudience: string
+  businessProcesses: string[]
+  documentType: string
+  linkedArticleIds: string[]
+  languageCode: string
   knowledgeBase: {
     id: string
     name: string
@@ -65,12 +70,22 @@ export async function listDocuments(params?: {
 export async function uploadDocument(
   file: File,
   knowledgeBaseId: string,
-  title?: string
+  title?: string,
+  metadata?: {
+    targetAudience?: string
+    businessProcesses?: string[]
+    documentType?: string
+    linkedArticleIds?: string[]
+  }
 ): Promise<{ document: ContextDocument; chunksCreated: number }> {
   const formData = new FormData()
   formData.append("file", file)
   formData.append("knowledgeBaseId", knowledgeBaseId)
   if (title) formData.append("title", title)
+  if (metadata?.targetAudience) formData.append("targetAudience", metadata.targetAudience)
+  if (metadata?.businessProcesses?.length) formData.append("businessProcesses", metadata.businessProcesses.join(","))
+  if (metadata?.documentType) formData.append("documentType", metadata.documentType)
+  if (metadata?.linkedArticleIds?.length) formData.append("linkedArticleIds", JSON.stringify(metadata.linkedArticleIds))
 
   const res = await fetch("/api/context/documents", {
     method: "POST",
@@ -120,7 +135,10 @@ export async function ingestText(params: {
   knowledgeBaseId: string
   tags?: string[]
   language?: string
-}): Promise<{ article: { id: string; title: string; content: string; tags: string[]; language: string }; chunksCreated: number }> {
+  targetAudience?: string
+  businessProcesses?: string[]
+  documentType?: string
+}): Promise<{ article: { id: string; title: string; content: string; tags: string[]; language: string; targetAudience: string; businessProcesses: string[]; documentType: string }; chunksCreated: number }> {
   const res = await fetch("/api/context/ingest?action=upload", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

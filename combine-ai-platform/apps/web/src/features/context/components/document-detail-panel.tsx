@@ -130,6 +130,63 @@ export function DocumentDetailPanel({
           </div>
         )}
 
+        {/* Document Type */}
+        {document.documentType && (
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase">
+              Document Type
+            </label>
+            <p className="mt-1">
+              <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                {document.documentType.replace(/_/g, " ")}
+              </span>
+            </p>
+          </div>
+        )}
+
+        {/* Target Audience */}
+        {document.targetAudience && (
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase">
+              Target Audience
+            </label>
+            <p className="mt-1 text-sm capitalize">
+              {document.targetAudience.replace(/_/g, " ").toLowerCase()}
+            </p>
+          </div>
+        )}
+
+        {/* Business Processes */}
+        {document.businessProcesses && document.businessProcesses.length > 0 && (
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase">
+              Business Processes
+            </label>
+            <div className="mt-1 flex flex-wrap gap-1">
+              {document.businessProcesses.map((bp) => (
+                <span
+                  key={bp}
+                  className="rounded-full bg-accent px-2 py-0.5 text-xs font-medium"
+                >
+                  {bp}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Linked Articles */}
+        {document.linkedArticleIds && document.linkedArticleIds.length > 0 && (
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase">
+              Linked Articles
+            </label>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {document.linkedArticleIds.length} referenced document{document.linkedArticleIds.length !== 1 ? "s" : ""}
+            </p>
+          </div>
+        )}
+
         {/* Content Preview */}
         <div>
           <label className="text-xs font-medium text-muted-foreground uppercase flex items-center gap-1">
