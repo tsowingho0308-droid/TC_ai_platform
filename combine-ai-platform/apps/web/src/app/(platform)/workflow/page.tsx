@@ -12,6 +12,7 @@ interface WorkflowRunSummary {
   status: string
   completedSteps: number
   totalSteps: number
+  overdueSteps?: number
   createdAt: string
 }
 
@@ -25,14 +26,49 @@ interface DashboardStats {
 export default function WorkflowPage() {
   const [runs, setRuns] = useState<WorkflowRunSummary[]>([])
   const [loading, setLoading] = useState(true)
+  const [starting, setStarting] = useState(false)
 
-  useEffect(() => {
+  const loadRuns = () => {
     fetch("/api/workflow/runs")
       .then((r) => r.json())
       .then((data) => setRuns(data.runs || []))
       .catch(() => {})
       .finally(() => setLoading(false))
+  }
+
+  useEffect(() => {
+    loadRuns()
+    const handler = () => loadRuns()
+    window.addEventListener("workflow:data-updated", handler)
+    return () => window.removeEventListener("workflow:data-updated", handler)
   }, [])
+
+  async function startOnboarding() {
+    setStarting(true)
+    try {
+      const tmplRes = await fetch("/api/workflow/templates")
+      const tmplData = await tmplRes.json()
+      const template = (tmplData.templates || []).find(
+        (t: { id: string }) => t.id === "template-onboarding-default"
+      )
+      const res = await fetch("/api/workflow/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: `Employee Onboarding — ${new Date().toLocaleDateString()}`,
+          category: "ONBOARDING",
+          templateId: template?.id,
+        }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        window.dispatchEvent(new Event("workflow:data-updated"))
+        window.location.href = `/workflow/runs/${data.run.id}`
+      }
+    } finally {
+      setStarting(false)
+    }
+  }
 
   const activeRuns = runs.filter((r) => r.status === "active")
   const completedRuns = runs.filter((r) => r.status === "completed")
@@ -41,7 +77,7 @@ export default function WorkflowPage() {
     activeRuns: activeRuns.length,
     totalSteps: activeRuns.reduce((sum, r) => sum + r.totalSteps, 0),
     completedSteps: activeRuns.reduce((sum, r) => sum + r.completedSteps, 0),
-    overdueSteps: 0, // Would need SLA tracking logic
+    overdueSteps: activeRuns.reduce((sum, r) => sum + (r.overdueSteps || 0), 0),
   }
 
   return (
@@ -52,6 +88,14 @@ export default function WorkflowPage() {
           <p className="text-xs text-muted-foreground">Cross-department workflow automation & onboarding management</p>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={startOnboarding}
+            disabled={starting}
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-50"
+          >
+            <UserPlus className="h-4 w-4" />
+            {starting ? "Starting..." : "Start Onboarding"}
+          </button>
           <Link
             href="/workflow/templates"
             className="inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent"
@@ -107,6 +151,14 @@ export default function WorkflowPage() {
             <p className="mt-2 max-w-md text-sm text-muted-foreground">
               Workflow Agent automates cross-department processes like employee onboarding, offboarding, and approvals. Each run tracks tasks across Admin, IT, HR, and Management.
             </p>
+            <button
+              onClick={startOnboarding}
+              disabled={starting}
+              className="mt-6 inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
+            >
+              <UserPlus className="h-4 w-4" />
+              {starting ? "Starting..." : "Start Onboarding Workflow"}
+            </button>
           </div>
         ) : (
           <div className="space-y-6">

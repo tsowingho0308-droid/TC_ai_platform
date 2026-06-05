@@ -4,6 +4,18 @@ import { requireSession } from "@/lib/server/auth-helpers"
 
 export const dynamic = "force-dynamic"
 
+function countOverdueSteps(
+  steps: Array<{ status: string; slaHours: number | null; createdAt: Date }>
+) {
+  return steps.filter((step) => {
+    if (step.status === "COMPLETED" || step.status === "SKIPPED" || !step.slaHours) {
+      return false
+    }
+    const elapsed = Date.now() - step.createdAt.getTime()
+    return elapsed > step.slaHours * 60 * 60 * 1000
+  }).length
+}
+
 export async function GET(request: NextRequest) {
   const session = await requireSession().catch(() => null)
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
@@ -36,7 +48,7 @@ export async function GET(request: NextRequest) {
     where: { workspaceId: session.workspaceId },
     orderBy: { createdAt: "desc" },
     include: {
-      steps: { select: { status: true } },
+      steps: { select: { status: true, slaHours: true, createdAt: true } },
     },
     take: 50,
   })
@@ -49,6 +61,7 @@ export async function GET(request: NextRequest) {
     targetPerson: run.targetPerson,
     completedSteps: run.steps.filter(s => s.status === "COMPLETED").length,
     totalSteps: run.steps.length,
+    overdueSteps: countOverdueSteps(run.steps),
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
   }))

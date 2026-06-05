@@ -110,6 +110,7 @@ export default function WorkflowRunDetailPage() {
       if (res.ok) {
         toast.success(`Step ${action}ed`)
         fetchRun()
+        window.dispatchEvent(new Event("workflow:data-updated"))
       } else {
         toast.error("Failed to update step")
       }
