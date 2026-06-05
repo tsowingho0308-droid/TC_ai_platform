@@ -32,6 +32,92 @@ function formatDate(dateStr: string): string {
   })
 }
 
+// ── Document Item (separate component so hooks are top-level) ──
+
+function DocumentItem({
+  doc,
+  isSelected,
+  onSelect,
+  onDelete,
+}: {
+  doc: ContextDocument
+  isSelected: boolean
+  onSelect: (doc: ContextDocument) => void
+  onDelete: (id: string) => void
+}) {
+  const [menuOpen, setMenuOpen] = useState(false)
+
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-4 rounded-lg border p-4 cursor-pointer transition-colors hover:bg-accent/50",
+        isSelected && "border-primary bg-accent/50"
+      )}
+      onClick={() => onSelect(doc)}
+    >
+      {/* Icon */}
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-muted">
+        <FileText className="h-5 w-5 text-muted-foreground" />
+      </div>
+
+      {/* Content */}
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <h4 className="truncate text-sm font-medium">{doc.title}</h4>
+          {doc.chunkCount > 0 && (
+            <BadgeCheck className="h-3.5 w-3.5 text-green-500" aria-label="Vector search enabled" />
+          )}
+        </div>
+        <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+          <span className={cn("rounded-full px-2 py-0.5 text-xs font-medium", DEPARTMENT_COLORS[doc.knowledgeBase.department] || DEPARTMENT_COLORS.GENERAL)}>
+            {doc.knowledgeBase.department}
+          </span>
+          <span>{doc.knowledgeBase.name}</span>
+          <span>·</span>
+          <span>{doc.chunkCount} chunks</span>
+          <span>·</span>
+          <span>{doc.language}</span>
+          <span>·</span>
+          <span>{formatDate(doc.updatedAt)}</span>
+        </div>
+        <p className="mt-1 truncate text-xs text-muted-foreground">
+          {doc.content.slice(0, 150)}
+        </p>
+      </div>
+
+      {/* Actions */}
+      <div className="relative shrink-0">
+        <button
+          onClick={(e) => {
+            e.stopPropagation()
+            setMenuOpen(!menuOpen)
+          }}
+          className="rounded-md p-1 hover:bg-muted"
+        >
+          <MoreVertical className="h-4 w-4 text-muted-foreground" />
+        </button>
+        {menuOpen && (
+          <div className="absolute right-0 top-full z-10 mt-1 w-36 rounded-md border bg-popover shadow-md">
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                onDelete(doc.id)
+                setMenuOpen(false)
+              }}
+              className="flex w-full items-center gap-2 px-3 py-2 text-sm text-destructive hover:bg-muted"
+            >
+              <Trash2 className="h-4 w-4" />
+              Delete
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Main List ──────────────────────────────────────────────────
+
 export function DocumentList({
   documents,
   loading,
@@ -98,77 +184,15 @@ export function DocumentList({
 
   return (
     <div className="space-y-2">
-      {documents.map((doc) => {
-        const [menuOpen, setMenuOpen] = useState(false)
-        return (
-          <div
-            key={doc.id}
-            className={cn(
-              "flex items-center gap-4 rounded-lg border p-4 cursor-pointer transition-colors hover:bg-accent/50",
-              selectedId === doc.id && "border-primary bg-accent/50"
-            )}
-            onClick={() => onSelect(doc)}
-          >
-            {/* Icon */}
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-muted">
-              <FileText className="h-5 w-5 text-muted-foreground" />
-            </div>
-
-            {/* Content */}
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <h4 className="truncate text-sm font-medium">{doc.title}</h4>
-                {doc.chunkCount > 0 && (
-                  <BadgeCheck className="h-3.5 w-3.5 text-green-500" aria-label="Vector search enabled" />
-                )}
-              </div>
-              <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
-                <span className={cn("rounded-full px-2 py-0.5 text-xs font-medium", DEPARTMENT_COLORS[doc.knowledgeBase.department] || DEPARTMENT_COLORS.GENERAL)}>
-                  {doc.knowledgeBase.department}
-                </span>
-                <span>{doc.knowledgeBase.name}</span>
-                <span>·</span>
-                <span>{doc.chunkCount} chunks</span>
-                <span>·</span>
-                <span>{doc.language}</span>
-                <span>·</span>
-                <span>{formatDate(doc.updatedAt)}</span>
-              </div>
-              <p className="mt-1 truncate text-xs text-muted-foreground">
-                {doc.content.slice(0, 150)}
-              </p>
-            </div>
-
-            {/* Actions */}
-            <div className="relative shrink-0">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation()
-                  setMenuOpen(!menuOpen)
-                }}
-                className="rounded-md p-1 hover:bg-muted"
-              >
-                <MoreVertical className="h-4 w-4 text-muted-foreground" />
-              </button>
-              {menuOpen && (
-                <div className="absolute right-0 top-full z-10 mt-1 w-36 rounded-md border bg-popover shadow-md">
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      onDelete(doc.id)
-                      setMenuOpen(false)
-                    }}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-sm text-destructive hover:bg-muted"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                    Delete
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        )
-      })}
+      {documents.map((doc) => (
+        <DocumentItem
+          key={doc.id}
+          doc={doc}
+          isSelected={selectedId === doc.id}
+          onSelect={onSelect}
+          onDelete={onDelete}
+        />
+      ))}
     </div>
   )
 }

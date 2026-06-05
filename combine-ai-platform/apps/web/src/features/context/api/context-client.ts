@@ -77,7 +77,19 @@ export async function uploadDocument(
     documentType?: string
     linkedArticleIds?: string[]
   }
-): Promise<{ document: ContextDocument; chunksCreated: number }> {
+): Promise<{
+    document: ContextDocument
+    chunksCreated: number
+    autoKbMatched?: string | null
+    autoDocCategory?: string | null
+    autoDepartments?: string[]
+    aiSuggestions?: {
+      tags: Array<{ tag: string; confidence: number; reason: string }>
+      suggestedDepartment: string | null
+      suggestedDocumentType: string | null
+      summary: string | null
+    }
+  }> {
   const formData = new FormData()
   formData.append("file", file)
   formData.append("knowledgeBaseId", knowledgeBaseId)

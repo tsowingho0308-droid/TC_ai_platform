@@ -13,7 +13,7 @@ import {
   Ticket,
   RefreshCw,
 } from "lucide-react"
-import { cn } from "@combine-ai/shared-ui"
+import { cn, MarkdownContent } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
 import {
@@ -375,7 +375,7 @@ export default function HelpdeskPage() {
                     </details>
                   )}
 
-                  <p className="text-sm whitespace-pre-wrap">{turn.content}</p>
+                  <MarkdownContent>{turn.content}</MarkdownContent>
 
                   {/* Sources */}
                   {turn.sources && turn.sources.length > 0 && (
@@ -482,10 +482,10 @@ export default function HelpdeskPage() {
 
                   {/* Streaming content */}
                   {streamingContent ? (
-                    <p className="text-sm whitespace-pre-wrap">
-                      {streamingContent}
-                      <span className="animate-pulse">▊</span>
-                    </p>
+                    <div>
+                      <MarkdownContent>{streamingContent}</MarkdownContent>
+                      <span className="animate-pulse text-sm">▊</span>
+                    </div>
                   ) : activeToolCalls.length === 0 && !streamingThinking ? (
                     <div className="flex items-center gap-2">
                       <Loader2 className="h-4 w-4 animate-spin" />

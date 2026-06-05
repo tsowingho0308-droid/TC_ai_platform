@@ -24,6 +24,15 @@ export function UploadDropzone({ onUploadComplete, onError }: UploadDropzoneProp
   const [targetAudience, setTargetAudience] = useState("ALL_EMPLOYEES")
   const [businessProcesses, setBusinessProcesses] = useState("")
   const [documentType, setDocumentType] = useState("STANDARD")
+  const [aiSuggestions, setAiSuggestions] = useState<{
+    tags: Array<{ tag: string; confidence: number; reason: string }>
+    suggestedDepartment: string | null
+    suggestedDocumentType: string | null
+    summary: string | null
+  } | null>(null)
+  const [autoKbMatched, setAutoKbMatched] = useState<string | null>(null)
+  const [autoDocCategory, setAutoDocCategory] = useState<string | null>(null)
+  const [autoDepartments, setAutoDepartments] = useState<string[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Fetch knowledge bases for selection
@@ -64,6 +73,10 @@ export function UploadDropzone({ onUploadComplete, onError }: UploadDropzoneProp
     setTitle(selectedFile.name.replace(/\.[^.]+$/, ""))
     setState("idle")
     setErrorMsg("")
+    setAiSuggestions(null)
+    setAutoKbMatched(null)
+    setAutoDocCategory(null)
+    setAutoDepartments([])
   }, [onError])
 
   const handleUpload = useCallback(async () => {
@@ -81,6 +94,10 @@ export function UploadDropzone({ onUploadComplete, onError }: UploadDropzoneProp
       })
       setProgress(100)
       setState("success")
+      setAiSuggestions(result.aiSuggestions || null)
+      setAutoKbMatched(result.autoKbMatched || null)
+      setAutoDocCategory(result.autoDocCategory || null)
+      setAutoDepartments(result.autoDepartments || [])
 
       setTimeout(() => {
         onUploadComplete(result.document)
@@ -176,6 +193,41 @@ export function UploadDropzone({ onUploadComplete, onError }: UploadDropzoneProp
           <>
             <CheckCircle className="mb-2 h-8 w-8 text-green-500" />
             <p className="text-sm font-medium text-green-700">Document uploaded!</p>
+            {autoKbMatched && (
+              <div className="mt-2 text-xs text-muted-foreground space-y-1">
+                {autoDocCategory && (
+                  <p>📄 Type: <span className="font-medium">{autoDocCategory}</span></p>
+                )}
+                <p>📂 KB: <span className="font-medium">{autoKbMatched}</span></p>
+                {autoDepartments.length > 1 && (
+                  <p>🔗 Also relevant to: <span className="font-medium">{autoDepartments.filter(d => !autoKbMatched?.includes(d)).join(", ")}</span></p>
+                )}
+              </div>
+            )}
+            {aiSuggestions?.tags && aiSuggestions.tags.length > 0 && (
+              <div className="mt-3 w-full border-t pt-3">
+                <p className="text-xs font-medium text-muted-foreground mb-2">
+                  🤖 AI Auto-Tagged:
+                </p>
+                <div className="flex flex-wrap gap-1 justify-center">
+                  {aiSuggestions.tags.map((s) => (
+                    <span
+                      key={s.tag}
+                      title={`${s.reason} (${Math.round(s.confidence * 100)}% confidence)`}
+                      className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary"
+                    >
+                      {s.tag}
+                      <span className="opacity-50">{Math.round(s.confidence * 100)}%</span>
+                    </span>
+                  ))}
+                </div>
+                {aiSuggestions.summary && (
+                  <p className="mt-2 text-xs text-muted-foreground italic">
+                    {aiSuggestions.summary}
+                  </p>
+                )}
+              </div>
+            )}
           </>
         )}
 
@@ -213,6 +265,8 @@ export function UploadDropzone({ onUploadComplete, onError }: UploadDropzoneProp
             onChange={(e) => setSelectedKb(e.target.value)}
             className="rounded border px-2 py-1 text-sm"
           >
+            <option value="auto">🤖 Auto (AI)</option>
+            <option disabled>──────────</option>
             {knowledgeBases.map((kb) => (
               <option key={kb.id} value={kb.id}>
                 {kb.name} ({kb.department})

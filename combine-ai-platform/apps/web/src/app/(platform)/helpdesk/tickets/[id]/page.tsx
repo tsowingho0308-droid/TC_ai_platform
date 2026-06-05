@@ -6,7 +6,7 @@ import {
   ArrowLeft, MessageCircleQuestion, Clock, User, CheckCircle,
   XCircle, ExternalLink, AlertCircle, Send, Loader2
 } from "lucide-react"
-import { cn } from "@combine-ai/shared-ui"
+import { cn, MarkdownContent } from "@combine-ai/shared-ui"
 import { toast } from "sonner"
 
 interface TicketDetail {
@@ -219,7 +219,7 @@ export default function TicketDetailPage() {
                       </span>
                     )}
                   </div>
-                  <p className="text-sm whitespace-pre-wrap">{ticket.aiAnswer}</p>
+                  <MarkdownContent>{ticket.aiAnswer}</MarkdownContent>
 
                   {/* Sources */}
                   {ticket.aiSources && ticket.aiSources.length > 0 && (

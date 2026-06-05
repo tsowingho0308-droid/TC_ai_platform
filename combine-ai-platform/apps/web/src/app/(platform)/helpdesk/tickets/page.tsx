@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback } from "react"
 import Link from "next/link"
 import { MessageCircleQuestion, Clock, CheckCircle, AlertCircle, User, ArrowRight, Filter } from "lucide-react"
-import { cn } from "@combine-ai/shared-ui"
+import { cn, MarkdownContent } from "@combine-ai/shared-ui"
 import { toast } from "sonner"
 
 interface HelpdeskTicket {
@@ -251,7 +251,7 @@ export default function TicketsPage() {
                   </div>
                   {ticket.aiAnswer && (
                     <p className="mt-1 text-xs text-muted-foreground line-clamp-2">
-                      AI: {ticket.aiAnswer}
+                      <span className="text-xs text-muted-foreground">AI:</span> <MarkdownContent compact>{ticket.aiAnswer}</MarkdownContent>
                     </p>
                   )}
                 </div>
