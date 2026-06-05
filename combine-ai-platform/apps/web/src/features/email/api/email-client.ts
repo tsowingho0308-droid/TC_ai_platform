@@ -228,6 +228,7 @@ export async function removeComposeFile(id: string): Promise<void> {
 
 export async function generateComposeDraft(params: {
   brief: string
+  model?: string
   to?: string
   subject?: string
   context?: string
@@ -260,6 +261,7 @@ export async function generateComposeDraft(params: {
 }
 
 export async function rewriteComposeBody(params: {
+  model?: string
   to?: string
   subject?: string
   body: string

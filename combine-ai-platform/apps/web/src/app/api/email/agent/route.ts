@@ -1,9 +1,15 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
-import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { getDashScopeProvider, DEFAULT_MODELS, ALL_MODELS } from "@combine-ai/ai-provider"
 
 export const dynamic = "force-dynamic"
+
+function resolveComposeModel(model: unknown) {
+  if (typeof model !== "string" || !model.trim()) return DEFAULT_MODELS.email
+  const allowed = new Set(ALL_MODELS.map((m) => m.value))
+  return allowed.has(model) ? model : DEFAULT_MODELS.email
+}
 
 /** Unified AI call via DashScope provider */
 async function callAI(req: {
@@ -729,7 +735,10 @@ export async function POST(request: NextRequest) {
           }
         }
 
+        const composeModel = resolveComposeModel(body.model)
+
         const result = await callAI({
+          model: composeModel,
           temperature: 0.5,
           maxTokens: 1200,
           responseFormat: "json",
@@ -775,7 +784,10 @@ export async function POST(request: NextRequest) {
 
         if (!draftBody) return NextResponse.json({ error: "body is required" }, { status: 400 })
 
+        const composeModel = resolveComposeModel(body.model)
+
         const result = await callAI({
+          model: composeModel,
           temperature: 0.4,
           maxTokens: 1200,
           messages: [
