@@ -3,6 +3,10 @@ import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
 import { createHmac, timingSafeEqual } from "node:crypto"
 import { IntegrationStatus, MailProvider, MessageDirection } from "@prisma/client"
+import {
+  buildAttachmentStoragePath,
+  saveAttachmentFile,
+} from "@/lib/server/email-attachment-store"
 
 export const dynamic = "force-dynamic"
 
@@ -28,8 +32,21 @@ type GmailListMessagesResponse = {
 
 type GmailMessagePart = {
   mimeType?: string
-  body?: { data?: string }
+  filename?: string
+  body?: { data?: string; attachmentId?: string; size?: number }
   parts?: GmailMessagePart[]
+}
+
+type GmailAttachmentMeta = {
+  fileName: string
+  mimeType: string
+  attachmentId: string
+  sizeBytes: number
+}
+
+type GmailAttachmentResponse = {
+  data?: string
+  size?: number
 }
 
 type GmailMessageDetailResponse = {
@@ -62,20 +79,26 @@ function encodeState(payload: OAuthStatePayload) {
 }
 
 function decodeState(raw: string): OAuthStatePayload {
-  const [body, sig] = raw.split(".")
-  if (!body || !sig) throw new Error("Invalid OAuth state")
+  const dotIndex = raw.lastIndexOf(".")
+  if (dotIndex <= 0 || dotIndex >= raw.length - 1) {
+    throw new Error("OAuth link expired — click Connect again")
+  }
+  const body = raw.slice(0, dotIndex)
+  const sig = raw.slice(dotIndex + 1)
   const expected = createHmac("sha256", getStateSecret()).update(body).digest("base64url")
   const sigBuf = Buffer.from(sig)
   const expectedBuf = Buffer.from(expected)
   if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) {
-    throw new Error("Invalid OAuth state signature")
+    throw new Error("OAuth link expired — click Connect again")
   }
 
   const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as OAuthStatePayload
   if (!payload.workspaceId || !payload.inboxId || !payload.actorId || !payload.issuedAt) {
-    throw new Error("Invalid OAuth state payload")
+    throw new Error("OAuth link expired — click Connect again")
   }
-  if (Date.now() - payload.issuedAt > 10 * 60 * 1000) throw new Error("OAuth state expired")
+  if (Date.now() - payload.issuedAt > 60 * 60 * 1000) {
+    throw new Error("OAuth link expired — click Connect again")
+  }
   return payload
 }
 
@@ -131,6 +154,79 @@ function collectBodies(message: GmailMessageDetailResponse) {
 
 function stripHtml(value: string) {
   return value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
+}
+
+function collectAttachments(message: GmailMessageDetailResponse): GmailAttachmentMeta[] {
+  const results: GmailAttachmentMeta[] = []
+  const visit = (part?: GmailMessagePart) => {
+    if (!part) return
+    const fileName = part.filename?.trim()
+    const attachmentId = part.body?.attachmentId
+    if (fileName && attachmentId) {
+      results.push({
+        fileName,
+        mimeType: part.mimeType || "application/octet-stream",
+        attachmentId,
+        sizeBytes: part.body?.size || 0,
+      })
+    }
+    for (const child of part.parts || []) visit(child)
+  }
+  visit(message.payload as GmailMessagePart | undefined)
+  return results
+}
+
+async function downloadGmailAttachment(accessToken: string, messageId: string, attachmentId: string) {
+  const response = await gmailApi<GmailAttachmentResponse>(
+    accessToken,
+    `/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}`
+  )
+  if (!response.data) return null
+  return Buffer.from(response.data, "base64url")
+}
+
+async function syncMessageAttachments(params: {
+  workspaceId: string
+  conversationId: string
+  messageId: string
+  gmailMessageId: string
+  accessToken: string
+  attachments: GmailAttachmentMeta[]
+}) {
+  for (const att of params.attachments) {
+    const existing = await prisma.messageAttachment.findFirst({
+      where: {
+        workspaceId: params.workspaceId,
+        messageId: params.messageId,
+        providerAttachmentId: att.attachmentId,
+        fileName: att.fileName,
+      },
+    })
+    if (existing) continue
+
+    const buffer = await downloadGmailAttachment(params.accessToken, params.gmailMessageId, att.attachmentId)
+    if (!buffer || buffer.length === 0) continue
+
+    const recordId = `att-${params.messageId}-${att.attachmentId}`.slice(0, 80)
+    const storagePath = buildAttachmentStoragePath(params.workspaceId, recordId, att.fileName)
+    await saveAttachmentFile(storagePath, buffer)
+
+    await prisma.messageAttachment.create({
+      data: {
+        id: recordId,
+        workspaceId: params.workspaceId,
+        conversationId: params.conversationId,
+        messageId: params.messageId,
+        fileName: att.fileName,
+        mimeType: att.mimeType,
+        sizeBytes: buffer.length,
+        storagePath,
+        sourceProvider: MailProvider.GMAIL,
+        providerMessageId: params.gmailMessageId,
+        providerAttachmentId: att.attachmentId,
+      },
+    })
+  }
 }
 
 function mapFolder(labelIds: string[]) {
@@ -305,23 +401,36 @@ async function runManualSync(params: {
         },
       })
 
-      if (!existed) {
-        await prisma.message.create({
-          data: {
-            workspaceId: params.workspaceId,
-            conversationId: conversation.id,
-            direction,
-            sourceProvider: MailProvider.GMAIL,
-            providerMessageId: msg.id,
-            providerThreadId: thread.id,
-            body,
-            bodyText,
-            bodyHtml,
-            gmailLabelIds: msg.labelIds || [],
-            createdAt: msg.internalDate ? new Date(Number(msg.internalDate)) : new Date(),
-          },
+      const dbMessage = existed
+        ? existed
+        : await prisma.message.create({
+            data: {
+              workspaceId: params.workspaceId,
+              conversationId: conversation.id,
+              direction,
+              sourceProvider: MailProvider.GMAIL,
+              providerMessageId: msg.id,
+              providerThreadId: thread.id,
+              body,
+              bodyText,
+              bodyHtml,
+              gmailLabelIds: msg.labelIds || [],
+              createdAt: msg.internalDate ? new Date(Number(msg.internalDate)) : new Date(),
+            },
+          })
+
+      if (!existed) messagesCreated += 1
+
+      const attachmentParts = collectAttachments(msg)
+      if (attachmentParts.length > 0) {
+        await syncMessageAttachments({
+          workspaceId: params.workspaceId,
+          conversationId: conversation.id,
+          messageId: dbMessage.id,
+          gmailMessageId: msg.id,
+          accessToken: params.accessToken,
+          attachments: attachmentParts,
         })
-        messagesCreated += 1
       }
     }
 
@@ -367,6 +476,12 @@ export async function GET(request: NextRequest) {
         const tokens = (await tokenResponse.json()) as GoogleTokenResponse
         if (!tokenResponse.ok || !tokens.access_token) {
           throw new Error(tokens.error_description || tokens.error || "Failed to exchange code")
+        }
+
+        const grantedScopes = (tokens.scope || "").split(" ").filter(Boolean)
+        const hasGmailScope = grantedScopes.some((scope) => scope.includes("gmail"))
+        if (!hasGmailScope) {
+          throw new Error("Gmail permissions not granted — reconnect and allow all permissions")
         }
 
         const userInfo = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
@@ -459,7 +574,6 @@ export async function GET(request: NextRequest) {
         scope: getGoogleScopes(),
         access_type: "offline",
         prompt: "consent",
-        include_granted_scopes: "true",
         state: encodeState({
           workspaceId: session.workspaceId,
           inboxId,
@@ -487,6 +601,16 @@ export async function POST(request: NextRequest) {
     const action = url.searchParams.get("action")
 
     switch (action) {
+      case "disconnect": {
+        const { inboxId } = await request.json() as { inboxId?: string }
+        if (!inboxId) return NextResponse.json({ error: "inboxId required" }, { status: 400 })
+
+        await prisma.mailIntegration.deleteMany({
+          where: { inboxId, workspaceId: session.workspaceId, provider: "GMAIL" },
+        })
+        return NextResponse.json({ success: true })
+      }
+
       case "sync": {
         const { inboxId } = await request.json() as { inboxId?: string }
         if (!inboxId) return NextResponse.json({ error: "inboxId required" }, { status: 400 })

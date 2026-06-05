@@ -1,8 +1,9 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Loader2, Bot, Send, FileText, ExternalLink } from "lucide-react"
+import { Loader2, Bot, Send, FileText, ExternalLink, Paperclip } from "lucide-react"
 import { getConversation, generateReplySuggestion, classifyConversation, runConversationTriage } from "../api/email-client"
+import { useCrossAgent } from "@/features/cross-agent/use-cross-agent"
 import { cn } from "@combine-ai/shared-ui"
 
 interface ConversationDetail {
@@ -24,6 +25,14 @@ interface ConversationDetail {
     bodyText: string | null
     createdAt: string
   }>
+  attachments: Array<{
+    id: string
+    fileName: string
+    mimeType: string
+    sizeBytes: number
+    messageId: string
+    createdAt: string
+  }>
   inquiryTasks: Array<{
     id: string
     questionTitle: string
@@ -41,12 +50,15 @@ interface MailDisplayProps {
 }
 
 export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
+  const { openInTenderAgent, openInReportAgent, createLink } = useCrossAgent()
   const [conversation, setConversation] = useState<ConversationDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [replyDraft, setReplyDraft] = useState("")
   const [generating, setGenerating] = useState(false)
   const [classifying, setClassifying] = useState(false)
   const [triaging, setTriaging] = useState(false)
+  const [openingTender, setOpeningTender] = useState(false)
+  const [openingReport, setOpeningReport] = useState(false)
 
   useEffect(() => {
     if (!conversationId) {
@@ -110,6 +122,70 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
       console.error("Triage failed:", err)
     } finally {
       setTriaging(false)
+    }
+  }
+
+  const attachments = conversation?.attachments ?? []
+
+  function getPrimaryDocumentAttachment() {
+    if (!attachments.length) return null
+    return (
+      attachments.find(
+        (att) =>
+          att.mimeType === "application/pdf" ||
+          att.fileName.toLowerCase().endsWith(".pdf") ||
+          att.fileName.toLowerCase().endsWith(".docx")
+      ) || attachments[0]
+    )
+  }
+
+  async function handleOpenInTender() {
+    if (!conversationId || !conversation) return
+    setOpeningTender(true)
+    try {
+      const primaryAttachment = getPrimaryDocumentAttachment()
+      await createLink({
+        sourceType: "email",
+        sourceId: conversationId,
+        targetType: "tender",
+        targetId: conversationId,
+        linkType: primaryAttachment ? "attachment" : "reference",
+      })
+      await openInTenderAgent({
+        sourceId: conversationId,
+        subject: conversation.subject,
+        attachmentId: primaryAttachment?.id,
+        attachmentName: primaryAttachment?.fileName,
+      })
+    } catch (err) {
+      console.error("Failed to open in Tender:", err)
+    } finally {
+      setOpeningTender(false)
+    }
+  }
+
+  async function handleExtractWithReport() {
+    if (!conversationId || !conversation) return
+    setOpeningReport(true)
+    try {
+      const primaryAttachment = getPrimaryDocumentAttachment()
+      await createLink({
+        sourceType: "email",
+        sourceId: conversationId,
+        targetType: "report",
+        targetId: conversationId,
+        linkType: primaryAttachment ? "attachment" : "reference",
+      })
+      await openInReportAgent({
+        sourceId: conversationId,
+        subject: conversation.subject,
+        attachmentId: primaryAttachment?.id,
+        attachmentName: primaryAttachment?.fileName,
+      })
+    } catch (err) {
+      console.error("Failed to extract with Report:", err)
+    } finally {
+      setOpeningReport(false)
     }
   }
 
@@ -200,13 +276,21 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
             <Bot className="h-3.5 w-3.5" />
             {generating ? "Generating..." : "AI Reply Suggestion"}
           </button>
-          <button className="inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs hover:bg-accent">
+          <button
+            onClick={handleOpenInTender}
+            disabled={openingTender}
+            className="inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs hover:bg-accent disabled:opacity-50"
+          >
             <ExternalLink className="h-3.5 w-3.5" />
-            Open in Tender
+            {openingTender ? "Opening..." : "Open in Tender"}
           </button>
-          <button className="inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs hover:bg-accent">
+          <button
+            onClick={handleExtractWithReport}
+            disabled={openingReport}
+            className="inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs hover:bg-accent disabled:opacity-50"
+          >
             <FileText className="h-3.5 w-3.5" />
-            Extract with Report
+            {openingReport ? "Opening..." : "Extract with Report"}
           </button>
         </div>
       </header>
@@ -224,6 +308,21 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
             <div className="prose prose-sm max-w-none text-sm whitespace-pre-wrap">
               {msg.bodyText || msg.body}
             </div>
+            {attachments
+              .filter((att) => att.messageId === msg.id)
+              .map((att) => (
+                <a
+                  key={att.id}
+                  href={`/api/email/attachments?action=download&id=${encodeURIComponent(att.id)}`}
+                  className="mt-3 inline-flex items-center gap-2 rounded-md border bg-accent/40 px-3 py-2 text-xs hover:bg-accent"
+                >
+                  <Paperclip className="h-3.5 w-3.5" />
+                  <span>{att.fileName}</span>
+                  <span className="text-muted-foreground">
+                    ({Math.max(1, Math.round(att.sizeBytes / 1024))} KB)
+                  </span>
+                </a>
+              ))}
           </div>
         ))}
       </div>

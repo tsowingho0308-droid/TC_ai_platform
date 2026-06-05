@@ -22,6 +22,17 @@ export async function GET(request: NextRequest) {
       where: { id: conversationId, workspaceId: session.workspaceId },
       include: {
         messages: { orderBy: { createdAt: "asc" } },
+        attachments: {
+          orderBy: { createdAt: "asc" },
+          select: {
+            id: true,
+            fileName: true,
+            mimeType: true,
+            sizeBytes: true,
+            messageId: true,
+            createdAt: true,
+          },
+        },
         inquiryTasks: {
           orderBy: { sortOrder: "asc" },
           include: { childConversation: { select: { id: true, subject: true, status: true } } },

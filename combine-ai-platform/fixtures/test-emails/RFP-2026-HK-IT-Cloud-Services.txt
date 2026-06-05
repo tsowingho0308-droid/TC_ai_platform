@@ -1,0 +1,144 @@
+================================================================================
+REQUEST FOR PROPOSAL (RFP)
+IT Cloud Infrastructure & Managed Services
+================================================================================
+
+Tender Reference Number : HK-IT-2026-0042
+Issuing Organization    : Hong Kong Digital Transformation Bureau (HKDTB)
+Tender Type             : Open Tender
+Industry/Sector         : Government IT Services
+Document Version        : 1.0
+Issue Date              : 2026-05-15
+
+--------------------------------------------------------------------------------
+1. INVITATION TO TENDER
+--------------------------------------------------------------------------------
+
+The Hong Kong Digital Transformation Bureau invites qualified IT service providers
+to submit proposals for the provision of Cloud Infrastructure and Managed Services
+for a period of 36 months, with an option to extend for a further 12 months.
+
+This RFP covers migration of on-premises workloads to a hybrid cloud environment,
+24/7 managed operations, security monitoring, and disaster recovery services.
+
+--------------------------------------------------------------------------------
+2. SCOPE OF WORK
+--------------------------------------------------------------------------------
+
+2.1 Services Included
+  - Hybrid cloud architecture design and implementation (AWS + Azure)
+  - Migration of 120+ virtual machines and 45 databases
+  - 24/7 NOC monitoring and incident response (SLA: P1 within 15 minutes)
+  - Security Operations Center (SOC) with SIEM integration
+  - Backup, disaster recovery, and business continuity (RPO 1hr, RTO 4hr)
+  - Identity & access management (Azure AD / Okta integration)
+  - Monthly performance reporting and quarterly service reviews
+  - Dedicated account manager and technical lead on-site 2 days/week
+
+2.2 Services Excluded
+  - End-user desktop support (covered under separate helpdesk contract)
+  - Software licensing procurement (client retains direct vendor relationships)
+  - Physical data centre build-out or cabling works
+  - Custom application development beyond migration tooling
+
+2.3 Key Deliverables
+  - Cloud migration roadmap and execution plan (Month 1)
+  - Completed workload migration with zero-downtime cutover plan (Month 1-6)
+  - SOC runbook, incident playbooks, and DR test reports (Month 3)
+  - Monthly SLA compliance dashboard (ongoing)
+  - Knowledge transfer and handover documentation (Month 36)
+
+2.4 Key Requirements / Qualifications
+  - Minimum 5 years experience in enterprise cloud managed services in APAC
+  - AWS Advanced Consulting Partner AND Microsoft Azure Expert MSP status
+  - ISO 27001 and ISO 20000 certifications (valid at submission date)
+  - Minimum 3 references for government or regulated-industry cloud projects >HK$10M
+  - Dedicated Hong Kong-based project team with Cantonese/English fluency
+  - Proposed team must include: 1 Project Director, 2 Cloud Architects, 4 Engineers
+
+2.5 Contract Duration
+  - Initial term: 36 months from contract commencement
+  - Optional extension: 12 months at client's discretion
+
+--------------------------------------------------------------------------------
+3. FINANCIAL INFORMATION
+--------------------------------------------------------------------------------
+
+Estimated Budget / Tender Value : HK$28,500,000 (inclusive of all fees)
+Currency                          : HKD
+Payment Terms                     : Monthly in arrears upon milestone acceptance
+Bid Bond Required                 : Yes — 2% of total bid value (HK$570,000)
+Performance Bond Required         : Yes — 10% of contract value upon award
+
+--------------------------------------------------------------------------------
+4. TIMELINE
+--------------------------------------------------------------------------------
+
+Tender Issue Date           : 2026-05-15
+Pre-Tender Briefing         : 2026-05-22 (14:00 HKT, HKDTB Conference Room B)
+Site Visit Date             : 2026-05-28 (10:00 HKT, Primary Data Centre, Kwun Tong)
+Clarification Deadline      : 2026-06-05 (17:00 HKT)
+Submission Deadline         : 2026-06-30 (17:00 HKT) — LATE SUBMISSIONS NOT ACCEPTED
+Tender Validity Period      : 180 days from submission deadline
+Expected Award Date         : 2026-08-15
+Contract Start Date         : 2026-09-01
+
+--------------------------------------------------------------------------------
+5. SUBMISSION REQUIREMENTS
+--------------------------------------------------------------------------------
+
+Submission Method     : Electronic via HKDTB Procurement Portal (https://procure.hkdtb.gov.hk)
+                       Hard copy backup: 1 sealed envelope to HKDTB Procurement Office
+
+Required Documents:
+  1. Technical Proposal (max 80 pages, PDF)
+  2. Financial Proposal (separate sealed envelope / encrypted upload)
+  3. Company profile and organizational chart
+  4. Certifications (ISO 27001, ISO 20000, partner accreditations)
+  5. Client reference letters (minimum 3)
+  6. Proposed team CVs and role assignments
+  7. Migration methodology and risk mitigation plan
+  8. SLA commitment matrix
+  9. Signed Declaration of Non-Collusion (Form DTB-7)
+
+Technical Proposal Format : PDF, A4, minimum 11pt font
+Financial Proposal Format : Excel template (Form FIN-2026-42) + signed PDF summary
+Language Requirements     : English (Chinese summary optional, max 5 pages)
+Number of Copies          : 1 electronic + 1 hard copy backup
+
+--------------------------------------------------------------------------------
+6. EVALUATION CRITERIA
+--------------------------------------------------------------------------------
+
+Evaluation Criteria              Weight
+-------------------------------- --------
+Technical Capability & Methodology   40%
+Team Experience & Qualifications     20%
+Price / Cost Effectiveness           30%
+SLA Commitments & Risk Management    10%
+-------------------------------- --------
+Total                               100%
+
+Presentation/Interview Required : Yes — shortlisted bidders (top 3) invited week of 2026-07-14
+Shortlist Process               : Minimum technical score of 70/100 to proceed to financial evaluation
+
+--------------------------------------------------------------------------------
+7. CONTACT INFORMATION
+--------------------------------------------------------------------------------
+
+Contact Person  : Ms. Fiona Cheung
+Title           : Senior Procurement Manager
+Department      : IT Procurement Division, HKDTB
+Contact Email   : procurement.it@hkdtb.gov.hk
+Contact Phone   : +852 2345 6789
+Office Address  : 88 Cyberport Road, Hong Kong
+
+For technical clarifications:
+Contact Person  : Mr. David Lam
+Title           : Chief Technology Officer (Acting)
+Contact Email   : david.lam@hkdtb.gov.hk
+Contact Phone   : +852 2345 6790
+
+--------------------------------------------------------------------------------
+END OF RFP DOCUMENT
+================================================================================

@@ -1,0 +1,35 @@
+TENDER TEST EMAIL — HOW TO USE
+==============================
+
+OPTION A: Use seeded email with PDF attachment (fastest)
+-------------------------------------------------------
+1. Run: npm run db:seed:test-email
+2. Open http://localhost:3000/email
+3. Find: [RFP] IT Cloud Infrastructure & Managed Services — Ref: HK-IT-2026-0042
+4. Click "Open in Tender" — PDF attachment is passed automatically
+5. On Tender page click "Analyze PDF" on RFP-2026-HK-IT-Cloud-Services.pdf
+
+OPTION B: Upload PDF on Tender page directly
+--------------------------------------------
+1. Go to http://localhost:3000/tender
+2. Upload: fixtures/test-emails/RFP-2026-HK-IT-Cloud-Services.pdf
+3. Select template: "IT Services Tender Analysis"
+4. Wait for extraction (should get 20+ fields)
+
+OPTION C: Send real Gmail with PDF attachment
+---------------------------------------------
+1. Open Gmail, compose new email TO your connected account
+2. Subject: [RFP] IT Cloud Infrastructure & Managed Services — Ref: HK-IT-2026-0042
+3. Body: copy from email-cover-letter.txt
+4. Attach: RFP-2026-HK-IT-Cloud-Services.pdf
+5. Send, then in app click Sync on Email page
+
+Note: Gmail sync now downloads and stores PDF/DOCX/TXT attachments.
+After sending a real email with PDF (Option C), click Sync in Email Agent,
+then Open in Tender to analyze the attachment.
+
+FILES IN THIS FOLDER
+--------------------
+RFP-2026-HK-IT-Cloud-Services.txt   Full RFP document (plain text)
+RFP-2026-HK-IT-Cloud-Services.pdf   Same document as PDF
+email-cover-letter.txt              Email wrapper / cover letter body

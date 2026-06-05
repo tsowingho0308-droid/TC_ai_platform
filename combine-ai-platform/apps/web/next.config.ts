@@ -5,6 +5,7 @@ const projectRoot = path.resolve(import.meta.dirname, "../..")
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  serverExternalPackages: ["pdf-parse", "pdfjs-dist", "mammoth"],
   turbopack: {
     root: projectRoot,
   },
