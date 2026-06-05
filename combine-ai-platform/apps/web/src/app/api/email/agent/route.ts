@@ -79,6 +79,101 @@ type ClassificationResult = {
   department: string
 }
 
+const COMPOSE_DRAFT_PROMPT = `You are a professional business email assistant.
+The user describes what email they want in natural language (recipient, purpose, key points, tone).
+
+Respond ONLY in JSON:
+{
+  "to": "recipient@email.com",
+  "subject": "Professional subject line",
+  "body": "Full email body with salutation, paragraphs, and sign-off"
+}
+
+Language rules (CRITICAL):
+- DEFAULT: Write subject and body in the SAME language the user wrote their brief in.
+  (Chinese brief → Chinese email; Japanese brief → Japanese email; English brief → English email.)
+- OVERRIDE: Use a different language ONLY when the user explicitly asks (e.g. "用英文写", "write in English", "en français").
+- subject and body must be ENTIRELY in one language — no mixing.
+- "to" is always an email address (unchanged).
+- Use culturally appropriate salutation and sign-off for that language.
+
+Content rules:
+- Extract recipient email from the brief when provided.
+- Do not put "To:" or "Subject:" labels inside the body.`
+
+const COMPOSE_REWRITE_PROMPT = `You are a professional business email editor.
+Improve the draft to be MORE detailed and MORE formal/professional.
+
+Rules:
+- Write in the EXACT SAME language as the draft — do not translate or mix languages.
+- Expand brief points into clear paragraphs; fix grammar and flow.
+- Do NOT invent new facts, dates, or commitments.
+- Return ONLY the improved email body (salutation through sign-off).`
+
+function inferNameFromEmail(email: string) {
+  const local = email.split("@")[0] || ""
+  const cleaned = local.replace(/[._+\-0-9]+/g, " ").trim()
+  if (!cleaned) return "there"
+  return cleaned
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ")
+}
+
+function extractEmailFromText(value: string) {
+  const match = value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)
+  return match?.[0] || ""
+}
+
+type ComposeDraftResult = {
+  to: string
+  subject: string
+  body: string
+}
+
+function safeParseComposeDraft(raw: string | null | undefined): ComposeDraftResult | null {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as { to?: string; subject?: string; body?: string }
+    if (!parsed.body?.trim()) return null
+    return {
+      to: (parsed.to || "").trim(),
+      subject: (parsed.subject || "").trim() || "Follow-up",
+      body: parsed.body.trim(),
+    }
+  } catch {
+    return null
+  }
+}
+
+function buildFallbackComposeDraft(params: {
+  to?: string
+  subject?: string
+  brief?: string
+  recipientName?: string
+}): ComposeDraftResult {
+  const to = params.to || extractEmailFromText(params.brief || "")
+  const name = params.recipientName || (to ? inferNameFromEmail(to) : "there")
+  const subject = params.subject || "Follow-up"
+  const contextLine = params.brief
+    ? `Regarding: ${normalizeText(params.brief).slice(0, 300)}`
+    : `Regarding: ${subject}`
+
+  const body = [
+    `Dear ${name},`,
+    "",
+    contextLine,
+    "",
+    "I hope this message finds you well. Please let me know if you need any further information.",
+    "",
+    "Yours faithfully,",
+    "Combine AI Team",
+  ].join("\n")
+
+  return { to, subject, body }
+}
+
 function normalizeText(value: string) {
   return value.replace(/\s+/g, " ").trim()
 }
@@ -599,6 +694,108 @@ export async function POST(request: NextRequest) {
             tasks: refreshed?.inquiryTasks || [],
           },
         })
+      }
+
+      case "compose-draft": {
+        const brief = typeof body.brief === "string" ? body.brief.trim() : ""
+        const hintTo = typeof body.to === "string" ? body.to.trim() : ""
+        const hintSubject = typeof body.subject === "string" ? body.subject.trim() : ""
+        const context = typeof body.context === "string" ? body.context.trim() : ""
+        const recipientName = typeof body.recipientName === "string" ? body.recipientName.trim() : ""
+
+        if (!brief && !hintTo && typeof body.conversationId !== "string") {
+          return NextResponse.json({ error: "brief is required" }, { status: 400 })
+        }
+
+        let emailContext = [brief, context].filter(Boolean).join("\n\n")
+        if (typeof body.conversationId === "string") {
+          const conversation = await prisma.conversation.findFirst({
+            where: { id: body.conversationId, workspaceId: session.workspaceId },
+            include: { messages: { orderBy: { createdAt: "asc" }, take: 3 } },
+          })
+          if (conversation) {
+            const threadPreview = conversation.messages
+              .map((m) => `${m.direction}: ${(m.bodyText || m.body || "").slice(0, 800)}`)
+              .join("\n---\n")
+            emailContext = [
+              emailContext,
+              `Replying to thread.`,
+              `Recipient: ${conversation.senderName} <${conversation.senderEmail}>`,
+              `Original subject: ${conversation.subject}`,
+              threadPreview,
+            ]
+              .filter(Boolean)
+              .join("\n\n")
+          }
+        }
+
+        const result = await callAI({
+          temperature: 0.5,
+          maxTokens: 1200,
+          responseFormat: "json",
+          messages: [
+            { role: "system", content: COMPOSE_DRAFT_PROMPT },
+            {
+              role: "user",
+              content: [
+                `User brief (write subject + body in THIS language unless user explicitly requests another language):\n${emailContext.slice(0, 5000) || "Write a polite follow-up email."}`,
+                hintTo ? `Hint — recipient email: ${hintTo}` : "",
+                hintSubject ? `Hint — subject: ${hintSubject}` : "",
+                recipientName ? `Hint — recipient name: ${recipientName}` : "",
+              ]
+                .filter(Boolean)
+                .join("\n\n"),
+            },
+          ],
+        })
+
+        const parsed = safeParseComposeDraft(result.messageContent)
+        const draft = parsed || buildFallbackComposeDraft({
+          to: hintTo || extractEmailFromText(emailContext),
+          subject: hintSubject,
+          brief: emailContext,
+          recipientName: recipientName || undefined,
+        })
+
+        if (hintTo && !draft.to) draft.to = hintTo
+        if (hintSubject && (!draft.subject || draft.subject === "Follow-up")) draft.subject = hintSubject
+
+        return NextResponse.json({
+          to: draft.to,
+          subject: draft.subject,
+          body: draft.body,
+          draft: draft.body,
+        })
+      }
+
+      case "compose-rewrite": {
+        const to = typeof body.to === "string" ? body.to.trim() : ""
+        const subject = typeof body.subject === "string" ? body.subject.trim() : ""
+        const draftBody = typeof body.body === "string" ? body.body.trim() : ""
+
+        if (!draftBody) return NextResponse.json({ error: "body is required" }, { status: 400 })
+
+        const result = await callAI({
+          temperature: 0.4,
+          maxTokens: 1200,
+          messages: [
+            { role: "system", content: COMPOSE_REWRITE_PROMPT },
+            {
+              role: "user",
+              content: [
+                to ? `Recipient: ${to}` : "",
+                subject ? `Subject (keep same language): ${subject}` : "",
+                "Draft to improve (keep same language):",
+                draftBody.slice(0, 6000),
+              ]
+                .filter(Boolean)
+                .join("\n"),
+            },
+          ],
+        })
+
+        const rewritten = result.messageContent?.trim() || draftBody
+        return NextResponse.json({ body: rewritten })
       }
 
       default:

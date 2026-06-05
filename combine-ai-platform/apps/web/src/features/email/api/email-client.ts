@@ -29,6 +29,7 @@ interface AttachmentSummary {
 }
 
 interface ConversationDetail extends ConversationSummary {
+  replyTo: string
   messages: MessageDetail[]
   attachments: AttachmentSummary[]
   inquiryTasks: InquiryTaskSummary[]
@@ -199,4 +200,115 @@ export async function syncGmail(inboxId: string): Promise<string> {
     throw new Error(data.detail || data.error || "Failed to start sync")
   }
   return data.syncRunId || ""
+}
+
+export interface ComposeUploadedFile {
+  id: string
+  fileName: string
+  mimeType: string
+  sizeBytes: number
+  textExcerpt: string
+}
+
+export async function uploadComposeFile(file: File): Promise<ComposeUploadedFile> {
+  const formData = new FormData()
+  formData.append("file", file)
+  const res = await fetch("/api/email/compose/files", { method: "POST", body: formData })
+  const data = await res.json().catch(() => ({})) as ComposeUploadedFile & { error?: string; detail?: string }
+  if (!res.ok) {
+    throw new Error(data.detail || data.error || "Failed to upload file")
+  }
+  return data
+}
+
+export async function removeComposeFile(id: string): Promise<void> {
+  const res = await fetch(`/api/email/compose/files?id=${encodeURIComponent(id)}`, { method: "DELETE" })
+  if (!res.ok) throw new Error("Failed to remove file")
+}
+
+export async function generateComposeDraft(params: {
+  brief: string
+  to?: string
+  subject?: string
+  context?: string
+  recipientName?: string
+  conversationId?: string
+}): Promise<{ to: string; subject: string; body: string; draft: string }> {
+  const res = await fetch("/api/email/agent?action=compose-draft", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  })
+  const data = await res.json().catch(() => ({})) as {
+    to?: string
+    subject?: string
+    body?: string
+    draft?: string
+    error?: string
+    detail?: string
+  }
+  if (!res.ok) {
+    throw new Error(data.detail || data.error || "Failed to generate draft")
+  }
+  const bodyText = data.body || data.draft || ""
+  return {
+    to: data.to || "",
+    subject: data.subject || "",
+    body: bodyText,
+    draft: bodyText,
+  }
+}
+
+export async function rewriteComposeBody(params: {
+  to?: string
+  subject?: string
+  body: string
+}): Promise<{ body: string }> {
+  const res = await fetch("/api/email/agent?action=compose-rewrite", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  })
+  const data = await res.json().catch(() => ({})) as { body?: string; error?: string; detail?: string }
+  if (!res.ok) {
+    throw new Error(data.detail || data.error || "Failed to rewrite email")
+  }
+  return { body: data.body || params.body }
+}
+
+export async function sendEmail(params: {
+  to: string
+  subject: string
+  body: string
+  inboxId?: string
+  conversationId?: string
+  attachmentIds?: string[]
+}): Promise<{ messageId: string; threadId: string }> {
+  const hasAttachments = (params.attachmentIds?.length ?? 0) > 0
+  const res = await fetch("/api/email/send", {
+    method: "POST",
+    headers: hasAttachments ? undefined : { "Content-Type": "application/json" },
+    body: hasAttachments
+      ? (() => {
+          const formData = new FormData()
+          formData.append("to", params.to)
+          formData.append("subject", params.subject)
+          formData.append("body", params.body)
+          if (params.inboxId) formData.append("inboxId", params.inboxId)
+          if (params.conversationId) formData.append("conversationId", params.conversationId)
+          formData.append("attachmentIds", JSON.stringify(params.attachmentIds))
+          return formData
+        })()
+      : JSON.stringify(params),
+  })
+  const data = await res.json().catch(() => ({})) as {
+    messageId?: string
+    threadId?: string
+    error?: string
+    detail?: string
+  }
+  if (!res.ok) {
+    throw new Error(data.detail || data.error || "Failed to send email")
+  }
+  return { messageId: data.messageId || "", threadId: data.threadId || "" }
 }
