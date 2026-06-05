@@ -9,28 +9,32 @@ export function useCrossAgent() {
 
   async function openInTenderAgent(params: {
     sourceId: string
+    subject?: string
     attachmentId?: string
     attachmentName?: string
   }) {
     const searchParams = new URLSearchParams()
     searchParams.set("fromEmail", params.sourceId)
+    if (params.subject) searchParams.set("emailSubject", params.subject)
     if (params.attachmentId) searchParams.set("attachmentId", params.attachmentId)
     if (params.attachmentName) searchParams.set("attachmentName", params.attachmentName)
 
-    router.push(`/tender/new?${searchParams.toString()}`)
+    router.push(`/tender?${searchParams.toString()}`)
   }
 
   async function openInReportAgent(params: {
     sourceId: string
+    subject?: string
     attachmentId?: string
     attachmentName?: string
   }) {
     const searchParams = new URLSearchParams()
     searchParams.set("fromEmail", params.sourceId)
+    if (params.subject) searchParams.set("emailSubject", params.subject)
     if (params.attachmentId) searchParams.set("attachmentId", params.attachmentId)
     if (params.attachmentName) searchParams.set("attachmentName", params.attachmentName)
 
-    router.push(`/report/new?${searchParams.toString()}`)
+    router.push(`/report?${searchParams.toString()}`)
   }
 
   async function sendViaEmail(params: {

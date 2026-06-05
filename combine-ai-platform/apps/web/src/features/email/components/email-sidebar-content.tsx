@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import { cn } from "@combine-ai/shared-ui"
@@ -12,8 +12,12 @@ import {
   Archive,
   Trash2,
   PencilLine,
+  Mail,
+  RefreshCw,
+  Loader2,
   type LucideIcon,
 } from "lucide-react"
+import { connectGmail, disconnectGmail, getIntegrationStatus, syncGmail } from "../api/email-client"
 
 interface FolderItem {
   id: string
@@ -42,6 +46,88 @@ export function EmailSidebarContent() {
   const pathname = usePathname()
   const [folders, setFolders] = useState(DEFAULT_FOLDERS)
   const [departments, setDepartments] = useState<Department[]>([])
+  const [primaryInboxId, setPrimaryInboxId] = useState<string | null>(null)
+  const [gmailStatus, setGmailStatus] = useState<"disconnected" | "connected" | "error">("disconnected")
+  const [gmailEmail, setGmailEmail] = useState<string | null>(null)
+  const [gmailLoading, setGmailLoading] = useState(false)
+  const [gmailMessage, setGmailMessage] = useState<string | null>(null)
+
+  const loadGmailStatus = useCallback(async () => {
+    try {
+      const [inboxRes, integrations] = await Promise.all([
+        fetch("/api/email/inboxes?kind=PRIMARY").then((r) => r.json()),
+        getIntegrationStatus(),
+      ])
+      const primary = inboxRes.inboxes?.[0]
+      if (primary?.id) setPrimaryInboxId(primary.id)
+
+      const gmail = integrations.find((i) => i.provider === "GMAIL")
+      if (gmail?.status === "CONNECTED") {
+        setGmailStatus("connected")
+        setGmailEmail(gmail.externalEmail)
+      } else if (gmail?.status === "ERROR") {
+        setGmailStatus("error")
+        setGmailEmail(gmail.externalEmail)
+      } else {
+        setGmailStatus("disconnected")
+        setGmailEmail(null)
+      }
+    } catch {
+      setGmailStatus("disconnected")
+    }
+  }, [])
+
+  useEffect(() => {
+    loadGmailStatus()
+  }, [loadGmailStatus])
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const gmailParam = params.get("gmail")
+    if (gmailParam === "connected") {
+      setGmailMessage("Gmail connected successfully.")
+      loadGmailStatus()
+    } else if (gmailParam === "error") {
+      const reason = params.get("reason") || "unknown"
+      setGmailMessage(`Gmail connection failed: ${reason}`)
+    }
+  }, [loadGmailStatus])
+
+  async function handleConnectGmail(reconnect = false) {
+    if (!primaryInboxId) return
+    setGmailLoading(true)
+    setGmailMessage(null)
+    window.history.replaceState({}, "", "/email")
+    try {
+      if (reconnect) await disconnectGmail(primaryInboxId)
+      const url = await connectGmail(primaryInboxId)
+      window.location.href = url
+    } catch {
+      setGmailMessage("Failed to start Gmail connection.")
+      setGmailLoading(false)
+    }
+  }
+
+  async function handleSyncGmail() {
+    if (!primaryInboxId) return
+    setGmailLoading(true)
+    setGmailMessage(null)
+    try {
+      await syncGmail(primaryInboxId)
+      setGmailMessage("Gmail sync completed.")
+      window.location.reload()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Gmail sync failed."
+      if (message.toLowerCase().includes("insufficient") || message.toLowerCase().includes("permission")) {
+        setGmailMessage("Missing Gmail permissions. Click Reconnect and allow all access.")
+        setGmailStatus("error")
+      } else {
+        setGmailMessage(message)
+      }
+    } finally {
+      setGmailLoading(false)
+    }
+  }
 
   useEffect(() => {
     // Fetch folder counts and departments from the API
@@ -94,6 +180,56 @@ export function EmailSidebarContent() {
         <PencilLine className="h-4 w-4" />
         Compose
       </Link>
+
+      {/* Gmail integration */}
+      <div className="mb-4 rounded-md border p-2">
+        <h3 className="mb-1 px-1 text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+          Gmail
+        </h3>
+        <p className="mb-2 px-1 text-xs text-muted-foreground">
+          {gmailStatus === "connected"
+            ? `Connected${gmailEmail ? `: ${gmailEmail}` : ""}`
+            : gmailStatus === "error"
+              ? `Permission error${gmailEmail ? `: ${gmailEmail}` : ""}`
+              : "Not connected"}
+        </p>
+        <div className="flex gap-1">
+          {gmailStatus === "connected" ? (
+            <button
+              type="button"
+              onClick={handleSyncGmail}
+              disabled={gmailLoading || !primaryInboxId}
+              className="flex flex-1 items-center justify-center gap-1 rounded border px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+            >
+              {gmailLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+              Sync
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => handleConnectGmail(false)}
+              disabled={gmailLoading || !primaryInboxId}
+              className="flex flex-1 items-center justify-center gap-1 rounded border px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+            >
+              {gmailLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Mail className="h-3 w-3" />}
+              Connect
+            </button>
+          )}
+          {(gmailStatus === "connected" || gmailStatus === "error") && (
+            <button
+              type="button"
+              onClick={() => handleConnectGmail(true)}
+              disabled={gmailLoading || !primaryInboxId}
+              className="flex flex-1 items-center justify-center gap-1 rounded border px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+            >
+              Reconnect
+            </button>
+          )}
+        </div>
+        {gmailMessage && (
+          <p className="mt-2 px-1 text-xs text-muted-foreground">{gmailMessage}</p>
+        )}
+      </div>
 
       {/* Folders */}
       <div className="mb-4">

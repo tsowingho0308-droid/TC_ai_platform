@@ -1,8 +1,9 @@
 "use client"
 
-import { useState, useRef, useCallback, useEffect } from "react"
-import { useRouter } from "next/navigation"
-import { Upload, FileText, Download, Plus, Trash2, Loader2, GitCompare, Brain, BarChart3, Search } from "lucide-react"
+import { useState, useRef, useEffect, Suspense } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
+import Link from "next/link"
+import { Upload, FileText, Download, Plus, Trash2, Loader2, GitCompare, Brain, BarChart3, Search, Mail, ArrowLeft, Paperclip } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
@@ -30,8 +31,35 @@ interface Template {
   updatedAt?: string
 }
 
+interface EmailAttachment {
+  id: string
+  fileName: string
+  mimeType: string
+  sizeBytes: number
+}
+
+interface EmailSource {
+  id: string
+  subject: string
+  senderName: string
+  senderEmail: string
+  attachments: EmailAttachment[]
+}
+
 export default function TenderPage() {
+  return (
+    <Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-muted-foreground">Loading...</div>}>
+      <TenderPageContent />
+    </Suspense>
+  )
+}
+
+function TenderPageContent() {
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const fromEmailId = searchParams.get("fromEmail")
+  const emailSubjectParam = searchParams.get("emailSubject")
+  const attachmentIdParam = searchParams.get("attachmentId")
   const [tenders, setTenders] = useState<Array<{ id: string; name: string; fields: TenderField[]; type: string | null }>>([])
   const [analyzing, setAnalyzing] = useState(false)
   const [model, setModel] = useState(DEFAULT_MODELS.tender)
@@ -44,6 +72,8 @@ export default function TenderPage() {
   const [confidence, setConfidence] = useState<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const [emailSource, setEmailSource] = useState<EmailSource | null>(null)
+  const [loadingEmail, setLoadingEmail] = useState(false)
 
   // Fetch templates on mount
   useEffect(() => {
@@ -54,6 +84,31 @@ export default function TenderPage() {
       })
       .catch(() => {})
   }, [])
+
+  // Load email context when opened from Email Agent
+  useEffect(() => {
+    if (!fromEmailId) {
+      setEmailSource(null)
+      return
+    }
+
+    setLoadingEmail(true)
+    fetch(`/api/email/mailbox?conversationId=${encodeURIComponent(fromEmailId)}`)
+      .then((r) => r.json())
+      .then((data) => {
+        const conv = data.conversation
+        if (!conv) return
+        setEmailSource({
+          id: conv.id,
+          subject: emailSubjectParam || conv.subject,
+          senderName: conv.senderName,
+          senderEmail: conv.senderEmail,
+          attachments: conv.attachments || [],
+        })
+      })
+      .catch(console.error)
+      .finally(() => setLoadingEmail(false))
+  }, [fromEmailId, emailSubjectParam])
 
   useEffect(() => {
     return () => {
@@ -71,10 +126,7 @@ export default function TenderPage() {
     setConfidence(null)
   }
 
-  async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (!file) return
-
+  async function runExtraction(documentText: string, fileName: string) {
     resetState()
     setAnalyzing(true)
     setStreamingStatus("connecting")
@@ -84,23 +136,14 @@ export default function TenderPage() {
     abortRef.current = controller
 
     try {
-      // Read file as text
-      const reader = new FileReader()
-      const fileText = await new Promise<string>((resolve, reject) => {
-        reader.onload = () => resolve(reader.result as string)
-        reader.onerror = () => reject(new Error("Failed to read file"))
-        reader.readAsText(file)
-      })
-
       setStreamingStatus("thinking")
 
-      // Stream AI extraction
       const response = await fetch("/api/tender/agent?action=extract&stream=1", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          documentText: fileText,
-          fileName: file.name,
+          documentText,
+          fileName,
           templateId: selectedTemplate || undefined,
           model,
         }),
@@ -116,7 +159,6 @@ export default function TenderPage() {
         throw new Error("Response body is not available")
       }
 
-      // Process SSE stream
       const bodyReader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ""
@@ -174,7 +216,7 @@ export default function TenderPage() {
       if (result && result.fields && result.fields.length > 0) {
         const newTender = {
           id: `tender-${Date.now()}`,
-          name: result.tenderTitle || file.name.replace(/\.(pdf|docx?|txt)$/i, ""),
+          name: result.tenderTitle || fileName.replace(/\.(pdf|docx?|txt)$/i, ""),
           fields: result.fields,
           type: result.tenderType || null,
         }
@@ -192,6 +234,28 @@ export default function TenderPage() {
       setStreamingStatus("error")
     } finally {
       setAnalyzing(false)
+    }
+  }
+
+  async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    try {
+      const reader = new FileReader()
+      const fileText = await new Promise<string>((resolve, reject) => {
+        reader.onload = () => resolve(reader.result as string)
+        reader.onerror = () => reject(new Error("Failed to read file"))
+        reader.readAsText(file)
+      })
+      await runExtraction(fileText, file.name)
+    } catch (err) {
+      console.error("File read error:", err)
+      setError(err instanceof Error ? err.message : "Failed to read file")
+      setStreamingStatus("error")
+      setAnalyzing(false)
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = ""
     }
   }
 
@@ -267,6 +331,11 @@ export default function TenderPage() {
         <header className="flex items-center justify-between border-b px-6 py-3">
           <div className="flex items-center gap-3">
             <h1 className="text-lg font-semibold">Tender & Bidding Agent</h1>
+            {emailSource && (
+              <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary">
+                From Email Agent
+              </span>
+            )}
             {confidence !== null && (
               <span className="text-xs text-muted-foreground">
                 Confidence: {(confidence * 100).toFixed(0)}%
@@ -318,6 +387,66 @@ export default function TenderPage() {
         <div className="flex flex-1 overflow-hidden">
           {/* Left: Upload Panel */}
           <div className="w-80 border-r p-6 overflow-y-auto">
+            {/* Email source from Email Agent */}
+            {fromEmailId && (
+              <div className="mb-4 rounded-lg border bg-accent/30 p-3">
+                <div className="mb-2 flex items-center gap-2">
+                  <Mail className="h-4 w-4 text-primary" />
+                  <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    From Email Agent
+                  </span>
+                </div>
+                {loadingEmail ? (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Loading email...
+                  </div>
+                ) : emailSource ? (
+                  <>
+                    <p className="text-sm font-medium line-clamp-2">{emailSource.subject}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {emailSource.senderName} &lt;{emailSource.senderEmail}&gt;
+                    </p>
+                    <p className="mt-2 text-xs text-green-700">
+                      Email forwarded — ready for tender analysis.
+                    </p>
+                    {emailSource.attachments.length > 0 && (
+                      <div className="mt-3 space-y-2">
+                        <p className="text-xs font-medium text-muted-foreground">Attachments</p>
+                        {emailSource.attachments.map((att) => (
+                          <a
+                            key={att.id}
+                            href={`/api/email/attachments?action=download&id=${encodeURIComponent(att.id)}`}
+                            className={cn(
+                              "flex items-start gap-2 rounded-md border p-2 hover:bg-accent/50",
+                              att.id === attachmentIdParam && "border-primary bg-primary/5"
+                            )}
+                          >
+                            <Paperclip className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-xs font-medium">{att.fileName}</p>
+                              <p className="text-[10px] text-muted-foreground">
+                                {Math.max(1, Math.round(att.sizeBytes / 1024))} KB
+                              </p>
+                            </div>
+                          </a>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground">Email not found or unavailable.</p>
+                )}
+                <Link
+                  href="/email"
+                  className="mt-2 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                >
+                  <ArrowLeft className="h-3 w-3" />
+                  Back to Email
+                </Link>
+              </div>
+            )}
+
             {/* Upload Zone */}
             <div
               className={cn(
@@ -467,9 +596,15 @@ export default function TenderPage() {
                 <p className="mt-1 max-w-md text-sm text-muted-foreground">
                   Upload tender documents to analyze key information, compare multiple tenders side-by-side, and export comparison tables.
                 </p>
-                <p className="mt-4 text-sm text-muted-foreground">
-                  Upload a PDF, DOCX, or TXT file to get started
-                </p>
+                {emailSource ? (
+                  <p className="mt-4 text-sm text-muted-foreground">
+                    Email and attachments have been forwarded from Email Agent. Upload or analyze when ready.
+                  </p>
+                ) : (
+                  <p className="mt-4 text-sm text-muted-foreground">
+                    Upload a PDF, DOCX, or TXT file to get started
+                  </p>
+                )}
               </div>
             ) : (
               <div className="space-y-8">

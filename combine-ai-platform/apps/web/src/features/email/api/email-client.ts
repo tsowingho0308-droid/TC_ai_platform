@@ -19,8 +19,18 @@ interface ConversationSummary {
   updatedAt: string
 }
 
+interface AttachmentSummary {
+  id: string
+  fileName: string
+  mimeType: string
+  sizeBytes: number
+  messageId: string
+  createdAt: string
+}
+
 interface ConversationDetail extends ConversationSummary {
   messages: MessageDetail[]
+  attachments: AttachmentSummary[]
   inquiryTasks: InquiryTaskSummary[]
   aiIntentSummary: string | null
   finalReplyDraft: string | null
@@ -76,7 +86,12 @@ export async function getConversation(id: string): Promise<ConversationDetail> {
   const res = await fetch(`/api/email/mailbox?conversationId=${encodeURIComponent(id)}`)
   if (!res.ok) throw new Error("Failed to load conversation")
   const data = await res.json()
-  return data.conversation
+  const conversation = data.conversation
+  if (!conversation) throw new Error("Failed to load conversation")
+  return {
+    ...conversation,
+    attachments: conversation.attachments ?? [],
+  }
 }
 
 export async function classifyConversation(conversationId: string): Promise<{
@@ -164,13 +179,24 @@ export async function connectGmail(inboxId: string): Promise<string> {
   return data.url
 }
 
+export async function disconnectGmail(inboxId: string): Promise<void> {
+  const res = await fetch("/api/email/integrations?action=disconnect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ inboxId }),
+  })
+  if (!res.ok) throw new Error("Failed to disconnect Gmail")
+}
+
 export async function syncGmail(inboxId: string): Promise<string> {
   const res = await fetch("/api/email/integrations?action=sync", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ inboxId }),
   })
-  if (!res.ok) throw new Error("Failed to start sync")
-  const data = await res.json()
-  return data.syncRunId
+  const data = await res.json().catch(() => ({})) as { syncRunId?: string; detail?: string; error?: string }
+  if (!res.ok) {
+    throw new Error(data.detail || data.error || "Failed to start sync")
+  }
+  return data.syncRunId || ""
 }

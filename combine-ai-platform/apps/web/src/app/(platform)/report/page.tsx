@@ -1,7 +1,9 @@
 "use client"
 
-import { useState, useRef, useCallback, useEffect } from "react"
-import { Upload, FileSpreadsheet, Download, Plus, Trash2, Loader2, Brain, BarChart3 } from "lucide-react"
+import { useState, useRef, useCallback, useEffect, Suspense } from "react"
+import { useSearchParams } from "next/navigation"
+import Link from "next/link"
+import { Upload, FileSpreadsheet, Download, Plus, Trash2, Loader2, Brain, BarChart3, Mail, ArrowLeft, Paperclip } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
@@ -20,7 +22,36 @@ interface TraceEvent {
   detail?: string
 }
 
+interface EmailAttachment {
+  id: string
+  fileName: string
+  mimeType: string
+  sizeBytes: number
+}
+
+interface EmailSource {
+  id: string
+  subject: string
+  senderName: string
+  senderEmail: string
+  attachments: EmailAttachment[]
+}
+
 export default function ReportPage() {
+  return (
+    <Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-muted-foreground">Loading...</div>}>
+      <ReportPageContent />
+    </Suspense>
+  )
+}
+
+function ReportPageContent() {
+  const searchParams = useSearchParams()
+  const fromEmailId = searchParams.get("fromEmail")
+  const emailSubjectParam = searchParams.get("emailSubject")
+  const attachmentIdParam = searchParams.get("attachmentId")
+  const [emailSource, setEmailSource] = useState<EmailSource | null>(null)
+  const [loadingEmail, setLoadingEmail] = useState(false)
   const [rows, setRows] = useState<TableRow[]>([])
   const [extracting, setExtracting] = useState(false)
   const [model, setModel] = useState(DEFAULT_MODELS.report)
@@ -35,6 +66,30 @@ export default function ReportPage() {
   const [streamingStatus, setStreamingStatus] = useState<"idle" | "connecting" | "thinking" | "done" | "error">("idle")
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => {
+    if (!fromEmailId) {
+      setEmailSource(null)
+      return
+    }
+
+    setLoadingEmail(true)
+    fetch(`/api/email/mailbox?conversationId=${encodeURIComponent(fromEmailId)}`)
+      .then((r) => r.json())
+      .then((data) => {
+        const conv = data.conversation
+        if (!conv) return
+        setEmailSource({
+          id: conv.id,
+          subject: emailSubjectParam || conv.subject,
+          senderName: conv.senderName,
+          senderEmail: conv.senderEmail,
+          attachments: conv.attachments || [],
+        })
+      })
+      .catch(console.error)
+      .finally(() => setLoadingEmail(false))
+  }, [fromEmailId, emailSubjectParam])
 
   // Cleanup on unmount
   useEffect(() => {
@@ -278,6 +333,11 @@ export default function ReportPage() {
         <header className="flex items-center justify-between border-b px-6 py-3">
           <div className="flex items-center gap-3">
             <h1 className="text-lg font-semibold">Report Agent</h1>
+            {emailSource && (
+              <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary">
+                From Email Agent
+              </span>
+            )}
             {documentType && (
               <span className="inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold text-muted-foreground">
                 {documentType}
@@ -306,6 +366,65 @@ export default function ReportPage() {
         <div className="flex flex-1 overflow-hidden">
           {/* Left: Upload & AI Status */}
           <div className="w-1/2 border-r p-6 overflow-y-auto">
+            {fromEmailId && (
+              <div className="mb-4 rounded-lg border bg-accent/30 p-3">
+                <div className="mb-2 flex items-center gap-2">
+                  <Mail className="h-4 w-4 text-primary" />
+                  <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    From Email Agent
+                  </span>
+                </div>
+                {loadingEmail ? (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Loading email...
+                  </div>
+                ) : emailSource ? (
+                  <>
+                    <p className="text-sm font-medium line-clamp-2">{emailSource.subject}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {emailSource.senderName} &lt;{emailSource.senderEmail}&gt;
+                    </p>
+                    <p className="mt-2 text-xs text-green-700">
+                      Email forwarded — ready for report extraction.
+                    </p>
+                    {emailSource.attachments.length > 0 && (
+                      <div className="mt-3 space-y-2">
+                        <p className="text-xs font-medium text-muted-foreground">Attachments</p>
+                        {emailSource.attachments.map((att) => (
+                          <a
+                            key={att.id}
+                            href={`/api/email/attachments?action=download&id=${encodeURIComponent(att.id)}`}
+                            className={cn(
+                              "flex items-start gap-2 rounded-md border p-2 hover:bg-accent/50",
+                              att.id === attachmentIdParam && "border-primary bg-primary/5"
+                            )}
+                          >
+                            <Paperclip className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-xs font-medium">{att.fileName}</p>
+                              <p className="text-[10px] text-muted-foreground">
+                                {Math.max(1, Math.round(att.sizeBytes / 1024))} KB
+                              </p>
+                            </div>
+                          </a>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground">Email not found or unavailable.</p>
+                )}
+                <Link
+                  href="/email"
+                  className="mt-2 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                >
+                  <ArrowLeft className="h-3 w-3" />
+                  Back to Email
+                </Link>
+              </div>
+            )}
+
             {/* Upload Zone */}
             <div
               className={cn(
@@ -487,7 +606,9 @@ export default function ReportPage() {
               <div className="flex h-48 flex-col items-center justify-center rounded-lg border-2 border-dashed text-center">
                 <FileSpreadsheet className="h-8 w-8 text-muted-foreground/50" />
                 <p className="mt-2 text-sm text-muted-foreground">
-                  Upload a document to extract data
+                  {emailSource
+                    ? "Email and attachments forwarded from Email Agent. Upload or extract when ready."
+                    : "Upload a document to extract data"}
                 </p>
                 <p className="mt-1 text-xs text-muted-foreground">
                   AI will analyze images, PDFs, and documents
