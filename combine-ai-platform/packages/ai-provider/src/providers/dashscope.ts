@@ -28,25 +28,15 @@ function getConfig() {
 // ── Provider Implementation ───────────────────────────────────────
 
 export class DashScopeProvider implements IAiProvider {
-  private baseUrl: string
-  private apiKey: string
-  private defaultModel: string
-
-  constructor() {
-    const config = getConfig()
-    this.baseUrl = config.baseUrl
-    this.apiKey = config.apiKey
-    this.defaultModel = config.defaultModel
-  }
-
   /**
    * Non-streaming completion — used for simple classification / extraction.
    */
   async createCompletion(req: CompletionRequest): Promise<CompletionResponse> {
-    const model = req.model || this.defaultModel
+    const { baseUrl, apiKey, defaultModel } = getConfig()
+    const model = req.model || defaultModel
 
-    if (!this.apiKey) {
-      throw new Error("DASHSCOPE_API_KEY not configured. Set it in .env.local")
+    if (!apiKey) {
+      throw new Error("DASHSCOPE_API_KEY not configured. Set it in .env (DASHSCOPE_API_KEY=...)")
     }
 
     const body: Record<string, unknown> = {
@@ -69,11 +59,11 @@ export class DashScopeProvider implements IAiProvider {
       body.extra_body = { enable_thinking: true }
     }
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify(body),
     })
@@ -111,10 +101,11 @@ export class DashScopeProvider implements IAiProvider {
     req: CompletionRequest,
     handlers?: StreamHandlers
   ): Promise<CompletionResponse> {
-    const model = req.model || this.defaultModel
+    const { baseUrl, apiKey, defaultModel } = getConfig()
+    const model = req.model || defaultModel
 
-    if (!this.apiKey) {
-      throw new Error("DASHSCOPE_API_KEY not configured. Set it in .env.local")
+    if (!apiKey) {
+      throw new Error("DASHSCOPE_API_KEY not configured. Set it in .env (DASHSCOPE_API_KEY=...)")
     }
 
     const body: Record<string, unknown> = {
@@ -139,11 +130,11 @@ export class DashScopeProvider implements IAiProvider {
       body.extra_body = { enable_thinking: true }
     }
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify(body),
       signal: handlers?.signal,
