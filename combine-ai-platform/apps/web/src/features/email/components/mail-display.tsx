@@ -1,8 +1,15 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Loader2, Bot, Send, FileText, ExternalLink, Paperclip } from "lucide-react"
-import { getConversation, generateReplySuggestion, classifyConversation, runConversationTriage } from "../api/email-client"
+import { useRouter } from "next/navigation"
+import { Loader2, Bot, Send, FileText, ExternalLink, Paperclip, PencilLine } from "lucide-react"
+import {
+  getConversation,
+  generateReplySuggestion,
+  classifyConversation,
+  runConversationTriage,
+  sendEmail,
+} from "../api/email-client"
 import { useCrossAgent } from "@/features/cross-agent/use-cross-agent"
 import { cn } from "@combine-ai/shared-ui"
 
@@ -50,11 +57,13 @@ interface MailDisplayProps {
 }
 
 export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
+  const router = useRouter()
   const { openInTenderAgent, openInReportAgent, createLink } = useCrossAgent()
   const [conversation, setConversation] = useState<ConversationDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [replyDraft, setReplyDraft] = useState("")
   const [generating, setGenerating] = useState(false)
+  const [sending, setSending] = useState(false)
   const [classifying, setClassifying] = useState(false)
   const [triaging, setTriaging] = useState(false)
   const [openingTender, setOpeningTender] = useState(false)
@@ -83,6 +92,28 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
       console.error("Failed to generate reply:", err)
     } finally {
       setGenerating(false)
+    }
+  }
+
+  async function handleSendReply() {
+    if (!conversationId || !conversation || !replyDraft.trim()) return
+    setSending(true)
+    try {
+      await sendEmail({
+        to: conversation.senderEmail,
+        subject: conversation.subject.startsWith("Re:")
+          ? conversation.subject
+          : `Re: ${conversation.subject}`,
+        body: replyDraft.trim(),
+        conversationId,
+      })
+      setReplyDraft("")
+      const refreshed = await getConversation(conversationId)
+      setConversation(refreshed)
+    } catch (err) {
+      console.error("Failed to send reply:", err)
+    } finally {
+      setSending(false)
     }
   }
 
@@ -277,6 +308,13 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
             {generating ? "Generating..." : "AI Reply Suggestion"}
           </button>
           <button
+            onClick={() => router.push(`/email/compose?replyTo=${encodeURIComponent(conversationId || "")}`)}
+            className="inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs hover:bg-accent"
+          >
+            <PencilLine className="h-3.5 w-3.5" />
+            Compose Reply
+          </button>
+          <button
             onClick={handleOpenInTender}
             disabled={openingTender}
             className="inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs hover:bg-accent disabled:opacity-50"
@@ -371,9 +409,13 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
             />
           </div>
           <div className="mt-2 flex justify-end">
-            <button className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground">
-              <Send className="h-3.5 w-3.5" />
-              Send Reply
+            <button
+              onClick={handleSendReply}
+              disabled={sending || !replyDraft.trim()}
+              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
+            >
+              {sending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+              {sending ? "Sending..." : "Send Reply"}
             </button>
           </div>
         </div>
