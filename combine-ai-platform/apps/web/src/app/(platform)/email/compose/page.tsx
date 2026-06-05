@@ -14,6 +14,8 @@ import {
   sendEmail,
   uploadComposeFile,
 } from "@/features/email/api/email-client"
+import { ModelSelector } from "@/features/shared/model-selector"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
 function isValidEmail(value: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
@@ -44,6 +46,7 @@ function ComposeContent() {
   const [sending, setSending] = useState(false)
   const [statusMessage, setStatusMessage] = useState<string | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [model, setModel] = useState(DEFAULT_MODELS.email)
 
   const fromTender = searchParams.get("fromTender")
   const fromReport = searchParams.get("fromReport")
@@ -117,6 +120,7 @@ function ComposeContent() {
 
       const result = await generateComposeDraft({
         brief,
+        model,
         to: to || undefined,
         subject: subject || undefined,
         context: contextParts.join("\n") || undefined,
@@ -143,7 +147,7 @@ function ComposeContent() {
     setRewriting(true)
     setErrorMessage(null)
     try {
-      const { body: rewritten } = await rewriteComposeBody({ to, subject, body })
+      const { body: rewritten } = await rewriteComposeBody({ model, to, subject, body })
       setBody(rewritten)
       setStatusMessage("Done.")
     } catch (err) {
@@ -225,7 +229,8 @@ function ComposeContent() {
               rows={7}
               className="w-full resize-none rounded-md border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
             />
-            <div className="mt-3 flex justify-end">
+            <div className="mt-3 flex items-center justify-end gap-2">
+              <ModelSelector value={model} onChange={setModel} />
               <button
                 type="button"
                 onClick={handleGenerateDraft}
