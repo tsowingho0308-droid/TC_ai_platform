@@ -18,11 +18,39 @@ export async function GET(request: NextRequest) {
 
   // Return single conversation detail
   if (conversationId) {
-    const conversation = await prisma.conversation.findFirst({
-      where: { id: conversationId, workspaceId: session.workspaceId },
-      include: {
-        messages: { orderBy: { createdAt: "asc" } },
-        attachments: {
+    try {
+      const conversation = await prisma.conversation.findFirst({
+        where: { id: conversationId, workspaceId: session.workspaceId },
+        include: {
+          messages: { orderBy: { createdAt: "asc" } },
+          inquiryTasks: {
+            orderBy: { sortOrder: "asc" },
+            include: { childConversation: { select: { id: true, subject: true, status: true } } },
+          },
+          parentConversation: { select: { id: true, subject: true } },
+          childConversations: {
+            select: { id: true, subject: true, status: true, departmentReviewStatus: true },
+            orderBy: { createdAt: "asc" },
+          },
+        },
+      })
+
+      if (!conversation) {
+        return NextResponse.json({ error: "Conversation not found" }, { status: 404 })
+      }
+
+      // Fetch attachments separately (table may be empty if sync hasn't stored files yet)
+      let attachments: Array<{
+        id: string
+        fileName: string
+        mimeType: string
+        sizeBytes: number
+        messageId: string
+        createdAt: Date
+      }> = []
+      try {
+        attachments = await prisma.messageAttachment.findMany({
+          where: { workspaceId: session.workspaceId, conversationId },
           orderBy: { createdAt: "asc" },
           select: {
             id: true,
@@ -32,24 +60,24 @@ export async function GET(request: NextRequest) {
             messageId: true,
             createdAt: true,
           },
-        },
-        inquiryTasks: {
-          orderBy: { sortOrder: "asc" },
-          include: { childConversation: { select: { id: true, subject: true, status: true } } },
-        },
-        parentConversation: { select: { id: true, subject: true } },
-        childConversations: {
-          select: { id: true, subject: true, status: true, departmentReviewStatus: true },
-          orderBy: { createdAt: "asc" },
-        },
-      },
-    })
+        })
+      } catch (attachErr) {
+        const code = (attachErr as { code?: string }).code
+        if (code !== "P2021") throw attachErr
+        console.warn("MessageAttachment table missing, returning empty attachments")
+      }
 
-    if (!conversation) {
-      return NextResponse.json({ error: "Conversation not found" }, { status: 404 })
+      return NextResponse.json({ conversation: { ...conversation, attachments } })
+    } catch (error) {
+      console.error("Mailbox conversation detail error:", error)
+      return NextResponse.json(
+        {
+          error: "Failed to load conversation",
+          detail: error instanceof Error ? error.message : "Unknown error",
+        },
+        { status: 500 }
+      )
     }
-
-    return NextResponse.json({ conversation })
   }
 
   // List conversations

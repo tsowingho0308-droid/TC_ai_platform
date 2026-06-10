@@ -71,6 +71,7 @@ export function WorkflowSidebarContent() {
     if (res.ok) {
       const data = await res.json()
       setRuns((prev) => [data.run, ...prev])
+      window.dispatchEvent(new Event("workflow:data-updated"))
       router.push(`/workflow/runs/${data.run.id}`)
     }
   }, [router])

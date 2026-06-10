@@ -167,6 +167,7 @@ export default function TemplatesPage() {
       if (res.ok) {
         const data = await res.json()
         toast.success("Workflow started")
+        window.dispatchEvent(new Event("workflow:data-updated"))
         router.push(`/workflow/runs/${data.run.id}`)
       }
     } catch {

@@ -85,10 +85,16 @@ export async function listConversations(params: {
 
 export async function getConversation(id: string): Promise<ConversationDetail> {
   const res = await fetch(`/api/email/mailbox?conversationId=${encodeURIComponent(id)}`)
-  if (!res.ok) throw new Error("Failed to load conversation")
-  const data = await res.json()
+  const data = await res.json().catch(() => ({})) as {
+    conversation?: ConversationDetail
+    error?: string
+    detail?: string
+  }
+  if (!res.ok) {
+    throw new Error(data.detail || data.error || "Failed to load conversation")
+  }
   const conversation = data.conversation
-  if (!conversation) throw new Error("Failed to load conversation")
+  if (!conversation) throw new Error(data.error || "Failed to load conversation")
   return {
     ...conversation,
     attachments: conversation.attachments ?? [],

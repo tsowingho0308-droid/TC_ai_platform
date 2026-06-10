@@ -1,12 +1,63 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
+import { extractTextFromDocument } from "@/lib/server/document-text"
 import { mockTenderResult, mockTenderCompare } from "@/lib/server/mock-extraction"
 import type { Prisma } from "@prisma/client"
 import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
 export const dynamic = "force-dynamic"
 export const maxDuration = 120
+
+const MIN_DOCUMENT_TEXT_LENGTH = 50
+const DOCUMENT_TEXT_LIMIT = 20000
+
+const TEXT_EXTRACTION_ERROR =
+  "Could not extract readable text from document. Try a text-based PDF or DOCX."
+
+type ExtractedTender = {
+  tenderTitle?: string
+  tenderType?: string
+  fields?: Array<{ field: string; value: string }>
+  keyRequirements?: string[]
+  deadlines?: Array<{ label: string; date: string | null }>
+  confidence?: number
+}
+
+function validateDocumentText(documentText?: string): string | null {
+  if ((documentText || "").trim().length < MIN_DOCUMENT_TEXT_LENGTH) {
+    return TEXT_EXTRACTION_ERROR
+  }
+  return null
+}
+
+function normalizeExtractedFields(extracted: ExtractedTender): Array<{ field: string; value: string }> {
+  const fields = extracted.fields || []
+  if (fields.length > 0) return fields
+
+  const flattened: Array<{ field: string; value: string }> = []
+  for (const req of extracted.keyRequirements || []) {
+    if (req.trim()) flattened.push({ field: "Key Requirement", value: req })
+  }
+  for (const dl of extracted.deadlines || []) {
+    if (dl.label?.trim()) {
+      flattened.push({ field: dl.label, value: dl.date || "TBD" })
+    }
+  }
+  return flattened
+}
+
+function buildExtractionPrompt(
+  documentText: string,
+  fileName?: string,
+  instructions?: string
+): string {
+  const textSlice = documentText.slice(0, DOCUMENT_TEXT_LIMIT)
+  if (instructions) {
+    return `Analyze this tender document and extract all structured fields. File: ${fileName || "document"}. Additional instructions: ${instructions}\n\nDocument text:\n${textSlice}`
+  }
+  return `Analyze this tender document and extract all structured fields. File: ${fileName || "document"}\n\nDocument text:\n${textSlice}`
+}
 
 // ── AI Provider ───────────────────────────────────────────────
 
@@ -158,6 +209,46 @@ Respond ONLY with valid JSON:
   }
 }`
 
+const TENDER_THREE_WAY_MATCH_PROMPT = `You are a procurement auditor performing a 3-Way Match analysis.
+You will be given extracted text from Purchase Order (PO), Goods Receipt Note (GRN), and Supplier Invoice documents.
+There may be multiple files per category — treat all files within each category as a combined set.
+
+Your task is to:
+1. Identify all line items across the three document sets
+2. Match corresponding items by name/description
+3. Compare quantities: PO quantity vs GRN received quantity vs Invoice quantity
+4. Compare prices: PO unit price vs Invoice unit price
+5. Detect and flag any discrepancies
+
+Categorize each item status:
+- "match": Quantities and prices agree across all three documents
+- "qty_mismatch": Quantities differ between GRN and Invoice (or PO)
+- "price_mismatch": Unit price in Invoice differs from PO
+- "missing_grn": Item in Invoice/PO but no corresponding GRN entry
+- "missing_po": Item in Invoice but not found in any PO
+
+Respond ONLY with valid JSON:
+{
+  "matchedItems": [
+    {
+      "poItem": "item name/description",
+      "grnQty": 0,
+      "invQty": 0,
+      "poPrice": 0,
+      "invPrice": 0,
+      "status": "match|qty_mismatch|price_mismatch|missing_grn|missing_po"
+    }
+  ],
+  "summary": {
+    "totalMatchCount": 0,
+    "discrepancyCount": 0,
+    "totalPOAmount": 0,
+    "totalInvAmount": 0,
+    "variance": 0
+  },
+  "flags": ["description of critical issues"]
+}`
+
 const TENDER_FIELDS_TOOL = {
   type: "function" as const,
   function: {
@@ -210,7 +301,9 @@ export async function POST(request: NextRequest) {
 
     // Handle multipart file upload
     if (contentType.includes("multipart/form-data")) {
-      return handleMultipartExtract(request, session)
+      return stream
+        ? handleStreamMultipartExtract(request, session)
+        : handleMultipartExtract(request, session)
     }
 
     const body = (await request.json()) as Record<string, unknown>
@@ -230,6 +323,9 @@ export async function POST(request: NextRequest) {
       case "generate-docx":
         return handleGenerateDocx(session, body)
 
+      case "three-way-match":
+        return handleTenderThreeWayMatch(session, body)
+
       default:
         return NextResponse.json({ error: `Unknown action: ${action}` }, { status: 400 })
     }
@@ -247,6 +343,54 @@ export async function POST(request: NextRequest) {
 
 // ── Multipart Extraction ──────────────────────────────────────
 
+async function extractTextFromUploadedFile(file: File): Promise<string | undefined> {
+  const arrayBuffer = await file.arrayBuffer()
+  const mimeType = file.type || "application/octet-stream"
+  try {
+    return await extractTextFromDocument(Buffer.from(arrayBuffer), file.name, mimeType)
+  } catch {
+    return undefined
+  }
+}
+
+async function handleStreamMultipartExtract(
+  request: NextRequest,
+  session: { sub: string; workspaceId: string }
+) {
+  try {
+    const formData = await request.formData()
+    const file = formData.get("file") as File | null
+    const sessionId = formData.get("sessionId") as string | null
+    const instructions = formData.get("instructions") as string | null
+    const templateId = formData.get("templateId") as string | null
+    const model = formData.get("model") as string | null
+
+    if (!file) {
+      return NextResponse.json({ error: "file is required" }, { status: 400 })
+    }
+
+    const documentText = await extractTextFromUploadedFile(file)
+
+    return handleStreamExtract(session, {
+      documentText,
+      fileName: file.name,
+      sessionId: sessionId || undefined,
+      instructions: instructions || undefined,
+      templateId: templateId || undefined,
+      model: model || undefined,
+    })
+  } catch (error) {
+    console.error("Stream multipart tender extraction error:", error)
+    return NextResponse.json(
+      {
+        error: "File processing failed",
+        detail: error instanceof Error ? error.message : "Unknown error",
+      },
+      { status: 500 }
+    )
+  }
+}
+
 async function handleMultipartExtract(
   request: NextRequest,
   session: { sub: string; workspaceId: string }
@@ -257,19 +401,25 @@ async function handleMultipartExtract(
     const sessionId = formData.get("sessionId") as string | null
     const instructions = formData.get("instructions") as string | null
     const templateId = formData.get("templateId") as string | null
+    const model = formData.get("model") as string | null
 
     if (!file) {
       return NextResponse.json({ error: "file is required" }, { status: 400 })
     }
 
-    const text = await file.text().catch(() => "")
+    const documentText = await extractTextFromUploadedFile(file)
+    const validationError = validateDocumentText(documentText)
+    if (validationError) {
+      return NextResponse.json({ error: validationError, detail: validationError }, { status: 400 })
+    }
 
     return performExtraction(session, {
-      documentText: text || undefined,
+      documentText,
       fileName: file.name,
       sessionId: sessionId || undefined,
       instructions: instructions || undefined,
       templateId: templateId || undefined,
+      model: model || undefined,
     })
   } catch (error) {
     console.error("Multipart tender extraction error:", error)
@@ -321,19 +471,15 @@ async function performExtraction(
 ) {
   const { documentText, fileName, sessionId, instructions, model } = params
 
-  const userPrompt = instructions
-    ? `Analyze this tender document and extract all structured fields. File: ${fileName || "document"}. Additional instructions: ${instructions}\n\nDocument text:\n${(documentText || "").slice(0, 8000)}`
-    : `Analyze this tender document and extract all structured fields. File: ${fileName || "document"}\n\nDocument text:\n${(documentText || "").slice(0, 8000)}`
+  const validationError = validateDocumentText(documentText)
+  if (validationError) {
+    return NextResponse.json({ error: validationError, detail: validationError }, { status: 400 })
+  }
+
+  const userPrompt = buildExtractionPrompt(documentText!, fileName, instructions)
 
   // ── Try AI extraction, fallback to mock template if no API key ──
-  let extracted: {
-    tenderTitle?: string
-    tenderType?: string
-    fields?: Array<{ field: string; value: string }>
-    keyRequirements?: string[]
-    deadlines?: Array<{ label: string; date: string | null }>
-    confidence?: number
-  } = {}
+  let extracted: ExtractedTender = {}
   let modelUsed = "unknown"
 
   try {
@@ -381,7 +527,7 @@ async function performExtraction(
     modelUsed = mock.model
   }
 
-  const fields = extracted.fields || []
+  const fields = normalizeExtractedFields(extracted)
   const fieldInputs: Record<string, string> = {}
   for (const f of fields) {
     fieldInputs[f.field] = f.value
@@ -417,7 +563,7 @@ async function performExtraction(
         kind: "TENDER_ANALYSIS",
         status: "COMPLETED",
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        input: { fileName, hasText: !!documentText } as any,
+        input: { fileName, hasText: !!documentText, textLength: documentText?.length } as any,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         output: { tenderType: extracted.tenderType, fieldCount: fields.length } as any,
       },
@@ -450,14 +596,6 @@ async function handleStreamExtract(
   const instructions = body.instructions as string | undefined
   const model = body.model as string | undefined
 
-  if (!documentText) {
-    return NextResponse.json({ error: "documentText required" }, { status: 400 })
-  }
-
-  const userPrompt = instructions
-    ? `Analyze this tender document and extract all structured fields. File: ${fileName || "document"}. Instructions: ${instructions}\n\nDocument text:\n${(documentText as string).slice(0, 8000)}`
-    : `Analyze this tender document and extract all structured fields. File: ${fileName || "document"}\n\nDocument text:\n${(documentText as string).slice(0, 8000)}`
-
   const encoder = new TextEncoder()
 
   const stream = new ReadableStream({
@@ -467,6 +605,18 @@ async function handleStreamExtract(
       }
 
       try {
+        const validationError = validateDocumentText(documentText)
+        if (validationError) {
+          send("error", {
+            error: "Text extraction failed",
+            detail: validationError,
+            code: "TEXT_EXTRACTION_FAILED",
+          })
+          return
+        }
+
+        const userPrompt = buildExtractionPrompt(documentText!, fileName, instructions)
+
         send("trace", {
           trace: {
             id: "tender-extract-start",
@@ -474,21 +624,16 @@ async function handleStreamExtract(
             stage: "extraction",
             status: "running",
             title: "Analyzing tender document",
-            detail: fileName ? `Processing: ${fileName}` : "Processing tender document",
+            detail: fileName
+              ? `Processing: ${fileName} (${documentText!.length.toLocaleString()} chars)`
+              : `Processing tender document (${documentText!.length.toLocaleString()} chars)`,
           },
         })
 
         send("thinking", { text: "Sending tender document to AI for analysis..." })
 
         // ── Try AI, fallback to mock if no API key ──
-        let extracted: {
-          tenderTitle?: string
-          tenderType?: string
-          fields?: Array<{ field: string; value: string }>
-          keyRequirements?: string[]
-          deadlines?: Array<{ label: string; date: string | null }>
-          confidence?: number
-        } = {}
+        let extracted: ExtractedTender = {}
         let modelUsed = "unknown"
 
         try {
@@ -536,7 +681,7 @@ async function handleStreamExtract(
           modelUsed = mock.model
         }
 
-        const fields = extracted.fields || []
+        const fields = normalizeExtractedFields(extracted)
         const fieldInputs: Record<string, string> = {}
         for (const f of fields) {
           fieldInputs[f.field] = f.value
@@ -579,12 +724,16 @@ async function handleStreamExtract(
             selectedTemplateId: null,
             selectedByAgent: false,
             selectionReason: "",
-            fields: extracted.fields || [],
+            fields,
             fieldUpdates: fieldInputs,
             applied: true,
             appliedAt: new Date().toISOString(),
             model: modelUsed,
             tenderTitle: extracted.tenderTitle,
+            tenderType: extracted.tenderType,
+            confidence: extracted.confidence,
+            keyRequirements: extracted.keyRequirements,
+            deadlines: extracted.deadlines,
           },
         })
       } catch (error) {
@@ -662,115 +811,158 @@ async function handleSelectTemplate(
 
 // ── Tender Comparison ─────────────────────────────────────────
 
-async function handleCompare(
-  session: { sub: string; workspaceId: string },
-  body: Record<string, unknown>
-) {
-  const { sessionIdA, sessionIdB, sessionIds } = body
+interface TenderCompareData {
+  id: string
+  title: string
+  fieldInputs: Record<string, string>
+}
 
-  // Support both direct 2-tender compare and multi-tender compare
-  const idsToCompare: string[] = sessionIds
-    ? (sessionIds as string[])
-    : [sessionIdA as string, sessionIdB as string].filter(Boolean)
+type AiComparisonResult = {
+  keyDifferences?: string[]
+  risksA?: string[]
+  risksB?: string[]
+  recommendation?: { preferred?: string; reason?: string }
+}
 
-  if (idsToCompare.length < 2) {
-    return NextResponse.json({ error: "At least 2 tender session IDs required" }, { status: 400 })
-  }
-
-  const tenderSessions = await prisma.tenderSession.findMany({
-    where: {
-      id: { in: idsToCompare },
-      workspaceId: session.workspaceId,
-    },
-  })
-
-  if (tenderSessions.length < 2) {
-    return NextResponse.json({ error: "Not enough valid tender sessions found" }, { status: 404 })
-  }
-
-  // Extract field data for comparison
-  const tenderData = tenderSessions.map((t) => ({
-    id: t.id,
-    title: t.title,
-    fieldInputs: (t.fieldInputs as Record<string, string>) || {},
-  }))
-
-  // Build aligned comparison
+function buildComparisonFields(tenderData: TenderCompareData[]) {
   const allFields = Array.from(
     new Set(tenderData.flatMap((t) => Object.keys(t.fieldInputs)))
   ).filter(Boolean)
 
-  const comparisonFields = allFields.map((field) => {
+  return allFields.map((field) => {
     const values = tenderData.map((t) => ({
       tenderId: t.id,
       tenderTitle: t.title,
       value: t.fieldInputs[field] || "—",
     }))
-
-    // Check if all values match
     const allMatch = values.length >= 2 && values.every((v) => v.value === values[0].value)
-
-    return {
-      field,
-      values,
-      match: allMatch,
-    }
+    return { field, values, match: allMatch }
   })
+}
 
-  // If 2 tenders, optionally run AI comparison for deeper analysis
-  let aiComparison: {
-    keyDifferences?: string[]
-    risksA?: string[]
-    risksB?: string[]
-    recommendation?: { preferred?: string; reason?: string }
-  } = {}
+async function runAiComparison(tenderData: TenderCompareData[]): Promise<AiComparisonResult> {
+  if (tenderData.length !== 2) return {}
 
-  if (tenderData.length === 2) {
+  try {
+    const prompt = TENDER_COMPARISON_PROMPT
+      .replace("{tenderA}", JSON.stringify(tenderData[0]))
+      .replace("{tenderB}", JSON.stringify(tenderData[1]))
+
+    const result = await callAI({
+      temperature: 0.3,
+      maxTokens: 2000,
+      responseFormat: "json",
+      messages: [{ role: "system", content: prompt }],
+    })
+
     try {
-      const prompt = TENDER_COMPARISON_PROMPT
-        .replace("{tenderA}", JSON.stringify(tenderData[0]))
-        .replace("{tenderB}", JSON.stringify(tenderData[1]))
-
-      const result = await callAI({
-        temperature: 0.3,
-        maxTokens: 2000,
-        responseFormat: "json",
-        messages: [{ role: "system", content: prompt }],
-      })
-
-      try {
-        const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
-        aiComparison = JSON.parse(cleaned)
-      } catch {
-        aiComparison = {}
-      }
-    } catch (aiErr) {
-      console.warn("AI comparison unavailable, using mock template:", (aiErr as Error).message)
-      const mock = mockTenderCompare(tenderData.map((t) => t.title))
-      aiComparison = {
-        keyDifferences: mock.keyDifferences,
-        risksA: mock.risksA,
-        risksB: mock.risksB,
-        recommendation: mock.recommendation,
-      }
+      const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
+      return JSON.parse(cleaned) as AiComparisonResult
+    } catch {
+      return {}
+    }
+  } catch (aiErr) {
+    console.warn("AI comparison unavailable, using mock template:", (aiErr as Error).message)
+    const mock = mockTenderCompare(tenderData.map((t) => t.title))
+    return {
+      keyDifferences: mock.keyDifferences,
+      risksA: mock.risksA,
+      risksB: mock.risksB,
+      recommendation: mock.recommendation,
     }
   }
+}
 
-  // Save comparison to DB
-  try {
-    await prisma.tenderComparison.create({
-      data: {
+function parseInlineTenders(
+  inlineTenders: Array<{
+    title: string
+    fields?: Array<{ field: string; value: string }> | Record<string, string>
+  }>
+): TenderCompareData[] {
+  return inlineTenders.map((t, i) => {
+    const fieldInputs: Record<string, string> = {}
+    if (Array.isArray(t.fields)) {
+      for (const f of t.fields) {
+        if (f.field?.trim()) fieldInputs[f.field] = f.value
+      }
+    } else if (t.fields) {
+      Object.assign(fieldInputs, t.fields)
+    }
+    return {
+      id: `inline-${i}`,
+      title: t.title,
+      fieldInputs,
+    }
+  })
+}
+
+async function handleCompare(
+  session: { sub: string; workspaceId: string },
+  body: Record<string, unknown>
+) {
+  const { sessionIdA, sessionIdB, sessionIds, tenders: inlineTenders } = body
+
+  let tenderData: TenderCompareData[]
+  let idsToCompare: string[] = []
+  let persistToDb = true
+
+  if (Array.isArray(inlineTenders) && inlineTenders.length >= 2) {
+    tenderData = parseInlineTenders(
+      inlineTenders as Array<{
+        title: string
+        fields?: Array<{ field: string; value: string }> | Record<string, string>
+      }>
+    )
+    persistToDb = false
+  } else {
+    idsToCompare = sessionIds
+      ? (sessionIds as string[])
+      : [sessionIdA as string, sessionIdB as string].filter(Boolean)
+
+    if (idsToCompare.length < 2) {
+      return NextResponse.json(
+        { error: "At least 2 tenders required (sessionIds or inline tenders array)" },
+        { status: 400 }
+      )
+    }
+
+    const tenderSessions = await prisma.tenderSession.findMany({
+      where: {
+        id: { in: idsToCompare },
         workspaceId: session.workspaceId,
-        userId: session.sub,
-        title: `Comparison: ${tenderData.map((t) => t.title).join(" vs ")}`,
-        comparisonType: idsToCompare.length > 2 ? "multi_client" : "company_vs_competitor",
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        comparisonData: { comparisonFields, ...aiComparison } as any,
-        comparedTenderIds: idsToCompare,
       },
     })
-  } catch (dbErr) {
-    console.error("Failed to save comparison:", dbErr)
+
+    if (tenderSessions.length < 2) {
+      return NextResponse.json({ error: "Not enough valid tender sessions found" }, { status: 404 })
+    }
+
+    tenderData = tenderSessions.map((t) => ({
+      id: t.id,
+      title: t.title,
+      fieldInputs: (t.fieldInputs as Record<string, string>) || {},
+    }))
+  }
+
+  const comparisonFields = buildComparisonFields(tenderData)
+  const aiComparison = await runAiComparison(tenderData)
+
+  if (persistToDb) {
+    try {
+      await prisma.tenderComparison.create({
+        data: {
+          workspaceId: session.workspaceId,
+          userId: session.sub,
+          title: `Comparison: ${tenderData.map((t) => t.title).join(" vs ")}`,
+          comparisonType: idsToCompare.length > 2 ? "multi_client" : "company_vs_competitor",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          comparisonData: { comparisonFields, ...aiComparison } as any,
+          comparedTenderIds: idsToCompare,
+        },
+      })
+    } catch (dbErr) {
+      console.error("Failed to save comparison:", dbErr)
+    }
   }
 
   return NextResponse.json({
@@ -827,3 +1019,134 @@ async function handleGenerateDocx(
     message: "DOCX generation placeholder — fields returned for client-side processing",
   })
 }
+
+// ── Tender 3-Way Match ─────────────────────────────────────────
+
+async function extractTextFromFiles(
+  files: Array<{ name: string; base64: string }>
+): Promise<string> {
+  const texts: string[] = []
+  for (const file of files) {
+    try {
+      const buffer = Buffer.from(file.base64, "base64")
+      let extractedText = ""
+
+      if (file.name.toLowerCase().endsWith(".pdf")) {
+        try {
+          // pdf-parse is CommonJS — use createRequire for ESM compatibility
+          const { createRequire } = await import("module")
+          const req = createRequire(import.meta.url)
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const pdfParse = req("pdf-parse") as (buf: Buffer) => Promise<{ text: string }>
+          const data = await pdfParse(buffer)
+          extractedText = data.text || ""
+          console.log(`[3-Way Match] Parsed PDF ${file.name}: ${extractedText.length} chars`)
+        } catch (pdfErr) {
+          console.warn(`[3-Way Match] pdf-parse failed for ${file.name}, falling back to text:`, (pdfErr as Error).message)
+          // Strip non-printable bytes so the AI gets something legible
+          extractedText = buffer.toString("utf-8").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ")
+        }
+      } else {
+        extractedText = buffer.toString("utf-8")
+      }
+
+      texts.push(`[File: ${file.name}]\n${extractedText}`)
+    } catch (fileErr) {
+      console.error(`[3-Way Match] Failed to process file ${file.name}:`, fileErr)
+      texts.push(`[File: ${file.name}]\n(Failed to process file)`)
+    }
+  }
+  return texts.join("\n\n---\n\n")
+}
+
+async function handleTenderThreeWayMatch(
+  session: { sub: string; workspaceId: string },
+  body: Record<string, unknown>
+) {
+  const { poFiles, grnFiles, invFiles } = body as {
+    poFiles?: Array<{ name: string; base64: string }>
+    grnFiles?: Array<{ name: string; base64: string }>
+    invFiles?: Array<{ name: string; base64: string }>
+  }
+
+  if (!poFiles?.length || !grnFiles?.length || !invFiles?.length) {
+    return NextResponse.json(
+      { error: "poFiles, grnFiles, and invFiles are required (at least one each)" },
+      { status: 400 }
+    )
+  }
+
+  // Extract text from all uploaded files in parallel
+  const [poText, grnText, invText] = await Promise.all([
+    extractTextFromFiles(poFiles),
+    extractTextFromFiles(grnFiles),
+    extractTextFromFiles(invFiles),
+  ])
+
+  const divider = "==".repeat(30)
+  const userMessage = [
+    `PURCHASE ORDER DOCUMENTS (${poFiles.length} file${poFiles.length > 1 ? "s" : ""}):\n${poText}`,
+    `GOODS RECEIPT NOTE DOCUMENTS (${grnFiles.length} file${grnFiles.length > 1 ? "s" : ""}):\n${grnText}`,
+    `SUPPLIER INVOICE DOCUMENTS (${invFiles.length} file${invFiles.length > 1 ? "s" : ""}):\n${invText}`,
+  ].join(`\n\n${divider}\n\n`)
+
+  let result
+  try {
+    result = await callAI({
+      temperature: 0.2,
+      maxTokens: 4000,
+      responseFormat: "json",
+      messages: [
+        { role: "system", content: TENDER_THREE_WAY_MATCH_PROMPT },
+        { role: "user", content: userMessage },
+      ],
+    })
+  } catch (aiErr) {
+    console.error("[3-Way Match] AI call failed:", aiErr)
+    return NextResponse.json(
+      { error: "AI service unavailable. Please try again later." },
+      { status: 503 }
+    )
+  }
+
+  let matchResult: Record<string, unknown> = {}
+  try {
+    const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
+    matchResult = JSON.parse(cleaned)
+  } catch {
+    console.error("[3-Way Match] Failed to parse AI response:", result.messageContent.slice(0, 300))
+    return NextResponse.json(
+      { error: "AI returned an unreadable response. The documents may not contain enough structured procurement data." },
+      { status: 422 }
+    )
+  }
+
+  // Validate that the AI returned the expected shape
+  if (!Array.isArray(matchResult.matchedItems) || typeof matchResult.summary !== "object") {
+    console.error("[3-Way Match] AI response missing required fields:", JSON.stringify(matchResult).slice(0, 300))
+    return NextResponse.json(
+      { error: matchResult.error as string || "AI could not extract procurement data from the documents. Please ensure files contain readable PO / GRN / Invoice line items (text-based PDFs, DOCX, CSV or TXT work best)." },
+      { status: 422 }
+    )
+  }
+
+  // Create AgentRun record
+  try {
+    await prisma.agentRun.create({
+      data: {
+        workspaceId: session.workspaceId,
+        kind: "FINANCE_THREE_WAY_MATCH",
+        status: "COMPLETED",
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        input: { poFileCount: poFiles.length, grnFileCount: grnFiles.length, invFileCount: invFiles.length } as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        output: matchResult as any,
+      },
+    })
+  } catch (dbErr) {
+    console.error("Failed to create AgentRun for three-way match:", dbErr)
+  }
+
+  return NextResponse.json(matchResult)
+}
+

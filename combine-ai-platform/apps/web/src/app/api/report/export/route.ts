@@ -9,16 +9,63 @@ export async function POST(request: Request) {
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
   try {
-    const { rows, format } = (await request.json()) as {
+    const body = (await request.json()) as {
       rows?: Array<{ field: string; value: string }>
-      format?: "xlsx" | "csv"
+      format?: "xlsx" | "csv" | "md"
+      summary?: string
+      keyPoints?: string[]
+      kbReferences?: Array<{
+        articleTitle: string
+        knowledgeBaseName: string
+        relevance: string
+      }>
+      fileName?: string
+    }
+
+    const { rows, format, summary, keyPoints, kbReferences, fileName } = body
+    const exportFormat = format || "xlsx"
+
+    if (exportFormat === "md") {
+      if (!summary) {
+        return NextResponse.json({ error: "summary required for md export" }, { status: 400 })
+      }
+
+      const lines = [
+        `# Report Summary — ${fileName || "document"}`,
+        "",
+        "## 總述",
+        summary,
+        "",
+      ]
+
+      if (keyPoints && keyPoints.length > 0) {
+        lines.push("## 知識庫相關要點", "")
+        for (const point of keyPoints) {
+          lines.push(`- ${point}`)
+        }
+        lines.push("")
+      }
+
+      if (kbReferences && kbReferences.length > 0) {
+        lines.push("## 參考條文", "")
+        for (const ref of kbReferences) {
+          lines.push(`- **${ref.articleTitle}** (${ref.knowledgeBaseName}) — ${ref.relevance}`)
+        }
+        lines.push("")
+      }
+
+      const markdown = lines.join("\n")
+      return new NextResponse(markdown, {
+        headers: {
+          "Content-Type": "text/markdown; charset=utf-8",
+          "Content-Disposition": `attachment; filename="report-summary-${Date.now()}.md"`,
+        },
+      })
     }
 
     if (!rows || rows.length === 0) {
       return NextResponse.json({ error: "No rows provided" }, { status: 400 })
     }
-
-    const exportFormat = format || "xlsx"
 
     // Build worksheet data: header row + data rows
     const sheetData: string[][] = [["Field", "Value"]]
