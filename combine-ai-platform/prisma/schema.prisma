@@ -276,6 +276,7 @@ model Conversation {
   labels       String[]
   replyTo      String
   sourceProvider MailProvider?
+  providerMessageId String?
   providerThreadId String?
   aiTriagedAt   DateTime?
   aiRouteConfidence Float?
@@ -311,7 +312,7 @@ model Conversation {
   @@index([workspaceId, parentConversationId, createdAt])
   @@index([workspaceId, parentConversationId, departmentReviewStatus])
   @@index([workspaceId, departmentSubmittedById])
-  @@unique([inboxId, sourceProvider, providerThreadId])
+  @@unique([inboxId, sourceProvider, providerMessageId])
 }
 
 model InboxMembership {

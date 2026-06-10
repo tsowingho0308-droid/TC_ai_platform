@@ -286,6 +286,16 @@ async function runManualSync(params: {
   accessToken: string
   externalEmail: string | null
 }) {
+  // Drop legacy thread-grouped Gmail rows (pre per-message sync)
+  await prisma.conversation.deleteMany({
+    where: {
+      workspaceId: params.workspaceId,
+      inboxId: params.inboxId,
+      sourceProvider: MailProvider.GMAIL,
+      providerMessageId: null,
+    },
+  })
+
   const list = await gmailApi<GmailListMessagesResponse>(
     params.accessToken,
     "/gmail/v1/users/me/messages?maxResults=50"
@@ -307,80 +317,73 @@ async function runManualSync(params: {
     if (!messages.length) continue
     fetchedMessages += messages.length
 
-    const labels = Array.from(new Set(messages.flatMap((m) => m.labelIds || [])))
-    const latest = messages[messages.length - 1]
-    const latestInbound = [...messages].reverse().find((m) => {
-      if (m.labelIds?.includes("SENT")) return false
-      if (!params.externalEmail) return true
-      const sender = parseSender(getHeader(m, "From"))
-      return sender.email.toLowerCase() !== params.externalEmail.toLowerCase()
-    }) || latest
-
-    const sender = parseSender(getHeader(latestInbound, "From"))
-    const subject = getHeader(latestInbound, "Subject") || "(No subject)"
-    const replyTo = getHeader(latestInbound, "Reply-To") || sender.email
-    const bodies = collectBodies(latestInbound)
-    const preview = (
-      bodies.text ||
-      latestInbound.snippet ||
-      stripHtml(bodies.html || "") ||
-      "(No preview)"
-    ).replace(/\s+/g, " ").trim().slice(0, 220)
-
-    const existingConversation = await prisma.conversation.findUnique({
-      where: {
-        inboxId_sourceProvider_providerThreadId: {
-          inboxId: params.inboxId,
-          sourceProvider: MailProvider.GMAIL,
-          providerThreadId: thread.id,
-        },
-      },
-    })
-
-    const conversation = existingConversation
-      ? await prisma.conversation.update({
-          where: { id: existingConversation.id },
-          data: {
-            folderId: mapFolder(labels),
-            read: !labels.includes("UNREAD"),
-            starred: labels.includes("STARRED"),
-            senderName: sender.name,
-            senderEmail: sender.email,
-            subject,
-            preview,
-            replyTo,
-          },
-        })
-      : await prisma.conversation.create({
-          data: {
-            workspaceId: params.workspaceId,
-            inboxId: params.inboxId,
-            folderId: mapFolder(labels),
-            status: "OPEN",
-            subject,
-            senderName: sender.name,
-            senderEmail: sender.email,
-            preview,
-            replyTo,
-            read: !labels.includes("UNREAD"),
-            starred: labels.includes("STARRED"),
-            labels: [],
-            sourceProvider: MailProvider.GMAIL,
-            providerThreadId: thread.id,
-          },
-        })
-
-    if (existingConversation) conversationsUpdated += 1
-    else conversationsCreated += 1
-
     for (const msg of messages) {
-      const direction = msg.labelIds?.includes("SENT")
-        ? MessageDirection.OUTBOUND
-        : MessageDirection.INBOUND
+      const msgLabels = msg.labelIds || []
+      const sender = parseSender(getHeader(msg, "From"))
+      const subject = getHeader(msg, "Subject") || "(No subject)"
+      const replyTo = getHeader(msg, "Reply-To") || sender.email
       const parts = collectBodies(msg)
       const bodyText = parts.text
       const bodyHtml = parts.html
       const body = bodyText || msg.snippet || stripHtml(bodyHtml || "") || "(No body)"
+      const preview = (
+        bodyText ||
+        msg.snippet ||
+        stripHtml(bodyHtml || "") ||
+        "(No preview)"
+      ).replace(/\s+/g, " ").trim().slice(0, 220)
+
+      const existingConversation = await prisma.conversation.findUnique({
+        where: {
+          inboxId_sourceProvider_providerMessageId: {
+            inboxId: params.inboxId,
+            sourceProvider: MailProvider.GMAIL,
+            providerMessageId: msg.id,
+          },
+        },
+      })
+
+      const conversation = existingConversation
+        ? await prisma.conversation.update({
+            where: { id: existingConversation.id },
+            data: {
+              folderId: mapFolder(msgLabels),
+              read: !msgLabels.includes("UNREAD"),
+              starred: msgLabels.includes("STARRED"),
+              senderName: sender.name,
+              senderEmail: sender.email,
+              subject,
+              preview,
+              replyTo,
+              providerThreadId: thread.id,
+            },
+          })
+        : await prisma.conversation.create({
+            data: {
+              workspaceId: params.workspaceId,
+              inboxId: params.inboxId,
+              folderId: mapFolder(msgLabels),
+              status: "OPEN",
+              subject,
+              senderName: sender.name,
+              senderEmail: sender.email,
+              preview,
+              replyTo,
+              read: !msgLabels.includes("UNREAD"),
+              starred: msgLabels.includes("STARRED"),
+              labels: [],
+              sourceProvider: MailProvider.GMAIL,
+              providerMessageId: msg.id,
+              providerThreadId: thread.id,
+            },
+          })
+
+      if (existingConversation) conversationsUpdated += 1
+      else conversationsCreated += 1
+
+      const direction = msgLabels.includes("SENT")
+        ? MessageDirection.OUTBOUND
+        : MessageDirection.INBOUND
 
       const existed = await prisma.message.findUnique({
         where: {
@@ -393,7 +396,16 @@ async function runManualSync(params: {
       })
 
       const dbMessage = existed
-        ? existed
+        ? await prisma.message.update({
+            where: { id: existed.id },
+            data: {
+              conversationId: conversation.id,
+              body,
+              bodyText,
+              bodyHtml,
+              gmailLabelIds: msgLabels,
+            },
+          })
         : await prisma.message.create({
             data: {
               workspaceId: params.workspaceId,
@@ -405,7 +417,7 @@ async function runManualSync(params: {
               body,
               bodyText,
               bodyHtml,
-              gmailLabelIds: msg.labelIds || [],
+              gmailLabelIds: msgLabels,
               createdAt: msg.internalDate ? new Date(Number(msg.internalDate)) : new Date(),
             },
           })

@@ -11,12 +11,17 @@ export function useCrossAgent() {
     sourceId: string
     subject?: string
     attachmentId?: string
+    attachmentIds?: string[]
     attachmentName?: string
   }) {
     const searchParams = new URLSearchParams()
     searchParams.set("fromEmail", params.sourceId)
     if (params.subject) searchParams.set("emailSubject", params.subject)
-    if (params.attachmentId) searchParams.set("attachmentId", params.attachmentId)
+    if (params.attachmentIds?.length) {
+      searchParams.set("attachmentIds", params.attachmentIds.join(","))
+    } else if (params.attachmentId) {
+      searchParams.set("attachmentId", params.attachmentId)
+    }
     if (params.attachmentName) searchParams.set("attachmentName", params.attachmentName)
 
     router.push(`/tender?${searchParams.toString()}`)
@@ -26,12 +31,17 @@ export function useCrossAgent() {
     sourceId: string
     subject?: string
     attachmentId?: string
+    attachmentIds?: string[]
     attachmentName?: string
   }) {
     const searchParams = new URLSearchParams()
     searchParams.set("fromEmail", params.sourceId)
     if (params.subject) searchParams.set("emailSubject", params.subject)
-    if (params.attachmentId) searchParams.set("attachmentId", params.attachmentId)
+    if (params.attachmentIds?.length) {
+      searchParams.set("attachmentIds", params.attachmentIds.join(","))
+    } else if (params.attachmentId) {
+      searchParams.set("attachmentId", params.attachmentId)
+    }
     if (params.attachmentName) searchParams.set("attachmentName", params.attachmentName)
 
     router.push(`/report?${searchParams.toString()}`)

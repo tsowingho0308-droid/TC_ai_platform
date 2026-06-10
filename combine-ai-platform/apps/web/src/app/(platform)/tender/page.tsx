@@ -11,6 +11,12 @@ import {
 import { cn } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import {
+  getInitialSelectedAttachmentIds,
+  getSelectedAnalyzableAttachments,
+  isAnalyzableEmailAttachment,
+  parseAttachmentIdsFromSearchParams,
+} from "@/features/cross-agent/email-attachments"
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -55,37 +61,6 @@ interface EmailSource {
   senderEmail: string
   body: string
   attachments: EmailAttachment[]
-}
-
-function getPrimaryDocumentAttachment(
-  attachments: EmailAttachment[],
-  preferredId?: string | null
-): EmailAttachment | null {
-  if (preferredId) {
-    const found = attachments.find((a) => a.id === preferredId)
-    if (found) return found
-  }
-  return (
-    attachments.find(
-      (att) =>
-        att.mimeType === "application/pdf" ||
-        att.fileName.toLowerCase().endsWith(".pdf") ||
-        att.fileName.toLowerCase().endsWith(".docx") ||
-        att.fileName.toLowerCase().endsWith(".doc") ||
-        att.fileName.toLowerCase().endsWith(".txt")
-    ) || null
-  )
-}
-
-function isAnalyzableAttachment(att: EmailAttachment): boolean {
-  const name = att.fileName.toLowerCase()
-  return (
-    att.mimeType === "application/pdf" ||
-    name.endsWith(".pdf") ||
-    name.endsWith(".docx") ||
-    name.endsWith(".doc") ||
-    name.endsWith(".txt")
-  )
 }
 
 interface ComparisonField {
@@ -238,6 +213,7 @@ function TenderPageContent() {
   const fromEmailId = searchParams.get("fromEmail")
   const emailSubjectParam = searchParams.get("emailSubject")
   const attachmentIdParam = searchParams.get("attachmentId")
+  const attachmentIdsParam = searchParams.get("attachmentIds")
 
   const [viewMode, setViewMode] = useState<"edit" | "compare">("edit")
   const [tenders, setTenders] = useState<TenderItem[]>([])
@@ -259,7 +235,7 @@ function TenderPageContent() {
   const abortRef = useRef<AbortController | null>(null)
   const [emailSource, setEmailSource] = useState<EmailSource | null>(null)
   const [loadingEmail, setLoadingEmail] = useState(false)
-  const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null)
+  const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<Set<string>>(new Set())
   const [loadingEmailExtract, setLoadingEmailExtract] = useState(false)
 
   const comparisonResult = useMemo(() => buildComparison(tenders), [tenders])
@@ -289,8 +265,8 @@ function TenderPageContent() {
           .filter(Boolean)
           .join("\n\n")
         const attachments = conv.attachments || []
-        const primary = getPrimaryDocumentAttachment(attachments, attachmentIdParam)
-        setSelectedAttachmentId(primary?.id ?? null)
+        const preferredIds = parseAttachmentIdsFromSearchParams(attachmentIdsParam, attachmentIdParam)
+        setSelectedAttachmentIds(getInitialSelectedAttachmentIds(attachments, preferredIds))
         setEmailSource({
           id: conv.id,
           subject: emailSubjectParam || conv.subject,
@@ -302,7 +278,7 @@ function TenderPageContent() {
       })
       .catch(console.error)
       .finally(() => setLoadingEmail(false))
-  }, [fromEmailId, emailSubjectParam])
+  }, [fromEmailId, emailSubjectParam, attachmentIdParam, attachmentIdsParam])
 
   useEffect(() => {
     return () => {
@@ -389,6 +365,16 @@ function TenderPageContent() {
     }
     if (!response.body) throw new Error("Response body is not available")
 
+    const appendTraceEvent = (trace: TraceEvent) => {
+      setTraceEvents((prev) => [
+        ...prev,
+        {
+          ...trace,
+          id: `${trace.id}-${fileName}-${prev.length}`,
+        },
+      ])
+    }
+
     const bodyReader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ""
@@ -406,7 +392,7 @@ function TenderPageContent() {
           const parsed = parseSseRecord(record)
           switch (parsed.event) {
             case "trace":
-              if (parsed.data?.trace) setTraceEvents((prev) => [...prev, parsed.data!.trace as TraceEvent])
+              if (parsed.data?.trace) appendTraceEvent(parsed.data.trace as TraceEvent)
               break
             case "thinking":
               if (parsed.data?.text) setThinkingText(parsed.data.text)
@@ -438,8 +424,8 @@ function TenderPageContent() {
     return false
   }
 
-  async function runExtraction(documentText: string, fileName: string) {
-    resetState()
+  async function runExtraction(documentText: string, fileName: string, options?: { skipReset?: boolean }) {
+    if (!options?.skipReset) resetState()
     setAnalyzing(true)
     setStreamingStatus("connecting")
     const controller = new AbortController()
@@ -495,13 +481,18 @@ function TenderPageContent() {
     }
   }
 
-  async function loadEmailAttachmentAndAnalyze(attachmentId: string) {
+  async function loadEmailAttachmentAndAnalyze(
+    attachmentId: string,
+    options?: { skipReset?: boolean }
+  ) {
     if (!emailSource) return
     const att = emailSource.attachments.find((a) => a.id === attachmentId)
     if (!att) return
 
-    setLoadingEmailExtract(true)
-    setError(null)
+    if (!options?.skipReset) {
+      setLoadingEmailExtract(true)
+      setError(null)
+    }
     try {
       const res = await fetch(
         `/api/email/attachments?action=extract&id=${encodeURIComponent(attachmentId)}`
@@ -514,45 +505,84 @@ function TenderPageContent() {
       if (!data.text?.trim()) {
         throw new Error("No text could be extracted from the attachment")
       }
-      setSelectedAttachmentId(attachmentId)
-      await runExtraction(data.text, data.fileName || att.fileName)
+      await runExtraction(data.text, data.fileName || att.fileName, options)
     } catch (err) {
       console.error("Email attachment analyze error:", err)
       setError(err instanceof Error ? err.message : "Failed to analyze email attachment")
       setStreamingStatus("error")
       setAnalyzing(false)
+      throw err
     } finally {
-      setLoadingEmailExtract(false)
+      if (!options?.skipReset) {
+        setLoadingEmailExtract(false)
+      }
     }
   }
 
   async function handleAnalyzeEmail() {
     if (!emailSource) return
-    const att = getPrimaryDocumentAttachment(
+    const selected = getSelectedAnalyzableAttachments(
       emailSource.attachments,
-      selectedAttachmentId || attachmentIdParam
+      selectedAttachmentIds
     )
-    if (att) {
-      await loadEmailAttachmentAndAnalyze(att.id)
-    } else if (emailSource.body.trim()) {
+
+    if (selected.length > 0) {
+      resetState()
+      setLoadingEmailExtract(true)
+      setError(null)
+      try {
+        for (let i = 0; i < selected.length; i++) {
+          await loadEmailAttachmentAndAnalyze(selected[i].id, { skipReset: i > 0 })
+        }
+      } catch {
+        // Error already surfaced in loadEmailAttachmentAndAnalyze
+      } finally {
+        setLoadingEmailExtract(false)
+        setAnalyzing(false)
+      }
+      return
+    }
+
+    if (emailSource.body.trim()) {
       await runExtraction(emailSource.body, `${emailSource.subject || "email"}.txt`)
     } else {
-      setError("Email has no content to analyze")
+      setError("Select at least one attachment to analyze")
       setStreamingStatus("error")
     }
   }
 
-  const emailAnalyzableAttachment = emailSource
-    ? getPrimaryDocumentAttachment(
-        emailSource.attachments,
-        selectedAttachmentId || attachmentIdParam
-      )
-    : null
+  const selectedAnalyzableAttachments = emailSource
+    ? getSelectedAnalyzableAttachments(emailSource.attachments, selectedAttachmentIds)
+    : []
+
+  const emailAnalyzableAttachments = emailSource
+    ? emailSource.attachments.filter((att) => isAnalyzableEmailAttachment(att))
+    : []
 
   const canAnalyzeEmail = Boolean(
     emailSource &&
-      (emailAnalyzableAttachment || emailSource.body.trim().length > 0)
+      (selectedAnalyzableAttachments.length > 0 || emailSource.body.trim().length > 0)
   )
+
+  function toggleAttachmentSelection(attachmentId: string) {
+    setSelectedAttachmentIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(attachmentId)) next.delete(attachmentId)
+      else next.add(attachmentId)
+      return next
+    })
+  }
+
+  function selectAllAnalyzableAttachments() {
+    if (!emailSource) return
+    setSelectedAttachmentIds(
+      new Set(emailAnalyzableAttachments.map((att) => att.id))
+    )
+  }
+
+  function clearAttachmentSelection() {
+    setSelectedAttachmentIds(new Set())
+  }
 
   function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
@@ -786,50 +816,78 @@ function TenderPageContent() {
                     )}
                     {loadingEmailExtract || analyzing
                       ? "Analyzing..."
-                      : "Analyze with Tender"}
+                      : selectedAnalyzableAttachments.length > 1
+                        ? `Analyze ${selectedAnalyzableAttachments.length} with Tender`
+                        : "Analyze with Tender"}
                   </button>
                   {emailSource.attachments.length > 0 && (
                     <div className="mt-3 space-y-2">
-                      <p className="text-xs font-medium text-muted-foreground">
-                        Attachments — click to select for analysis
-                      </p>
-                      {emailSource.attachments.map((att) => (
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs font-medium text-muted-foreground">
+                          Attachments — select one or more
+                        </p>
+                        {emailAnalyzableAttachments.length > 0 && (
+                          <div className="flex items-center gap-2 text-[10px]">
+                            <button
+                              type="button"
+                              onClick={selectAllAnalyzableAttachments}
+                              className="text-primary hover:underline"
+                            >
+                              All
+                            </button>
+                            <button
+                              type="button"
+                              onClick={clearAttachmentSelection}
+                              className="text-muted-foreground hover:underline"
+                            >
+                              Clear
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                      {emailSource.attachments.map((att) => {
+                        const analyzable = isAnalyzableEmailAttachment(att)
+                        const selected = selectedAttachmentIds.has(att.id)
+                        return (
                         <div
                           key={att.id}
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => {
-                            if (isAnalyzableAttachment(att)) setSelectedAttachmentId(att.id)
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" && isAnalyzableAttachment(att)) {
-                              setSelectedAttachmentId(att.id)
-                            }
-                          }}
                           className={cn(
                             "flex items-start gap-2 rounded-md border p-2",
-                            isAnalyzableAttachment(att) && "cursor-pointer hover:bg-accent/50",
-                            (selectedAttachmentId || attachmentIdParam) === att.id &&
-                              "border-primary bg-primary/5"
+                            analyzable && "hover:bg-accent/50",
+                            selected && "border-primary bg-primary/5"
                           )}
                         >
-                          <Paperclip className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            disabled={!analyzable}
+                            onChange={() => {
+                              if (analyzable) toggleAttachmentSelection(att.id)
+                            }}
+                            className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary disabled:opacity-40"
+                            aria-label={`Select ${att.fileName}`}
+                          />
                           <div className="min-w-0 flex-1">
                             <p className="truncate text-xs font-medium">{att.fileName}</p>
                             <p className="text-[10px] text-muted-foreground">
                               {Math.max(1, Math.round(att.sizeBytes / 1024))} KB
-                              {!isAnalyzableAttachment(att) && " — not analyzable"}
+                              {!analyzable && " — not analyzable"}
                             </p>
                           </div>
                           <a
                             href={`/api/email/attachments?action=download&id=${encodeURIComponent(att.id)}`}
-                            onClick={(e) => e.stopPropagation()}
                             className="shrink-0 text-[10px] text-primary hover:underline"
                           >
                             Download
                           </a>
                         </div>
-                      ))}
+                        )
+                      })}
+                      {selectedAnalyzableAttachments.length > 0 && (
+                        <p className="text-[10px] text-muted-foreground">
+                          {selectedAnalyzableAttachments.length} selected for analysis
+                        </p>
+                      )}
                     </div>
                   )}
                 </>
