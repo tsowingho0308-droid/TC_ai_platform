@@ -286,7 +286,6 @@ function ComposeContent() {
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".txt,.pdf,.doc,.docx,text/plain,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                   className="hidden"
                   onChange={handleFileSelect}
                 />
@@ -303,6 +302,9 @@ function ComposeContent() {
                   )}
                   Upload
                 </button>
+                <span className="text-[11px] text-muted-foreground">
+                  PNG, JPG, PDF, DOCX, and other file types
+                </span>
 
                 {attachments.map((file) => (
                   <span

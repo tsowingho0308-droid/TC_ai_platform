@@ -54,8 +54,8 @@ export class DashScopeProvider implements IAiProvider {
       body.tools = req.tools
     }
 
-    // Enable deep thinking for supported models
-    if (THINKING_MODELS.has(model)) {
+    // Enable deep thinking for supported models (text-only requests)
+    if (THINKING_MODELS.has(model) && !messagesContainImages(req)) {
       body.extra_body = { enable_thinking: true }
     }
 
@@ -125,8 +125,8 @@ export class DashScopeProvider implements IAiProvider {
       body.tools = req.tools
     }
 
-    // Enable deep thinking for supported models
-    if (THINKING_MODELS.has(model)) {
+    // Enable deep thinking for supported models (text-only requests)
+    if (THINKING_MODELS.has(model) && !messagesContainImages(req)) {
       body.extra_body = { enable_thinking: true }
     }
 
@@ -276,12 +276,20 @@ function serializeContent(content: string | ContentPart[]): string | Array<Recor
         type: "image_url",
         image_url: {
           url: part.image_url!.url,
-          detail: part.image_url!.detail ?? "high",
         },
       }
     }
     return part as unknown as Record<string, unknown>
   })
+}
+
+function messagesContainImages(req: CompletionRequest): boolean {
+  for (const msg of req.messages) {
+    if (Array.isArray(msg.content) && msg.content.some((part) => part.type === "image_url")) {
+      return true
+    }
+  }
+  return false
 }
 
 /** Singleton provider instance */

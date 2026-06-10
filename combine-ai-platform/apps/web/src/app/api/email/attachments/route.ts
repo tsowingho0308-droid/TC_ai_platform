@@ -25,6 +25,7 @@ export async function GET(request: NextRequest) {
         mimeType: true,
         sizeBytes: true,
         messageId: true,
+        contentId: true,
         createdAt: true,
       },
     })
@@ -56,6 +57,17 @@ export async function GET(request: NextRequest) {
         "Content-Type": attachment.mimeType,
         "Content-Disposition": `attachment; filename="${attachment.fileName}"`,
         "Content-Length": String(buffer.length),
+      },
+    })
+  }
+
+  if (action === "inline") {
+    return new NextResponse(new Uint8Array(buffer), {
+      headers: {
+        "Content-Type": attachment.mimeType,
+        "Content-Disposition": `inline; filename="${attachment.fileName}"`,
+        "Content-Length": String(buffer.length),
+        "Cache-Control": "private, max-age=3600",
       },
     })
   }

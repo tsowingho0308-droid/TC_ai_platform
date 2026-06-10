@@ -2,11 +2,14 @@ import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
 import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { FinanceDocType } from "@prisma/client"
+import { extractTextFromDocument } from "@/lib/server/document-text"
 
 export const dynamic = "force-dynamic"
 
 async function callAI(req: {
   model?: string
+  systemPrompt?: string
   temperature?: number
   maxTokens?: number
   responseFormat?: "json" | "text"
@@ -15,6 +18,7 @@ async function callAI(req: {
   const provider = getDashScopeProvider()
   const result = await provider.createCompletion({
     model: req.model || DEFAULT_MODELS.finance,
+    systemPrompt: req.systemPrompt,
     temperature: req.temperature ?? 0.3,
     maxTokens: req.maxTokens ?? 2000,
     responseFormat: req.responseFormat,
@@ -73,6 +77,102 @@ Respond ONLY with valid JSON:
   "flags": ["critical issue descriptions"]
 }`
 
+function parseJsonObject<T>(value: string, fallback: T): T {
+  try {
+    const cleaned = value.replace(/```json\s*|\s*```/g, "").trim()
+    return JSON.parse(cleaned) as T
+  } catch {
+    return fallback
+  }
+}
+
+function toFinanceDocType(value: unknown, fallback?: string): FinanceDocType {
+  const raw = String(value || fallback || "").toLowerCase()
+  if (raw.includes("purchase") || raw === "po") return FinanceDocType.PURCHASE_ORDER
+  if (raw.includes("goods") || raw.includes("grn") || raw.includes("receipt note")) return FinanceDocType.GOODS_RECEIPT
+  if (raw.includes("invoice")) return FinanceDocType.INVOICE
+  return FinanceDocType.RECEIPT
+}
+
+function prefixRows(
+  rows: Array<{ field: string; value: string }>,
+  label?: string
+) {
+  if (!label) return rows
+  return rows.map((row) => ({
+    field: `${label} · ${row.field}`,
+    value: row.value,
+  }))
+}
+
+const VISION_MODEL = DEFAULT_MODELS.report
+
+function decodeBase64DataUrl(dataUrl: string) {
+  const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
+  if (!match) {
+    throw new Error("Invalid file data. Expected a base64 data URL.")
+  }
+  return {
+    mimeType: match[1],
+    buffer: Buffer.from(match[2], "base64"),
+  }
+}
+
+async function buildFinanceExtractionRequest(params: {
+  fileBase64: string
+  fileName: string
+  instructions?: string
+  model?: string
+}) {
+  const userContent: Array<{ type: string; text?: string; image_url?: { url: string } }> = []
+  let model = params.model || DEFAULT_MODELS.finance
+
+  if (params.fileBase64.startsWith("data:image/")) {
+    userContent.push({
+      type: "image_url",
+      image_url: { url: params.fileBase64 },
+    })
+    userContent.push({
+      type: "text",
+      text: params.instructions
+        ? `Extract all financial data from this receipt or invoice. File: ${params.fileName}. Additional instructions: ${params.instructions}`
+        : `Extract all financial data from this receipt or invoice. File: ${params.fileName}`,
+    })
+    // Vision extraction works reliably on the general multimodal model.
+    model = VISION_MODEL
+  } else {
+    const { mimeType, buffer } = decodeBase64DataUrl(params.fileBase64)
+    let documentText = ""
+    try {
+      documentText = await extractTextFromDocument(buffer, params.fileName, mimeType)
+    } catch {
+      documentText = ""
+    }
+
+    if (documentText.trim()) {
+      userContent.push({
+        type: "text",
+        text: params.instructions
+          ? `Extract all financial data from this document (${params.fileName}):\n\n${documentText}\n\nAdditional instructions: ${params.instructions}`
+          : `Extract all financial data from this document (${params.fileName}):\n\n${documentText}`,
+      })
+    } else {
+      userContent.push({
+        type: "text",
+        text: params.instructions
+          ? `Extract all financial data from the uploaded document (${params.fileName}). MIME type: ${mimeType}. Additional instructions: ${params.instructions}`
+          : `Extract all financial data from the uploaded document (${params.fileName}). MIME type: ${mimeType}.`,
+      })
+    }
+  }
+
+  return {
+    model,
+    systemPrompt: EXTRACTION_PROMPT,
+    messages: [{ role: "user", content: userContent }],
+  }
+}
+
 export async function POST(request: NextRequest) {
   const session = await requireSession().catch(() => null)
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
@@ -84,7 +184,7 @@ export async function POST(request: NextRequest) {
 
     switch (action) {
       case "extract": {
-        const { sessionId, fileBase64, fileName, instructions } = body
+        const { sessionId, fileBase64, fileName, instructions, model, appendRows, sourceLabel, docType } = body
         if (!sessionId || !fileBase64) {
           return NextResponse.json({ error: "sessionId and fileBase64 required" }, { status: 400 })
         }
@@ -95,42 +195,57 @@ export async function POST(request: NextRequest) {
         })
         if (!financeSession) return NextResponse.json({ error: "Session not found" }, { status: 404 })
 
-        // Build messages with image content
-        const messages: Array<{ role: string; content: Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }> }> = [
-          { role: "system", content: [{ type: "text", text: EXTRACTION_PROMPT }] },
-          {
-            role: "user",
-            content: [
-              { type: "text", text: instructions ? `Additional instructions: ${instructions}` : "Extract all data from this document." },
-              { type: "image_url", image_url: { url: fileBase64 as string, detail: "high" } },
-            ],
-          },
-        ]
+        const extractionRequest = await buildFinanceExtractionRequest({
+          fileBase64: fileBase64 as string,
+          fileName: (fileName as string | undefined) || "document",
+          instructions: instructions as string | undefined,
+          model: model as string | undefined,
+        })
 
         const result = await callAI({
+          model: extractionRequest.model,
+          systemPrompt: extractionRequest.systemPrompt,
           temperature: 0.3,
           maxTokens: 2000,
           responseFormat: "json",
-          messages: messages as Array<{ role: string; content: unknown[] }>,
+          messages: extractionRequest.messages,
         })
 
         // Parse extraction result
-        let extracted: { documentType?: string; rows?: Array<{ field: string; value: string }>; currency?: string; taxId?: string } = {}
-        try {
-          const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
-          extracted = JSON.parse(cleaned)
-        } catch {
-          // Try to extract from raw text
-          extracted = { rows: [{ field: "Raw Extraction", value: result.messageContent }] }
-        }
+        const extracted = parseJsonObject<{
+          documentType?: string
+          rows?: Array<{ field: string; value: string }>
+          currency?: string
+          taxId?: string
+        }>(result.messageContent, {
+          rows: [{ field: "Raw Extraction", value: result.messageContent }],
+        })
 
         const rows = extracted.rows || []
+        const rowsForSession = prefixRows(rows, sourceLabel as string | undefined)
+        const existingRows = Array.isArray(financeSession.extractedRows)
+          ? financeSession.extractedRows as Array<{ field: string; value: string }>
+          : []
+        const mergedRows = appendRows ? [...existingRows, ...rowsForSession] : rowsForSession
 
         // Update session with extracted rows
         await prisma.financeSession.update({
           where: { id: sessionId as string },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          data: { extractedRows: rows as any },
+          data: {
+            extractedRows: mergedRows as any,
+            status: "analyzed",
+          },
+        })
+
+        await prisma.financeDocument.create({
+          data: {
+            sessionId: sessionId as string,
+            docType: toFinanceDocType(docType, extracted.documentType),
+            fileName: (fileName as string | undefined) || "document",
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            extractedData: extracted as any,
+          },
         })
 
         // Create conversation turns
@@ -163,7 +278,13 @@ export async function POST(request: NextRequest) {
           },
         })
 
-        return NextResponse.json({ rows, documentType: extracted.documentType, currency: extracted.currency })
+        return NextResponse.json({
+          rows,
+          sessionRows: mergedRows,
+          documentType: extracted.documentType,
+          currency: extracted.currency,
+          taxId: extracted.taxId,
+        })
       }
 
       case "check-policy": {
@@ -195,27 +316,27 @@ export async function POST(request: NextRequest) {
           .replace("{data}", JSON.stringify(financeSession.extractedRows || []))
 
         const result = await callAI({
+          systemPrompt: prompt,
           temperature: 0.2,
           maxTokens: 1000,
           responseFormat: "json",
-          messages: [
-            { role: "system", content: prompt },
-          ],
+          messages: [{ role: "user", content: "Run the policy compliance check." }],
         })
 
-        let policyResults: Array<{ rule: string; passed: boolean; detail: string }> = []
-        try {
-          const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
-          const parsed = JSON.parse(cleaned)
-          policyResults = parsed.policyResults || []
-        } catch {
-          policyResults = [{ rule: "parse_error", passed: false, detail: "Failed to parse policy check result" }]
-        }
+        const parsed = parseJsonObject<{
+          policyResults?: Array<{ rule: string; passed: boolean; detail: string }>
+        }>(result.messageContent, {
+          policyResults: [{ rule: "parse_error", passed: false, detail: "Failed to parse policy check result" }],
+        })
+        const policyResults = parsed.policyResults || []
 
         // Update session
         await prisma.financeSession.update({
           where: { id: sessionId as string },
-          data: { policyResults },
+          data: {
+            policyResults,
+            status: policyResults.some((p) => !p.passed) ? "needs_review" : "approved",
+          },
         })
 
         // Create AgentRun
@@ -248,28 +369,27 @@ export async function POST(request: NextRequest) {
         const userMessage = `PO Data:\n${JSON.stringify(poData)}\n\nGRN Data:\n${JSON.stringify(grnData)}\n\nInvoice Data:\n${JSON.stringify(invData)}`
 
         const result = await callAI({
+          systemPrompt: THREE_WAY_MATCH_PROMPT,
           temperature: 0.2,
           maxTokens: 3000,
           responseFormat: "json",
-          messages: [
-            { role: "system", content: THREE_WAY_MATCH_PROMPT },
-            { role: "user", content: userMessage },
-          ],
+          messages: [{ role: "user", content: userMessage }],
         })
 
-        let matchResult: Record<string, unknown> = {}
-        try {
-          const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
-          matchResult = JSON.parse(cleaned)
-        } catch {
-          matchResult = { error: "Failed to parse matching result" }
-        }
+        const matchResult = parseJsonObject<Record<string, unknown>>(result.messageContent, {
+          error: "Failed to parse matching result",
+        })
 
         // Update session
         await prisma.financeSession.update({
           where: { id: sessionId as string },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          data: { extractedRows: matchResult as any },
+          data: {
+            extractedRows: matchResult as any,
+            status: Array.isArray(matchResult.flags) && matchResult.flags.length > 0
+              ? "needs_review"
+              : "matched",
+          },
         })
 
         // Create AgentRun

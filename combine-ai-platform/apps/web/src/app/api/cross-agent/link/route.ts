@@ -3,9 +3,9 @@ import { NextResponse } from "next/server"
 export const dynamic = "force-dynamic"
 
 interface CrossAgentLinkBody {
-  sourceType: "email" | "report" | "tender"
+  sourceType: "email" | "report" | "tender" | "finance"
   sourceId: string
-  targetType: "email" | "report" | "tender"
+  targetType: "email" | "report" | "tender" | "finance"
   targetId: string
   linkType: "attachment" | "reference" | "export"
   metadata?: Record<string, unknown>
