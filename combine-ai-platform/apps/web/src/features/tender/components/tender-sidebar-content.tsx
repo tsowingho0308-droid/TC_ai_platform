@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from "react"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@combine-ai/shared-ui"
-import { Plus, Trash2, FileText, GitCompare } from "lucide-react"
+import { Plus, Trash2, FileText } from "lucide-react"
 
 interface TenderSession {
   id: string
@@ -209,18 +209,6 @@ export function TenderSidebarContent() {
         )}
       </div>
 
-      {/* Compare Mode */}
-      {sessions.length >= 2 && (
-        <div className="mt-4 border-t pt-3">
-          <Link
-            href="/tender/compare"
-            className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
-          >
-            <GitCompare className="h-4 w-4" />
-            Compare Tenders ({sessions.length})
-          </Link>
-        </div>
-      )}
     </div>
   )
 }
