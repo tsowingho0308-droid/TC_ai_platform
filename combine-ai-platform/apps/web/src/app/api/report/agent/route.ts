@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
 import { mockReportExtraction } from "@/lib/server/mock-extraction"
-import { extractTextFromDocument } from "@/lib/server/document-text"
+import { extractTextFromDocument, validateDocumentText } from "@/lib/server/document-text"
 import { searchKnowledgeChunks, type KnowledgeSearchResult } from "@/lib/server/knowledge-search"
 import { extractKbHighlightPhrases } from "@/lib/server/kb-highlight-phrases"
 import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
@@ -216,7 +216,8 @@ async function extractDocumentTextFromBase64(
   try {
     const text = await extractTextFromDocument(buffer, fileName, mimeType)
     return text || undefined
-  } catch {
+  } catch (err) {
+    console.error("Document text extraction failed:", fileName, err)
     return undefined
   }
 }
@@ -426,7 +427,8 @@ async function handleStreamMultipartExtract(
         file.name,
         mimeType
       )
-    } catch {
+    } catch (err) {
+      console.error("Stream multipart document extraction failed:", file.name, err)
       documentText = undefined
     }
 
@@ -728,6 +730,19 @@ async function handleStreamExtract(
             fileBase64 as string,
             (fileName as string) || "upload"
           )
+        }
+
+        const isImageUpload = Boolean(fileBase64?.startsWith("data:image/"))
+        if (!isImageUpload) {
+          const validationError = validateDocumentText(resolvedDocumentText)
+          if (validationError) {
+            send("error", {
+              error: "Text extraction failed",
+              detail: validationError,
+              code: "TEXT_EXTRACTION_FAILED",
+            })
+            return
+          }
         }
 
         // Start KB search in parallel with extraction (overlaps embedding latency)

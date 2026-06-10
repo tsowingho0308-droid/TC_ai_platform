@@ -19,6 +19,7 @@
     "db:seed:test-workflow": "npx tsx prisma/seed-test-workflow.ts",
     "db:studio": "npm run -w @combine-ai/database prisma:studio",
     "db:migrate:vector": "npx tsx scripts/run-vector-migration.ts",
+    "test:pdf-extract": "node scripts/test-pdf-extract.mjs",
     "clean": "rimraf apps/web/.next packages/*/dist node_modules"
   },
   "overrides": {

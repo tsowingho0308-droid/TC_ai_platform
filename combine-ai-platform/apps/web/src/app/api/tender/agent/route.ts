@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
-import { extractTextFromDocument } from "@/lib/server/document-text"
+import { extractTextFromDocument, validateDocumentText } from "@/lib/server/document-text"
 import { mockTenderResult, mockTenderCompare } from "@/lib/server/mock-extraction"
 import type { Prisma } from "@prisma/client"
 import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
@@ -9,11 +9,7 @@ import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
 export const dynamic = "force-dynamic"
 export const maxDuration = 120
 
-const MIN_DOCUMENT_TEXT_LENGTH = 50
 const DOCUMENT_TEXT_LIMIT = 20000
-
-const TEXT_EXTRACTION_ERROR =
-  "Could not extract readable text from document. Try a text-based PDF or DOCX."
 
 type ExtractedTender = {
   tenderTitle?: string
@@ -22,13 +18,6 @@ type ExtractedTender = {
   keyRequirements?: string[]
   deadlines?: Array<{ label: string; date: string | null }>
   confidence?: number
-}
-
-function validateDocumentText(documentText?: string): string | null {
-  if ((documentText || "").trim().length < MIN_DOCUMENT_TEXT_LENGTH) {
-    return TEXT_EXTRACTION_ERROR
-  }
-  return null
 }
 
 function normalizeExtractedFields(extracted: ExtractedTender): Array<{ field: string; value: string }> {
@@ -348,7 +337,8 @@ async function extractTextFromUploadedFile(file: File): Promise<string | undefin
   const mimeType = file.type || "application/octet-stream"
   try {
     return await extractTextFromDocument(Buffer.from(arrayBuffer), file.name, mimeType)
-  } catch {
+  } catch (err) {
+    console.error("Tender document extraction failed:", file.name, err)
     return undefined
   }
 }
