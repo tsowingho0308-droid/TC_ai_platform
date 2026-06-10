@@ -1,8 +1,5 @@
-import { existsSync } from "node:fs"
-import { join } from "node:path"
-import { pathToFileURL } from "node:url"
-import mammoth from "mammoth"
 import { PDFParse } from "pdf-parse"
+import mammoth from "mammoth"
 
 const SUPPORTED_MIME_TYPES = new Set([
   "application/pdf",
@@ -10,30 +7,6 @@ const SUPPORTED_MIME_TYPES = new Set([
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   "application/msword",
 ])
-
-let pdfWorkerReady = false
-
-function resolvePdfWorkerUrl() {
-  const candidates = [
-    join(process.cwd(), "node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs"),
-    join(process.cwd(), "../../node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs"),
-    join(process.cwd(), "../../../node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs"),
-  ]
-
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      return pathToFileURL(candidate).href
-    }
-  }
-
-  throw new Error("pdf.worker.mjs not found — run npm install")
-}
-
-function ensurePdfWorker() {
-  if (pdfWorkerReady) return
-  PDFParse.setWorker(resolvePdfWorkerUrl())
-  pdfWorkerReady = true
-}
 
 export function isSupportedDocumentMimeType(mimeType: string, fileName: string) {
   const normalized = mimeType.toLowerCase()
@@ -47,8 +20,7 @@ export async function extractTextFromDocument(buffer: Buffer, fileName: string, 
   const normalizedMime = mimeType.toLowerCase()
 
   if (normalizedMime.includes("pdf") || lowerName.endsWith(".pdf")) {
-    ensurePdfWorker()
-    const parser = new PDFParse({ data: buffer })
+    const parser = new PDFParse(new Uint8Array(buffer))
     try {
       const result = await parser.getText()
       return (result.text || "").trim()
