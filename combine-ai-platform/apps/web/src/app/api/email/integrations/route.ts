@@ -7,6 +7,14 @@ import {
   buildAttachmentStoragePath,
   saveAttachmentFile,
 } from "@/lib/server/email-attachment-store"
+import {
+  assertGmailScopesGranted,
+  exchangeGoogleCode,
+  fetchGoogleUserInfo,
+  getGmailOAuthScopeString,
+  upsertGmailIntegration,
+  type GoogleTokenResponse,
+} from "@/lib/server/google-oauth"
 
 export const dynamic = "force-dynamic"
 
@@ -15,15 +23,6 @@ type OAuthStatePayload = {
   inboxId: string
   actorId: string
   issuedAt: number
-}
-
-type GoogleTokenResponse = {
-  access_token?: string
-  refresh_token?: string
-  expires_in?: number
-  scope?: string
-  error?: string
-  error_description?: string
 }
 
 type GmailListMessagesResponse = {
@@ -100,14 +99,6 @@ function decodeState(raw: string): OAuthStatePayload {
     throw new Error("OAuth link expired — click Connect again")
   }
   return payload
-}
-
-function getGoogleScopes() {
-  return [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/userinfo.email",
-  ].join(" ")
 }
 
 function parseSender(value: string) {
@@ -462,54 +453,20 @@ export async function GET(request: NextRequest) {
 
       try {
         const state = decodeState(stateRaw)
-        const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            code,
-            client_id: process.env.GOOGLE_CLIENT_ID || "",
-            client_secret: process.env.GOOGLE_CLIENT_SECRET || "",
-            redirect_uri: process.env.GOOGLE_OAUTH_REDIRECT_URI || "",
-            grant_type: "authorization_code",
-          }),
-        })
-        const tokens = (await tokenResponse.json()) as GoogleTokenResponse
-        if (!tokenResponse.ok || !tokens.access_token) {
-          throw new Error(tokens.error_description || tokens.error || "Failed to exchange code")
-        }
+        const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI || ""
+        const tokens = await exchangeGoogleCode(code, redirectUri)
+        assertGmailScopesGranted(tokens.scope)
 
-        const grantedScopes = (tokens.scope || "").split(" ").filter(Boolean)
-        const hasGmailScope = grantedScopes.some((scope) => scope.includes("gmail"))
-        if (!hasGmailScope) {
-          throw new Error("Gmail permissions not granted — reconnect and allow all permissions")
-        }
+        const userInfo = await fetchGoogleUserInfo(tokens.access_token!)
 
-        const userInfo = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-          headers: { Authorization: `Bearer ${tokens.access_token}` },
-        }).then(async (r) => (r.ok ? (await r.json() as { email?: string }) : null))
-
-        await prisma.mailIntegration.upsert({
-          where: { inboxId_provider: { inboxId: state.inboxId, provider: "GMAIL" } },
-          update: {
-            status: "CONNECTED",
-            accessToken: tokens.access_token,
-            refreshToken: tokens.refresh_token || undefined,
-            scopes: (tokens.scope || "").split(" ").filter(Boolean),
-            tokenExpiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null,
-            externalEmail: userInfo?.email || null,
-            lastSyncError: null,
-          },
-          create: {
-            workspaceId: state.workspaceId,
-            inboxId: state.inboxId,
-            provider: "GMAIL",
-            status: "CONNECTED",
-            accessToken: tokens.access_token,
-            refreshToken: tokens.refresh_token || null,
-            scopes: (tokens.scope || "").split(" ").filter(Boolean),
-            tokenExpiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null,
-            externalEmail: userInfo?.email || null,
-          },
+        await upsertGmailIntegration({
+          workspaceId: state.workspaceId,
+          inboxId: state.inboxId,
+          accessToken: tokens.access_token!,
+          refreshToken: tokens.refresh_token,
+          scopes: (tokens.scope || "").split(" ").filter(Boolean),
+          tokenExpiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null,
+          externalEmail: userInfo.email,
         })
 
         return NextResponse.redirect(new URL(`${frontendRedirect}?gmail=connected`, request.url))
@@ -571,7 +528,7 @@ export async function GET(request: NextRequest) {
         client_id: clientId,
         redirect_uri: redirectUri,
         response_type: "code",
-        scope: getGoogleScopes(),
+        scope: getGmailOAuthScopeString(),
         access_type: "offline",
         prompt: "consent",
         state: encodeState({

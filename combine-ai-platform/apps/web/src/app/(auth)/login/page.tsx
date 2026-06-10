@@ -1,7 +1,13 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Button } from "@combine-ai/shared-ui"
+
+const LOGIN_ERROR_MESSAGES: Record<string, string> = {
+  no_code: "Google sign-in was cancelled or incomplete.",
+  access_denied: "Google sign-in was denied. Make sure your Gmail is added as a Test user in Google Cloud Console.",
+  auth_failed: "Google sign-in failed. Please try again.",
+}
 
 export default function LoginPage() {
   const [mode, setMode] = useState<"login" | "signup">("login")
@@ -11,6 +17,13 @@ export default function LoginPage() {
   const [workspaceName, setWorkspaceName] = useState("")
   const [error, setError] = useState("")
   const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const urlError = params.get("error")
+    if (!urlError) return
+    setError(LOGIN_ERROR_MESSAGES[urlError] || decodeURIComponent(urlError))
+  }, [])
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -49,13 +62,18 @@ export default function LoginPage() {
   }
 
   async function handleGoogleLogin() {
+    setError("")
     setLoading(true)
     try {
       const res = await fetch("/api/auth/google/start")
-      const { url } = await res.json()
-      if (url) window.location.href = url
-    } catch {
-      setError("Failed to initiate Google login")
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to initiate Google login")
+      }
+      if (data.url) window.location.href = data.url
+      else throw new Error("Google login URL missing")
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to initiate Google login")
       setLoading(false)
     }
   }
