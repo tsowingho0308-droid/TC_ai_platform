@@ -132,8 +132,8 @@ export async function generateEmbedding(text: string): Promise<number[]> {
  */
 export function chunkText(
   text: string,
-  maxChars: number = 2000,
-  overlapChars: number = 400
+  maxChars: number = 800,
+  overlapChars: number = 100
 ): string[] {
   const paragraphs = text.split(/\n\s*\n/).filter(Boolean)
   const chunks: string[] = []

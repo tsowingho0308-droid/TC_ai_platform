@@ -223,7 +223,7 @@ async function executeToolCall(
           workspaceId: session.workspaceId,
           department: args.department as string | undefined,
           topK: 5,
-          minSimilarity: 0.7,
+          minSimilarity: 0.6,
         }
       )
 
@@ -796,17 +796,41 @@ export async function POST(request: NextRequest) {
         const userQuestion =
           typeof lastUserMsg?.content === "string" ? lastUserMsg.content : ""
 
-        const { articles } = userQuestion
+        const searchResult = userQuestion
           ? await searchKnowledgeBase(userQuestion, {
               workspaceId: session.workspaceId,
               department: department as string | undefined,
               topK: 5,
-              minSimilarity: 0.7,
+              minSimilarity: 0.6,
             })
-          : { articles: [] as SearchResult[] }
+          : { articles: [] as SearchResult[], suggestions: [] as SearchResult[], maxScore: 0, tier: "none" as const, searchMethod: "none" as const }
 
-        const sourcesText = formatSourcesText(articles)
-        const departmentCoverage = [...new Set(articles.map((a) => a.department))]
+        const { articles, suggestions, tier: searchTier, maxScore } = searchResult
+
+        // Build sources text — include suggestions when in suggestions tier
+        let sourcesText: string
+        if (searchTier === "suggestions" && suggestions.length > 0) {
+          const sugTitles = suggestions.map((s) => `"${s.title}" (${s.department}, ${Math.round((s.similarity ?? 0) * 100)}% match)`).join(", ")
+          sourcesText = `⚠️ SUGGESTIONS FALLBACK — No strong matches found (best score: ${Math.round(maxScore * 100)}%).
+
+The following documents are PARTIALLY relevant but below the confidence threshold:
+${suggestions.map((s, i) => `[Suggestion ${i + 1}] Title: ${s.title}\nDepartment: ${s.department}\nContent: ${s.content.slice(0, 1000)}\nRelevance: ${Math.round((s.similarity ?? 0) * 100)}%\n`).join("\n")}
+
+INSTRUCTIONS: You MUST respond in this format:
+"找不到與您提問完全相符的內容 😢，或許您是指以下相關規定？
+
+- **${suggestions[0]?.title || "[文件標題]"}**（${suggestions[0]?.department || ""}）
+${suggestions.length > 1 ? `- **${suggestions[1]?.title || "[文件標題]"}**（${suggestions[1]?.department || ""}）` : ""}
+
+請問您想查詢以上哪一份文件的詳細內容？如果都不是您要找的，我可以為您建立工單轉交相關部門跟進。"
+
+Do NOT call search_knowledge_base. Do NOT create a ticket unless the user confirms.
+Respond in the SAME LANGUAGE as the user.`
+        } else {
+          sourcesText = formatSourcesText(articles)
+        }
+
+        const departmentCoverage = [...new Set([...articles, ...suggestions].map((a) => a.department))]
         const deptContext =
           departmentCoverage.length > 0
             ? `\n\n## Search Context\nDepartments with matching results: ${departmentCoverage.join(", ")}\nUser's selected department: ${department || "GENERAL"}`
@@ -1004,14 +1028,31 @@ export async function POST(request: NextRequest) {
                   ? lastUserMsg.content
                   : ""
 
-              const { articles } = userQuestion
+              const searchResult = userQuestion
                 ? await searchKnowledgeBase(userQuestion, {
                     workspaceId: session.workspaceId,
                     department: streamDept as string | undefined,
                     topK: 5,
-                    minSimilarity: 0.7,
+                    minSimilarity: 0.6,
                   })
-                : { articles: [] as SearchResult[] }
+                : { articles: [] as SearchResult[], suggestions: [] as SearchResult[], maxScore: 0, tier: "none" as const, searchMethod: "none" as const }
+
+              const { articles, suggestions, tier: searchTier, maxScore } = searchResult
+
+              // Build sources text with suggestions fallback
+              let sourcesText: string
+              if (searchTier === "suggestions" && suggestions.length > 0) {
+                const sugTitles = suggestions.map((s) => `"${s.title}"`).join(", ")
+                sourcesText = `⚠️ SUGGESTIONS FALLBACK — No strong matches (best: ${Math.round(maxScore * 100)}%).
+
+Suggestions: ${sugTitles}
+
+INSTRUCTIONS: Respond with "找不到與您提問完全相符的內容 😢，或許您是指以下相關規定？" and list the suggestion titles. Do NOT call search_knowledge_base. Ask user to confirm before creating ticket.
+
+${suggestions.map((s) => `[Suggestion] ${s.title} (${s.department}, ${Math.round((s.similarity ?? 0) * 100)}%)\n${s.content.slice(0, 500)}`).join("\n\n")}`
+              } else {
+                sourcesText = formatSourcesText(articles)
+              }
 
               sendSSE("trace", {
                 trace: {
@@ -1019,13 +1060,14 @@ export async function POST(request: NextRequest) {
                   at: new Date().toISOString(),
                   stage: "search",
                   status: "complete",
-                  title: `Found ${articles.length} relevant article${articles.length !== 1 ? "s" : ""}`,
-                  detail: articles.map((a) => a.title).join(", ") || "None",
+                  title: searchTier === "suggestions"
+                    ? `No strong matches — ${suggestions.length} suggestion${suggestions.length !== 1 ? "s" : ""} found`
+                    : `Found ${articles.length} relevant article${articles.length !== 1 ? "s" : ""}`,
+                  detail: [...articles, ...suggestions].map((a) => a.title).join(", ") || "None",
                 },
               })
 
-              const sourcesText = formatSourcesText(articles)
-              const deptCoverage = [...new Set(articles.map((a) => a.department))]
+              const deptCoverage = [...new Set([...articles, ...suggestions].map((a) => a.department))]
               const deptCtx =
                 deptCoverage.length > 0
                   ? `\n\n## Search Context\nDepartments with matching results: ${deptCoverage.join(", ")}\nUser's selected department: ${streamDept || "GENERAL"}`

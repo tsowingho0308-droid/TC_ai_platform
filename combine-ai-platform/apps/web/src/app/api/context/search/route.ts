@@ -58,7 +58,7 @@ export async function GET(request: NextRequest) {
         SELECT
           kc.id as chunk_id,
           kc.content,
-          kc.chunk_index as chunk_index,
+          kc."chunkIndex" as chunk_index,
           ka.id as article_id,
           ka.title as article_title,
           kb.id as knowledge_base_id,
@@ -67,9 +67,9 @@ export async function GET(request: NextRequest) {
           kb.department,
           1 - (kc.embedding <=> ${embedding}::vector) as similarity
         FROM "KnowledgeChunk" kc
-        JOIN "KnowledgeArticle" ka ON ka.id = kc.article_id
-        JOIN "KnowledgeBase" kb ON kb.id = ka.knowledge_base_id
-        WHERE kb.workspace_id = ${session.workspaceId}
+        JOIN "KnowledgeArticle" ka ON ka.id = kc."articleId"
+        JOIN "KnowledgeBase" kb ON kb.id = ka."knowledgeBaseId"
+        WHERE kb."workspaceId" = ${session.workspaceId}
           ${
             department && department !== "GENERAL"
               ? prisma.$queryRaw`AND kb.department = ${department}::text`
@@ -107,6 +107,7 @@ export async function GET(request: NextRequest) {
           OR: [
             { title: { contains: q, mode: "insensitive" } },
             { content: { contains: q, mode: "insensitive" } },
+            { tags: { hasSome: [q] } },
           ],
         },
         include: {

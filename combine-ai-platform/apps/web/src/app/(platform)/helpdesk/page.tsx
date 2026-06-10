@@ -375,7 +375,11 @@ export default function HelpdeskPage() {
                     </details>
                   )}
 
-                  <MarkdownContent>{turn.content}</MarkdownContent>
+                  <MarkdownContent
+                    className={turn.role === "user" ? "text-primary-foreground [&_*]:!text-primary-foreground [&_code]:!bg-white/20" : ""}
+                  >
+                    {turn.content}
+                  </MarkdownContent>
 
                   {/* Sources */}
                   {turn.sources && turn.sources.length > 0 && (
