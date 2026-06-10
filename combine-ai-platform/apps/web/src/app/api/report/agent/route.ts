@@ -2,6 +2,9 @@ import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
 import { mockReportExtraction } from "@/lib/server/mock-extraction"
+import { extractTextFromDocument } from "@/lib/server/document-text"
+import { searchKnowledgeChunks, type KnowledgeSearchResult } from "@/lib/server/knowledge-search"
+import { extractKbHighlightPhrases } from "@/lib/server/kb-highlight-phrases"
 import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
 export const dynamic = "force-dynamic"
@@ -44,13 +47,15 @@ Rules:
 7. For tables, extract column headers as field prefixes and row data accordingly.
 8. Preserve exact values — do not modify, summarize, or translate.
 9. Flag any unclear or ambiguous text with "⚠️" prefix.
+10. When possible, identify the page number (1-based) where each field appears in the document and include it as the "page" field in the row.
+11. For PDF highlighting: "value" must match the document text EXACTLY (same punctuation, currency symbols, spacing). For amounts, dates, titles, and reference numbers, "page" is REQUIRED.
 
 Respond ONLY with valid JSON:
 {
   "documentType": "report|invoice|receipt|contract|letter|form|other",
   "title": "extracted document title or subject",
   "rows": [
-    { "field": "standardized_label", "value": "exact_value" }
+    { "field": "standardized_label", "value": "exact_value", "page": 1 }
   ],
   "metadata": {
     "date": "YYYY-MM-DD or null",
@@ -100,6 +105,7 @@ const EXTRACTION_TOOL = {
             properties: {
               field: { type: "string", description: "Standardized field label" },
               value: { type: "string", description: "Exact value from the document" },
+              page: { type: "number", description: "Page number (1-based) where this value appears in the document. Provide this when the document has multiple pages and you can determine the page." },
             },
             required: ["field", "value"],
           },
@@ -115,8 +121,229 @@ const EXTRACTION_TOOL = {
 
 // ── SSE Helpers ────────────────────────────────────────────────
 
+const REPORT_SUMMARY_PROMPT = `你是香港企業的報告分析助手。根據上傳的報告內容與知識庫參考資料，產出精簡繁體中文摘要。
+
+要求：
+1. summary：2-4 句精簡總述報告核心內容
+2. keyPoints：3-6 條要點，優先標出與知識庫政策/標準/流程的關聯、差異或需注意事項
+3. kbReferences：列出實際用到的知識庫條文（articleTitle、knowledgeBaseName、relevance 說明關聯原因）
+4. 若知識庫無相關內容，keyPoints 仍給報告要點，並在 summary 中說明未找到相關知識庫條文
+
+僅回傳有效 JSON：
+{
+  "summary": "string",
+  "keyPoints": ["string"],
+  "kbReferences": [{ "articleTitle": "string", "knowledgeBaseName": "string", "relevance": "string" }]
+}`
+
 function sseEvent(event: string, data: Record<string, unknown>): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+}
+
+type ExtractRow = { field: string; value: string; page?: number }
+
+function highlightRowScore(row: ExtractRow): number {
+  let score = 0
+  if (row.page && row.page >= 1) score += 100
+  const v = row.value?.trim() || ""
+  if (v.length >= 2 && v.length <= 80) score += 20
+  if (/\d/.test(v)) score += 10
+  if (/[$¥€£]|HKD|USD|CNY/i.test(v)) score += 15
+  if (/\d{4}[-/]\d{1,2}/.test(v)) score += 10
+  score -= Math.min(v.length, 100)
+  return score
+}
+
+const HIGHLIGHT_SOFT_CAP = 60
+
+function selectHighlightRows(rows: ExtractRow[], limit = HIGHLIGHT_SOFT_CAP): ExtractRow[] {
+  const filtered = [...rows].filter((r) => {
+    const v = r.value?.trim() || ""
+    return v.length >= 2 && v.length <= 80
+  })
+  if (filtered.length <= limit) return filtered
+  return filtered
+    .sort((a, b) => highlightRowScore(b) - highlightRowScore(a))
+    .slice(0, limit)
+}
+
+async function saveStreamExtraction(
+  session: { workspaceId: string },
+  sessionId: string,
+  fileName: string | undefined,
+  rows: ExtractRow[],
+  extracted: Record<string, unknown>
+) {
+  try {
+    const existing = await prisma.reportSession.findFirst({
+      where: { id: sessionId, workspaceId: session.workspaceId },
+    })
+    if (existing) {
+      await prisma.reportSession.update({
+        where: { id: sessionId },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        data: { rows: rows as any, status: "active" },
+      })
+      await prisma.reportConversationTurn.createMany({
+        data: [
+          {
+            sessionId,
+            role: "user",
+            content: `Uploaded: ${fileName || "document"}`,
+          },
+          {
+            sessionId,
+            role: "assistant",
+            content: `Extracted ${rows.length} fields`,
+            assistantReply: JSON.stringify(extracted),
+          },
+        ],
+      })
+    }
+  } catch (dbErr) {
+    console.error("Failed to save stream extraction:", dbErr)
+  }
+}
+
+async function extractDocumentTextFromBase64(
+  fileBase64: string,
+  fileName: string
+): Promise<string | undefined> {
+  const match = fileBase64.match(/^data:([^;]+);base64,([\s\S]+)$/)
+  if (!match) return undefined
+  const mimeType = match[1]
+  const buffer = Buffer.from(match[2], "base64")
+  try {
+    const text = await extractTextFromDocument(buffer, fileName, mimeType)
+    return text || undefined
+  } catch {
+    return undefined
+  }
+}
+
+interface ReportSummaryResult {
+  summary: string
+  keyPoints: string[]
+  kbReferences: Array<{
+    articleTitle: string
+    knowledgeBaseName: string
+    relevance: string
+  }>
+  searchType: "semantic" | "keyword" | "none"
+}
+
+async function performReportSummary(
+  session: { workspaceId: string },
+  params: {
+    documentText?: string
+    fileName?: string
+    documentType?: string
+    title?: string
+    rows?: Array<{ field: string; value: string }>
+    kbSearchResult?: KnowledgeSearchResult
+  }
+): Promise<ReportSummaryResult> {
+  const { documentText, fileName, documentType, title, rows, kbSearchResult } = params
+
+  let reportContent = documentText?.trim() || ""
+  if (!reportContent && rows && rows.length > 0) {
+    reportContent = rows.map((r) => `${r.field}: ${r.value}`).join("\n")
+  }
+
+  if (!reportContent) {
+    return {
+      summary: "無法取得報告內容以產生摘要。",
+      keyPoints: [],
+      kbReferences: [],
+      searchType: "none",
+    }
+  }
+
+  let chunks = kbSearchResult?.chunks ?? []
+  let searchType = kbSearchResult?.searchType ?? "keyword"
+
+  if (!kbSearchResult) {
+    const searchQuery = [title, documentType, reportContent.slice(0, 1500)]
+      .filter(Boolean)
+      .join("\n")
+
+    const result = await searchKnowledgeChunks(session.workspaceId, searchQuery, { limit: 5 })
+    chunks = result.chunks
+    searchType = result.searchType
+  }
+
+  const kbContext =
+    chunks.length > 0
+      ? chunks
+          .map(
+            (c, i) =>
+              `[${i + 1}] ${c.articleTitle} (${c.knowledgeBaseName})\n${c.excerpt}`
+          )
+          .join("\n\n")
+      : "（知識庫中未找到相關條文）"
+
+  const userPrompt = [
+    fileName ? `檔案：${fileName}` : "",
+    documentType ? `類型：${documentType}` : "",
+    title ? `標題：${title}` : "",
+    "",
+    "── 報告內容 ──",
+    reportContent.slice(0, 4000),
+    "",
+    "── 知識庫參考 ──",
+    kbContext,
+  ]
+    .filter((line, i, arr) => line !== "" || (i > 0 && arr[i - 1] !== ""))
+    .join("\n")
+
+  try {
+    const result = await callAI({
+      model: "qwen-flash",
+      temperature: 0.3,
+      maxTokens: 1200,
+      responseFormat: "json",
+      messages: [
+        { role: "system", content: REPORT_SUMMARY_PROMPT },
+        { role: "user", content: userPrompt },
+      ],
+    })
+
+    let parsed: {
+      summary?: string
+      keyPoints?: string[]
+      kbReferences?: Array<{
+        articleTitle: string
+        knowledgeBaseName: string
+        relevance: string
+      }>
+    } = {}
+
+    try {
+      const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
+      parsed = JSON.parse(cleaned)
+    } catch {
+      parsed = { summary: result.messageContent, keyPoints: [], kbReferences: [] }
+    }
+
+    return {
+      summary: parsed.summary || result.messageContent,
+      keyPoints: Array.isArray(parsed.keyPoints) ? parsed.keyPoints : [],
+      kbReferences: Array.isArray(parsed.kbReferences) ? parsed.kbReferences : [],
+      searchType: chunks.length > 0 ? searchType : "none",
+    }
+  } catch (err) {
+    console.warn("Report summary AI unavailable:", (err as Error).message)
+    return {
+      summary: reportContent.slice(0, 300) + (reportContent.length > 300 ? "…" : ""),
+      keyPoints: rows?.slice(0, 5).map((r) => `${r.field}: ${r.value}`) || [],
+      kbReferences: chunks.slice(0, 3).map((c) => ({
+        articleTitle: c.articleTitle,
+        knowledgeBaseName: c.knowledgeBaseName,
+        relevance: c.excerpt.slice(0, 120),
+      })),
+      searchType: chunks.length > 0 ? searchType : "none",
+    }
+  }
 }
 
 // ── POST Handler ──────────────────────────────────────────────
@@ -131,9 +358,11 @@ export async function POST(request: NextRequest) {
     const stream = url.searchParams.get("stream") === "1"
     const contentType = request.headers.get("content-type") || ""
 
-    // ── Multipart file upload (non-streaming) ──
+    // ── Multipart file upload ──
     if (contentType.includes("multipart/form-data")) {
-      return handleMultipartExtract(request, session)
+      return stream
+        ? handleStreamMultipartExtract(request, session)
+        : handleMultipartExtract(request, session)
     }
 
     const body = (await request.json()) as Record<string, unknown>
@@ -149,6 +378,9 @@ export async function POST(request: NextRequest) {
 
       case "summarize":
         return handleSummarize(session, body)
+
+      case "generateReport":
+        return handleGenerateReport(session, body)
 
       default:
         return NextResponse.json({ error: `Unknown action: ${action}` }, { status: 400 })
@@ -166,6 +398,57 @@ export async function POST(request: NextRequest) {
 }
 
 // ── Multipart Upload Extraction ───────────────────────────────
+
+async function handleStreamMultipartExtract(
+  request: NextRequest,
+  session: { sub: string; workspaceId: string }
+) {
+  try {
+    const formData = await request.formData()
+    const file = formData.get("file") as File | null
+    const sessionId = formData.get("sessionId") as string | null
+    const instructions = formData.get("instructions") as string | null
+    const model = formData.get("model") as string | null
+
+    if (!file) {
+      return NextResponse.json({ error: "file is required" }, { status: 400 })
+    }
+
+    const arrayBuffer = await file.arrayBuffer()
+    const base64 = Buffer.from(arrayBuffer).toString("base64")
+    const mimeType = file.type || "application/octet-stream"
+    const dataUrl = `data:${mimeType};base64,${base64}`
+
+    let documentText: string | undefined
+    try {
+      documentText = await extractTextFromDocument(
+        Buffer.from(arrayBuffer),
+        file.name,
+        mimeType
+      )
+    } catch {
+      documentText = undefined
+    }
+
+    return handleStreamExtract(session, {
+      fileBase64: dataUrl,
+      fileName: file.name,
+      sessionId: sessionId || undefined,
+      instructions: instructions || undefined,
+      documentText,
+      model: model || undefined,
+    })
+  } catch (error) {
+    console.error("Stream multipart extraction error:", error)
+    return NextResponse.json(
+      {
+        error: "File processing failed",
+        detail: error instanceof Error ? error.message : "Unknown error",
+      },
+      { status: 500 }
+    )
+  }
+}
 
 async function handleMultipartExtract(request: NextRequest, session: { sub: string; workspaceId: string }) {
   try {
@@ -427,11 +710,38 @@ async function handleStreamExtract(
 
   const stream = new ReadableStream({
     async start(controller) {
+      let streamClosed = false
       const send = (event: string, data: Record<string, unknown>) => {
-        controller.enqueue(encoder.encode(sseEvent(event, data)))
+        if (streamClosed) return
+        try {
+          controller.enqueue(encoder.encode(sseEvent(event, data)))
+        } catch {
+          streamClosed = true
+        }
       }
 
       try {
+        // Parse document text early (needed for PDF/DOCX extraction + summary)
+        let resolvedDocumentText = documentText as string | undefined
+        if (!resolvedDocumentText && fileBase64) {
+          resolvedDocumentText = await extractDocumentTextFromBase64(
+            fileBase64 as string,
+            (fileName as string) || "upload"
+          )
+        }
+
+        // Start KB search in parallel with extraction (overlaps embedding latency)
+        const kbSearchQuery = [
+          fileName,
+          resolvedDocumentText?.slice(0, 1500),
+        ]
+          .filter(Boolean)
+          .join("\n")
+
+        const kbSearchPromise: Promise<KnowledgeSearchResult> = kbSearchQuery
+          ? searchKnowledgeChunks(session.workspaceId, kbSearchQuery, { limit: 5 })
+          : Promise.resolve({ chunks: [], searchType: "keyword" })
+
         // Step 1: Sending to AI
         send("trace", {
           trace: {
@@ -458,21 +768,35 @@ async function handleStreamExtract(
           if (isImage) {
             userContent.push({
               type: "image_url",
-              image_url: { url: fileBase64, detail: "high" },
+              image_url: { url: fileBase64 as string, detail: "high" },
+            })
+            userContent.push({
+              type: "text",
+              text: instructions
+                ? `Extract all data. File: ${fileName || "upload"}. Instructions: ${instructions}`
+                : `Extract all data. File: ${fileName || "upload"}`,
+            })
+          } else if (resolvedDocumentText) {
+            userContent.push({
+              type: "text",
+              text: instructions
+                ? `Extract all data from this document (${fileName || "upload"}):\n\n${resolvedDocumentText.slice(0, 8000)}\n\nInstructions: ${instructions}`
+                : `Extract all data from this document (${fileName || "upload"}):\n\n${resolvedDocumentText.slice(0, 8000)}`,
+            })
+          } else {
+            userContent.push({
+              type: "text",
+              text: instructions
+                ? `Extract all data. File: ${fileName || "upload"}. Instructions: ${instructions}`
+                : `Extract all data. File: ${fileName || "upload"}`,
             })
           }
+        } else if (resolvedDocumentText) {
           userContent.push({
             type: "text",
             text: instructions
-              ? `Extract all data. File: ${fileName || "upload"}. Instructions: ${instructions}`
-              : `Extract all data. File: ${fileName || "upload"}`,
-          })
-        } else if (documentText) {
-          userContent.push({
-            type: "text",
-            text: instructions
-              ? `Extract all data:\n\n${(documentText as string).slice(0, 4000)}\n\nInstructions: ${instructions}`
-              : `Extract all data:\n\n${(documentText as string).slice(0, 4000)}`,
+              ? `Extract all data:\n\n${resolvedDocumentText.slice(0, 8000)}\n\nInstructions: ${instructions}`
+              : `Extract all data:\n\n${resolvedDocumentText.slice(0, 8000)}`,
           })
         }
 
@@ -533,7 +857,8 @@ async function handleStreamExtract(
           modelUsed = mock.model
         }
 
-        const rows = extracted.rows || []
+        const rows = (extracted.rows || []) as ExtractRow[]
+        const highlightRows = selectHighlightRows(rows)
 
         send("trace", {
           trace: {
@@ -546,43 +871,11 @@ async function handleStreamExtract(
           },
         })
 
-        // Save to DB
-        if (sessionId) {
-          try {
-            const existing = await prisma.reportSession.findFirst({
-              where: { id: sessionId, workspaceId: session.workspaceId },
-            })
-            if (existing) {
-              await prisma.reportSession.update({
-                where: { id: sessionId },
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                data: { rows: rows as any, status: "active" },
-              })
-              await prisma.reportConversationTurn.createMany({
-                data: [
-                  {
-                    sessionId,
-                    role: "user",
-                    content: `Uploaded: ${fileName || "document"}`,
-                  },
-                  {
-                    sessionId,
-                    role: "assistant",
-                    content: `Extracted ${rows.length} fields`,
-                    assistantReply: JSON.stringify(extracted),
-                  },
-                ],
-              })
-            }
-          } catch (dbErr) {
-            console.error("Failed to save stream extraction:", dbErr)
-          }
-        }
-
-        // Send final result
+        // Send extraction result immediately so PDF highlights can start
         send("result", {
           result: {
             rows,
+            highlightRows,
             documentType: extracted.documentType,
             title: extracted.title,
             metadata: extracted.metadata,
@@ -592,6 +885,61 @@ async function handleStreamExtract(
             appliedAt: new Date().toISOString(),
           },
         })
+
+        // Persist to DB without blocking summary / highlight
+        if (sessionId) {
+          void saveStreamExtraction(
+            session,
+            sessionId,
+            fileName as string | undefined,
+            rows,
+            extracted as Record<string, unknown>
+          )
+        }
+
+        // Step 2: KB-aware summary (KB search already in flight)
+        send("trace", {
+          trace: {
+            id: "report-summary-start",
+            at: new Date().toISOString(),
+            stage: "summary",
+            status: "running",
+            title: "Generating summary",
+            detail: "Using knowledge base context",
+          },
+        })
+
+        send("thinking", { text: "正在產生知識庫關聯要點摘要…" })
+
+        const kbSearchResult = await kbSearchPromise
+
+        const kbPhrases = extractKbHighlightPhrases(kbSearchResult.chunks)
+        send("kbHighlights", {
+          phrases: kbPhrases,
+          searchType: kbSearchResult.chunks.length > 0 ? kbSearchResult.searchType : "none",
+        })
+
+        const summaryResult = await performReportSummary(session, {
+          documentText: resolvedDocumentText,
+          fileName: fileName as string | undefined,
+          documentType: extracted.documentType,
+          title: extracted.title,
+          rows: rows as Array<{ field: string; value: string }>,
+          kbSearchResult,
+        })
+
+        send("trace", {
+          trace: {
+            id: "report-summary-done",
+            at: new Date().toISOString(),
+            stage: "summary",
+            status: "complete",
+            title: "Summary complete",
+            detail: `${summaryResult.keyPoints.length} key points`,
+          },
+        })
+
+        send("summary", { summary: summaryResult })
       } catch (error) {
         console.error("Stream extraction error:", error)
         send("error", {
@@ -685,28 +1033,241 @@ async function handleSummarize(
   session: { sub: string; workspaceId: string },
   body: Record<string, unknown>
 ) {
-  const { rows } = body
+  const { rows, documentText, fileName, documentType, title } = body
 
-  if (!rows || !Array.isArray(rows) || rows.length === 0) {
-    return NextResponse.json({ error: "rows array required" }, { status: 400 })
+  const hasRows = Array.isArray(rows) && rows.length > 0
+  const hasText = typeof documentText === "string" && documentText.trim().length > 0
+
+  if (!hasRows && !hasText) {
+    return NextResponse.json(
+      { error: "documentText or rows required" },
+      { status: 400 }
+    )
   }
 
-  const rowsText = (rows as Array<{ field: string; value: string }>)
-    .map((r) => `${r.field}: ${r.value}`)
-    .join("\n")
-
-  const result = await callAI({
-    temperature: 0.3,
-    maxTokens: 500,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a document summarizer. Summarize the following extracted fields into a 2-3 sentence executive summary. Be concise and highlight the most important information.",
-      },
-      { role: "user", content: rowsText },
-    ],
+  const summaryResult = await performReportSummary(session, {
+    documentText: documentText as string | undefined,
+    fileName: fileName as string | undefined,
+    documentType: documentType as string | undefined,
+    title: title as string | undefined,
+    rows: hasRows ? (rows as Array<{ field: string; value: string }>) : undefined,
   })
 
-  return NextResponse.json({ summary: result.messageContent })
+  return NextResponse.json(summaryResult)
+}
+
+// ── Generate Full Report ──────────────────────────────────────
+
+const REPORT_GENERATE_PROMPT = `你是香港企業的報告撰寫助手。根據文件內容、郵件背景（如有）與知識庫參考資料，撰寫完整繁體中文分析報告。
+
+要求：
+1. 以 Markdown 格式輸出，包含以下章節（標題使用 ##）：
+   - 報告概要
+   - 郵件／文件背景（若無郵件背景則改為「文件背景」）
+   - 重點發現（條列，引用抽取欄位中的具體數據）
+   - 知識庫政策對照與合規注意事項
+   - 建議行動
+   - 附錄：參考條文
+2. 知識庫條文須在正文中引用並說明關聯；附錄列出所有參考條文
+3. 語氣專業、條理清晰，每章節 2-6 段或條列
+4. 僅回傳 Markdown 正文，不要 JSON 包裝，不要 code fence`
+
+async function performReportGenerate(
+  session: { workspaceId: string },
+  params: {
+    documentText?: string
+    fileName?: string
+    documentType?: string
+    title?: string
+    rows?: Array<{ field: string; value: string }>
+    reportSummary?: ReportSummaryResult
+    emailContext?: { subject?: string; sender?: string; body?: string }
+  }
+): Promise<{ markdown: string; fileName: string }> {
+  const { documentText, fileName, documentType, title, rows, reportSummary, emailContext } = params
+
+  let reportContent = documentText?.trim() || ""
+  if (!reportContent && rows && rows.length > 0) {
+    reportContent = rows.map((r) => `${r.field}: ${r.value}`).join("\n")
+  }
+  if (!reportContent && reportSummary?.summary) {
+    reportContent = reportSummary.summary
+  }
+
+  const searchQuery = [
+    emailContext?.subject,
+    title,
+    documentType,
+    reportContent.slice(0, 2000),
+    reportSummary?.keyPoints?.join("\n"),
+  ]
+    .filter(Boolean)
+    .join("\n")
+
+  const kbResult = await searchKnowledgeChunks(session.workspaceId, searchQuery, { limit: 8 })
+  const chunks = kbResult.chunks
+
+  const kbContext =
+    chunks.length > 0
+      ? chunks
+          .map(
+            (c, i) =>
+              `[${i + 1}] ${c.articleTitle} (${c.knowledgeBaseName})\n${c.excerpt}`
+          )
+          .join("\n\n")
+      : "（知識庫中未找到相關條文）"
+
+  const extractedFields =
+    rows && rows.length > 0
+      ? rows.map((r) => `- ${r.field}: ${r.value}`).join("\n")
+      : "（無抽取欄位）"
+
+  const summaryBlock = reportSummary
+    ? [
+        "── 既有摘要 ──",
+        reportSummary.summary,
+        "",
+        reportSummary.keyPoints.length > 0
+          ? "要點：\n" + reportSummary.keyPoints.map((p) => `- ${p}`).join("\n")
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+    : ""
+
+  const emailBlock = emailContext
+    ? [
+        "── 郵件背景 ──",
+        `主旨：${emailContext.subject || "（未知）"}`,
+        `寄件人：${emailContext.sender || "（未知）"}`,
+        emailContext.body ? `內容：\n${emailContext.body.slice(0, 3000)}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+    : ""
+
+  const userPrompt = [
+    fileName ? `檔案：${fileName}` : "",
+    documentType ? `類型：${documentType}` : "",
+    title ? `標題：${title}` : "",
+    emailBlock,
+    summaryBlock,
+    "",
+    "── 抽取欄位 ──",
+    extractedFields,
+    "",
+    "── 報告內容 ──",
+    reportContent.slice(0, 6000),
+    "",
+    "── 知識庫參考 ──",
+    kbContext,
+  ]
+    .filter((line, i, arr) => line !== "" || (i > 0 && arr[i - 1] !== ""))
+    .join("\n")
+
+  const baseName = fileName || emailContext?.subject || "document"
+  const safeName = baseName.replace(/[^\w\u4e00-\u9fff.-]+/g, "_").slice(0, 60)
+
+  try {
+    const result = await callAI({
+      model: "qwen-flash",
+      temperature: 0.4,
+      maxTokens: 4000,
+      responseFormat: "text",
+      messages: [
+        { role: "system", content: REPORT_GENERATE_PROMPT },
+        { role: "user", content: userPrompt },
+      ],
+    })
+
+    let markdown = result.messageContent.trim()
+    markdown = markdown.replace(/^```(?:markdown|md)?\s*|\s*```$/g, "").trim()
+
+    const header = [
+      `# 分析報告 — ${baseName}`,
+      "",
+      `> 產生時間：${new Date().toLocaleString("zh-HK", { timeZone: "Asia/Hong_Kong" })}`,
+      emailContext?.sender ? `> 郵件來源：${emailContext.sender}` : "",
+      "",
+    ]
+      .filter(Boolean)
+      .join("\n")
+
+    return {
+      markdown: header + markdown,
+      fileName: `report-${safeName}-${Date.now()}.md`,
+    }
+  } catch (err) {
+    console.warn("Report generate AI unavailable:", (err as Error).message)
+
+    const fallbackSections = [
+      `# 分析報告 — ${baseName}`,
+      "",
+      `> 產生時間：${new Date().toLocaleString("zh-HK", { timeZone: "Asia/Hong_Kong" })}`,
+      "",
+      "## 報告概要",
+      reportSummary?.summary || reportContent.slice(0, 500) || "無法取得報告內容。",
+      "",
+      "## 郵件／文件背景",
+      emailContext
+        ? `主旨：${emailContext.subject || ""}\n寄件人：${emailContext.sender || ""}`
+        : fileName || "（無背景資訊）",
+      "",
+      "## 重點發現",
+      extractedFields,
+      "",
+      "## 知識庫政策對照與合規注意事項",
+      reportSummary?.keyPoints?.map((p) => `- ${p}`).join("\n") || "（AI 暫不可用）",
+      "",
+      "## 建議行動",
+      "- 請人工覆核上述重點與知識庫條文",
+      "",
+      "## 附錄：參考條文",
+      chunks.length > 0
+        ? chunks
+            .map((c) => `- **${c.articleTitle}** (${c.knowledgeBaseName})\n  ${c.excerpt.slice(0, 200)}`)
+            .join("\n")
+        : "（知識庫中未找到相關條文）",
+    ]
+
+    return {
+      markdown: fallbackSections.join("\n"),
+      fileName: `report-${safeName}-${Date.now()}.md`,
+    }
+  }
+}
+
+async function handleGenerateReport(
+  session: { sub: string; workspaceId: string },
+  body: Record<string, unknown>
+) {
+  const { rows, documentText, fileName, documentType, title, reportSummary, emailContext } = body
+
+  const hasRows = Array.isArray(rows) && rows.length > 0
+  const hasText = typeof documentText === "string" && documentText.trim().length > 0
+  const hasSummary =
+    reportSummary &&
+    typeof reportSummary === "object" &&
+    typeof (reportSummary as ReportSummaryResult).summary === "string"
+
+  if (!hasRows && !hasText && !hasSummary) {
+    return NextResponse.json(
+      { error: "documentText, rows, or reportSummary required" },
+      { status: 400 }
+    )
+  }
+
+  const result = await performReportGenerate(session, {
+    documentText: documentText as string | undefined,
+    fileName: fileName as string | undefined,
+    documentType: documentType as string | undefined,
+    title: title as string | undefined,
+    rows: hasRows ? (rows as Array<{ field: string; value: string }>) : undefined,
+    reportSummary: hasSummary ? (reportSummary as ReportSummaryResult) : undefined,
+    emailContext: emailContext as
+      | { subject?: string; sender?: string; body?: string }
+      | undefined,
+  })
+
+  return NextResponse.json(result)
 }
