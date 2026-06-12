@@ -1,7 +1,8 @@
 // Query Expansion for RAG — pre-processes user queries with an LLM
 // to generate cross-language variants for better retrieval recall.
 
-import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { getDashScopeProvider } from "@combine-ai/ai-provider/server"
 
 // ── Types ────────────────────────────────────────────────────────
 

@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
-import { generateEmbedding, chunkText } from "@combine-ai/ai-provider"
+import { chunkText } from "@combine-ai/ai-provider"
+import { generateEmbedding } from "@combine-ai/ai-provider/server"
 
 export const dynamic = "force-dynamic"
 

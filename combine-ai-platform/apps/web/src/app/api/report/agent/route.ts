@@ -7,7 +7,8 @@ import { extractTextFromDocument, validateDocumentText } from "@/lib/server/docu
 import { searchKnowledgeChunks, type KnowledgeSearchResult } from "@/lib/server/knowledge-search"
 import { extractKbHighlightPhrases } from "@/lib/server/kb-highlight-phrases"
 import { buildReportDocx } from "@/lib/server/report-docx-export"
-import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { getDashScopeProvider, ensureAiEnvLoaded } from "@combine-ai/ai-provider/server"
 import path from "path"
 import fs from "fs"
 
@@ -56,6 +57,7 @@ async function callAI(req: {
   messages: Array<{ role: string; content: string | unknown[] }>
   tools?: unknown[]
 }) {
+  ensureAiEnvLoaded()
   const provider = getDashScopeProvider()
   return provider.createCompletion({
     model: req.model || DEFAULT_MODELS.report,
@@ -84,7 +86,7 @@ Rules:
 8. Preserve exact values — do not modify, summarize, or translate.
 9. Flag any unclear or ambiguous text with "⚠️" prefix.
 10. When possible, identify the page number (1-based) where each field appears in the document and include it as the "page" field in the row.
-11. For PDF highlighting: "value" must match the document text EXACTLY (same punctuation, currency symbols, spacing). For amounts, dates, titles, and reference numbers, "page" is REQUIRED.
+11. For PDF highlighting: "value" must match the document text EXACTLY (same punctuation, currency symbols, spacing). "field" should use the label text as it appears in the PDF when visible (e.g. "Invoice Date", not a paraphrase), so field+value can be highlighted together. For amounts, dates, titles, and reference numbers, "page" is REQUIRED.
 
 Respond ONLY with valid JSON:
 {

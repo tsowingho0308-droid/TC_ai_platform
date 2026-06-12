@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { requireSession } from "@/lib/server/auth-helpers"
-import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { getDashScopeProvider } from "@combine-ai/ai-provider/server"
 import { buildTaxonomyPrompt, PREDEFINED_TAGS } from "@/lib/server/tag-taxonomy"
 
 export const dynamic = "force-dynamic"

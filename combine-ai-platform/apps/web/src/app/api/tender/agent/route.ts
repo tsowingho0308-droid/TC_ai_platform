@@ -5,7 +5,8 @@ import { extractTextFromDocument, validateDocumentText } from "@/lib/server/docu
 import { mockTenderResult, mockTenderCompare } from "@/lib/server/mock-extraction"
 import { parseAIJson } from "@/lib/server/parse-json"
 import type { Prisma } from "@prisma/client"
-import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { getDashScopeProvider, ensureAiEnvLoaded } from "@combine-ai/ai-provider/server"
 
 export const dynamic = "force-dynamic"
 export const maxDuration = 120
@@ -59,6 +60,7 @@ async function callAI(req: {
   messages: Array<{ role: string; content: string | unknown[] }>
   tools?: unknown[]
 }) {
+  ensureAiEnvLoaded()
   const provider = getDashScopeProvider()
   return provider.createCompletion({
     model: req.model || DEFAULT_MODELS.tender,

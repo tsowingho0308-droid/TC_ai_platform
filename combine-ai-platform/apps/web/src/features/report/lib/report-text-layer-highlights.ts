@@ -11,6 +11,19 @@ export interface HighlightTarget {
   page?: number
 }
 
+/** Strip multi-document prefix "filename · field" for PDF text matching. */
+export function stripSourcePrefix(field: string): string {
+  const sep = field.indexOf(" · ")
+  if (sep <= 0) return field
+  return field.slice(sep + 3)
+}
+
+export function highlightTargetsMatch(a: HighlightTarget, b: HighlightTarget): boolean {
+  if (a.field !== b.field || a.value !== b.value) return false
+  if (a.page != null && b.page != null && a.page !== b.page) return false
+  return true
+}
+
 function normalizeText(text: string): string {
   return text
     .toLowerCase()
@@ -96,6 +109,85 @@ function findSpanRangeMatches(spanEls: HTMLSpanElement[], target: string): { sta
   return matches
 }
 
+function compactForMatch(text: string): string {
+  return normalizeText(text)
+    .replace(/\bhkd\b|\bhk\b/g, "")
+    .replace(/[\s$¥€£,]/g, "")
+}
+
+/** Build search needles from field/value for PDF text layer matching. */
+export function buildValueNeedles(field: string, value: string): string[] {
+  const cleanField = stripSourcePrefix(field).trim()
+  const cleanValue = value.trim()
+  const needles: string[] = []
+
+  const add = (raw: string) => {
+    const t = raw.trim()
+    if (t.length >= 2 && !needles.some((n) => normalizeText(n) === normalizeText(t))) {
+      needles.push(t)
+    }
+  }
+
+  add(cleanValue)
+
+  for (const match of cleanValue.matchAll(/\(([^)]+)\)/g)) add(match[1])
+  for (const match of cleanField.matchAll(/\(([^)]+)\)/g)) add(match[1])
+
+  const dashIdx = cleanField.lastIndexOf(" - ")
+  if (dashIdx >= 0) add(cleanField.slice(dashIdx + 3))
+
+  for (const part of cleanValue.split(/[,;·]/)) add(part)
+  for (const part of cleanField.split(/[,;·]/)) add(part)
+
+  const digits = cleanValue.replace(/[^\d.]/g, "")
+  if (digits.length >= 3) add(digits)
+
+  return needles
+}
+
+function findSubstringMatch(
+  spanEls: HTMLSpanElement[],
+  targetValue: string,
+  containerRect: DOMRect,
+  opts?: { allowAmbiguous?: boolean }
+): TextLayerBox[] {
+  const normTarget = normalizeText(targetValue)
+  if (normTarget.length < 2) return []
+
+  const compactTarget = compactForMatch(targetValue)
+  const needles: Array<{ haystack: "norm" | "compact"; value: string }> = [
+    { haystack: "norm", value: normTarget },
+  ]
+  if (compactTarget.length >= 3 && compactTarget !== normTarget.replace(/\s/g, "")) {
+    needles.push({ haystack: "compact", value: compactTarget })
+  }
+
+  const matches: { startIdx: number; endIdx: number; spanCount: number }[] = []
+
+  for (const needle of needles) {
+    for (let i = 0; i < spanEls.length; i++) {
+      let combined = ""
+      for (let j = i; j < spanEls.length; j++) {
+        combined += spanEls[j].textContent || ""
+        const haystack =
+          needle.haystack === "compact" ? compactForMatch(combined) : normalizeText(combined)
+
+        if (haystack.includes(needle.value)) {
+          matches.push({ startIdx: i, endIdx: j, spanCount: j - i })
+          break
+        }
+        if (normalizeText(combined).length > normTarget.length + 120) break
+      }
+    }
+  }
+
+  if (matches.length === 0) return []
+  if (matches.length > 3 && !opts?.allowAmbiguous) return []
+
+  const best = [...matches].sort((a, b) => a.spanCount - b.spanCount)[0]
+  return boxesFromSpanRange(spanEls, best.startIdx, best.endIdx, containerRect)
+}
+
 /**
  * Locate highlight boxes for a target string using the rendered PDF text layer DOM.
  * Returns at most one merged box group (best / shortest match).
@@ -131,6 +223,75 @@ export function findSearchTermMatches(
   searchTerm: string
 ): TextLayerBox[] {
   return findTextLayerMatch(pageWrapper, searchTerm, { allowAmbiguous: true })
+}
+
+function mergeAdjacentBoxes(fieldBox: TextLayerBox, valueBox: TextLayerBox): TextLayerBox | null {
+  const lineThreshold = 8
+  if (Math.abs(fieldBox.top - valueBox.top) >= lineThreshold) return null
+  if (fieldBox.left + fieldBox.width > valueBox.left + 4) return null
+  const left = Math.min(fieldBox.left, valueBox.left)
+  const right = Math.max(fieldBox.left + fieldBox.width, valueBox.left + valueBox.width)
+  return {
+    left,
+    top: Math.min(fieldBox.top, valueBox.top),
+    width: right - left,
+    height: Math.max(fieldBox.height, valueBox.height),
+  }
+}
+
+/**
+ * Locate highlight boxes for a field-value pair. Tries combined strings first,
+ * then separate field + value boxes on the same line, then value-only fallback.
+ */
+export function findFieldValueMatch(
+  pageWrapper: HTMLElement,
+  field: string,
+  value: string,
+  opts?: { allowAmbiguous?: boolean }
+): TextLayerBox[] {
+  const cleanField = stripSourcePrefix(field).trim()
+  const cleanValue = value.trim()
+  if (cleanValue.length < 1) return []
+
+  const needles = buildValueNeedles(field, value)
+
+  for (const needle of needles) {
+    const candidates = [
+      `${cleanField}: ${needle}`,
+      `${cleanField} ${needle}`,
+      `${cleanField}：${needle}`,
+      needle,
+    ].filter((c, i, arr) => c.length >= 2 && arr.indexOf(c) === i)
+
+    for (const candidate of candidates) {
+      const boxes = findTextLayerMatch(pageWrapper, candidate, opts)
+      if (boxes.length > 0) return boxes
+    }
+  }
+
+  if (cleanField.length >= 2) {
+    const fieldBoxes = findTextLayerMatch(pageWrapper, cleanField, opts)
+    const valueBoxes = findTextLayerMatch(pageWrapper, cleanValue, opts)
+    if (fieldBoxes.length > 0 && valueBoxes.length > 0) {
+      const merged = mergeAdjacentBoxes(fieldBoxes[0], valueBoxes[0])
+      if (merged) return [merged]
+      return [...fieldBoxes, ...valueBoxes]
+    }
+    if (valueBoxes.length > 0) return valueBoxes
+  }
+
+  const textLayer = pageWrapper.querySelector(".react-pdf__Page__textContent") as HTMLElement | null
+  if (!textLayer) return []
+  const spanEls = Array.from(textLayer.querySelectorAll("span")) as HTMLSpanElement[]
+  if (spanEls.length === 0) return []
+  const containerRect = pageWrapper.getBoundingClientRect()
+
+  for (const needle of needles) {
+    const boxes = findSubstringMatch(spanEls, needle, containerRect, opts)
+    if (boxes.length > 0) return boxes
+  }
+
+  return []
 }
 
 export const HIGHLIGHT_BLUE = "rgba(80, 160, 255, 0.45)"

@@ -1,5 +1,6 @@
 import { prisma } from "./prisma"
-import { chunkText, generateEmbedding } from "@combine-ai/ai-provider"
+import { chunkText } from "@combine-ai/ai-provider"
+import { generateEmbedding } from "@combine-ai/ai-provider/server"
 
 /**
  * Extract text from a file buffer based on MIME type.

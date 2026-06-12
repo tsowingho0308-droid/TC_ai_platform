@@ -2,7 +2,7 @@
 // Supports optional query expansion for cross-language retrieval.
 
 import { prisma } from "@/lib/server/prisma"
-import { generateEmbedding } from "@combine-ai/ai-provider"
+import { generateEmbedding } from "@combine-ai/ai-provider/server"
 import { COL, KB_JOIN_CHAIN, KB_VECTOR_SELECT, KB_WORKSPACE_WHERE } from "@/lib/server/db-columns"
 
 // ── Types ────────────────────────────────────────────────────────

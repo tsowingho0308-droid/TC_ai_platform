@@ -135,7 +135,8 @@ export async function POST(request: NextRequest) {
       try {
         const { extractText } = await import("@/lib/server/document-processor")
         const sampleText = await extractText(buffer, file.type)
-        const { getDashScopeProvider, DEFAULT_MODELS } = await import("@combine-ai/ai-provider")
+        const { DEFAULT_MODELS } = await import("@combine-ai/ai-provider")
+        const { getDashScopeProvider } = await import("@combine-ai/ai-provider/server")
         const provider = getDashScopeProvider()
 
         const result = await provider.createCompletion({
@@ -280,7 +281,8 @@ Return ONLY valid JSON:
     let aiSummary: string | null = null
 
     try {
-      const { getDashScopeProvider, DEFAULT_MODELS } = await import("@combine-ai/ai-provider")
+      const { DEFAULT_MODELS } = await import("@combine-ai/ai-provider")
+      const { getDashScopeProvider } = await import("@combine-ai/ai-provider/server")
       const { buildTaxonomyPrompt, PREDEFINED_TAGS } = await import("@/lib/server/tag-taxonomy")
 
       const provider = getDashScopeProvider()

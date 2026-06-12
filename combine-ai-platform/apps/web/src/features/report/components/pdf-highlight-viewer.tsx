@@ -18,8 +18,9 @@ import "react-pdf/dist/Page/TextLayer.css"
 import "react-pdf/dist/Page/AnnotationLayer.css"
 import { cn } from "@combine-ai/shared-ui"
 import {
-  findTextLayerMatch,
+  findFieldValueMatch,
   findSearchTermMatches,
+  highlightTargetsMatch,
   HIGHLIGHT_BLUE,
   SEARCH_COLORS,
   type TextLayerBox,
@@ -57,6 +58,25 @@ interface OverlayRect extends TextLayerBox {
   color: string
   label?: string
   flash?: boolean
+}
+
+const SHOW_ALL_CAP = 12
+
+function shouldShowHighlightOnPage(
+  hl: HighlightTarget,
+  page: number,
+  totalPages: number
+): boolean {
+  if (totalPages <= 1) return true
+  if (!hl.page) return true
+  return hl.page === page
+}
+
+function highlightMatchScore(hl: HighlightTarget): number {
+  let score = 0
+  if (hl.page && hl.page >= 1) score += 100
+  score -= Math.min(hl.value.trim().length, 80)
+  return score
 }
 
 export default function PdfHighlightViewer({
@@ -101,13 +121,17 @@ export default function PdfHighlightViewer({
   const pageWrapperRef = useRef<HTMLDivElement>(null)
 
   const activeHighlights = useMemo(() => {
-    if (!highlightEnabled) return []
-    if (showAllHighlights) return highlights.slice(0, 12)
+    if (!highlightEnabled || showAllHighlights) return []
     if (!focusTarget) return []
-    const matched = highlights.filter((h) => h.value === focusTarget.value)
+    const matched = highlights.filter((h) => highlightTargetsMatch(h, focusTarget))
     if (matched.length > 0) return matched
     return [{ field: focusTarget.field, value: focusTarget.value, page: focusTarget.page }]
   }, [highlightEnabled, showAllHighlights, highlights, focusTarget])
+
+  const isFocusedHighlight = useCallback(
+    (hl: HighlightTarget) => Boolean(focusTarget && highlightTargetsMatch(hl, focusTarget)),
+    [focusTarget]
+  )
 
   const recomputeOverlays = useCallback(() => {
     const wrapper = pageWrapperRef.current
@@ -125,18 +149,41 @@ export default function PdfHighlightViewer({
     const rects: OverlayRect[] = []
 
     if (highlightEnabled) {
-      for (const hl of activeHighlights) {
-        if (hl.page && hl.page !== pageNumber) continue
-        const boxes = findTextLayerMatch(wrapper, hl.value, {
-          allowAmbiguous: Boolean(focusTarget && focusTarget.value === hl.value),
-        })
-        for (const box of boxes) {
-          rects.push({
-            ...box,
-            color: HIGHLIGHT_BLUE,
-            label: hl.field,
-            flash: Boolean(focusTarget && focusTarget.value === hl.value),
+      if (showAllHighlights) {
+        const matched: Array<{ hl: HighlightTarget; boxes: TextLayerBox[] }> = []
+        for (const hl of highlights) {
+          if (!shouldShowHighlightOnPage(hl, pageNumber, numPages)) continue
+          const boxes = findFieldValueMatch(wrapper, hl.field, hl.value, {
+            allowAmbiguous: true,
           })
+          if (boxes.length > 0) matched.push({ hl, boxes })
+        }
+        matched.sort((a, b) => highlightMatchScore(b.hl) - highlightMatchScore(a.hl))
+        for (const { hl, boxes } of matched.slice(0, SHOW_ALL_CAP)) {
+          for (const box of boxes) {
+            rects.push({
+              ...box,
+              color: HIGHLIGHT_BLUE,
+              label: hl.field,
+              flash: false,
+            })
+          }
+        }
+      } else {
+        for (const hl of activeHighlights) {
+          if (!shouldShowHighlightOnPage(hl, pageNumber, numPages)) continue
+          const focused = isFocusedHighlight(hl)
+          const boxes = findFieldValueMatch(wrapper, hl.field, hl.value, {
+            allowAmbiguous: focused,
+          })
+          for (const box of boxes) {
+            rects.push({
+              ...box,
+              color: HIGHLIGHT_BLUE,
+              label: hl.field,
+              flash: focused,
+            })
+          }
         }
       }
     }
@@ -153,7 +200,17 @@ export default function PdfHighlightViewer({
     })
 
     setOverlayRects(rects)
-  }, [activeHighlights, focusTarget, highlightEnabled, pageNumber, pdfLoading, searchTerms])
+  }, [
+    activeHighlights,
+    highlights,
+    isFocusedHighlight,
+    highlightEnabled,
+    showAllHighlights,
+    numPages,
+    pageNumber,
+    pdfLoading,
+    searchTerms,
+  ])
 
   useEffect(() => {
     const id = requestAnimationFrame(() => {

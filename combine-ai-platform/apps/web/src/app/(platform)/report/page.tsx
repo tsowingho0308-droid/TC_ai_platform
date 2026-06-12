@@ -33,9 +33,6 @@ import {
   buildUploadFileId,
   type PendingUploadFile,
 } from "@/features/report/components/report-upload-queue"
-import {
-  ReportExtractionPanel,
-} from "@/features/report/components/report-extraction-panel"
 import type { ExtractionRow } from "@/features/report/components/report-extraction-table"
 import type { PreviewDocument } from "@/features/report/components/pdf-highlight-viewer"
 import { buildReportDraftNote } from "@/features/report/lib/report-draft-note"
@@ -52,12 +49,6 @@ const PdfHighlightViewer = dynamic(
 )
 
 interface TableRow extends ExtractionRow {}
-
-interface HighlightRow {
-  field: string
-  value: string
-  page?: number
-}
 
 interface ReportSummary {
   summary: string
@@ -115,7 +106,6 @@ function ReportPageContent() {
   const [loadingEmailExtract, setLoadingEmailExtract] = useState(false)
   const [generatingReport, setGeneratingReport] = useState(false)
   const [extractedRows, setExtractedRows] = useState<TableRow[]>([])
-  const [extractionHighlights, setExtractionHighlights] = useState<HighlightRow[]>([])
   const [kbHighlightPhrases, setKbHighlightPhrases] = useState<string[]>([])
   const [highlightEnabled, setHighlightEnabled] = useState(false)
   const [showAllHighlights, setShowAllHighlights] = useState(false)
@@ -136,10 +126,10 @@ function ReportPageContent() {
   const [model, setModel] = useState(DEFAULT_MODELS.report)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [previewFile, setPreviewFile] = useState<File | null>(null)
-  const [note, setNote] = useState("")
   const [traceEvents, setTraceEvents] = useState<TraceEvent[]>([])
   const [thinkingText, setThinkingText] = useState("")
   const [error, setError] = useState<string | null>(null)
+  const [mockWarning, setMockWarning] = useState<string | null>(null)
   const [documentType, setDocumentType] = useState<string | null>(null)
   const [confidence, setConfidence] = useState<number | null>(null)
   const [streamingStatus, setStreamingStatus] = useState<
@@ -278,11 +268,11 @@ function ReportPageContent() {
     traceSeqRef.current = 0
     setThinkingText("")
     setError(null)
+    setMockWarning(null)
     setDocumentType(null)
     setConfidence(null)
     setReportSummary(null)
     setExtractedRows([])
-    setExtractionHighlights([])
     setKbHighlightPhrases([])
     setFocusTarget(null)
     setSelectedTableRowIndex(null)
@@ -322,7 +312,7 @@ function ReportPageContent() {
       sourceLabel: att.fileName,
     }
 
-    await extractFromFile(file, note, await ensureSessionId(att.fileName))
+    await extractFromFile(file, await ensureSessionId(att.fileName))
   }
 
   async function consumeExtractStream(response: Response) {
@@ -383,7 +373,6 @@ function ReportPageContent() {
         body: JSON.stringify({
           documentText: emailSource.body,
           fileName: `${emailSource.subject || "email"}.txt`,
-          instructions: note || undefined,
           model,
           sessionId: sessionId || undefined,
         }),
@@ -413,6 +402,7 @@ function ReportPageContent() {
       resetAnalysisState()
       setLoadingEmailExtract(true)
       setError(null)
+    setMockWarning(null)
       try {
         for (let i = 0; i < selected.length; i++) {
           await loadEmailAttachmentAndExtract(selected[i].id, {
@@ -524,11 +514,22 @@ function ReportPageContent() {
     if (!previewFile) return
     resetAnalysisState()
     const sessionId = await ensureSessionId(previewFile.name)
-    await extractFromFile(previewFile, note, sessionId)
+    await extractFromFile(previewFile, sessionId)
   }
 
-  function replaceExtractedRows(rows: TableRow[]) {
-    setExtractedRows(rows)
+  function handleHighlightEnabledChange(enabled: boolean) {
+    setHighlightEnabled(enabled)
+    if (enabled && !focusTarget) {
+      setShowAllHighlights(true)
+    }
+  }
+
+  function handleShowAllHighlightsChange(show: boolean) {
+    setShowAllHighlights(show)
+    if (show) {
+      setFocusTarget(null)
+      setSelectedTableRowIndex(null)
+    }
   }
 
   function toggleUploadFileSelection(fileId: string) {
@@ -569,6 +570,7 @@ function ReportPageContent() {
     resetAnalysisState()
     setLoadingBatchExtract(true)
     setError(null)
+    setMockWarning(null)
 
     try {
       const sessionId = await ensureSessionId(
@@ -586,7 +588,7 @@ function ReportPageContent() {
           appendRows: i > 0,
           sourceLabel: entry.file.name,
         }
-        await extractFromFile(entry.file, note, sessionId)
+        await extractFromFile(entry.file, sessionId)
       }
     } catch (err) {
       console.error("Batch extract error:", err)
@@ -596,21 +598,6 @@ function ReportPageContent() {
       setLoadingBatchExtract(false)
       extractMergeRef.current = { appendRows: false }
     }
-  }
-
-  function updateExtractedRow(index: number, update: Partial<TableRow>) {
-    setExtractedRows((prev) =>
-      prev.map((row, i) => (i === index ? { ...row, ...update } : row))
-    )
-  }
-
-  function addExtractedRow() {
-    setExtractedRows((prev) => [...prev, { field: "New Field", value: "" }])
-  }
-
-  function deleteExtractedRow(index: number) {
-    setExtractedRows((prev) => prev.filter((_, i) => i !== index))
-    setSelectedTableRowIndex((prev) => (prev === index ? null : prev))
   }
 
   function handleTableRowClick(index: number, row: TableRow) {
@@ -660,19 +647,15 @@ function ReportPageContent() {
   const viewerFileName = activePdfDoc?.name ?? previewFile?.name ?? ""
 
   const documentHighlights = useMemo(() => {
-    if (!viewerFileName) return extractionHighlights
-    return extractionHighlights.filter((h) => {
+    if (!viewerFileName) return extractedRows
+    return extractedRows.filter((h) => {
       const sep = h.field.indexOf(" · ")
       if (sep <= 0) return true
       return h.field.slice(0, sep) === viewerFileName
     })
-  }, [extractionHighlights, viewerFileName])
+  }, [extractedRows, viewerFileName])
 
-  async function extractFromFile(
-    file: File,
-    instructions: string,
-    sessionId?: string | null
-  ) {
+  async function extractFromFile(file: File, sessionId?: string | null) {
     setExtracting(true)
     setStreamingStatus("connecting")
 
@@ -698,7 +681,6 @@ function ReportPageContent() {
           body: JSON.stringify({
             fileBase64: fileData,
             fileName: file.name,
-            instructions: instructions || undefined,
             model,
             sessionId: sessionId || undefined,
           }),
@@ -707,7 +689,6 @@ function ReportPageContent() {
       } else {
         const formData = new FormData()
         formData.append("file", file)
-        if (instructions) formData.append("instructions", instructions)
         formData.append("model", model)
         if (sessionId) formData.append("sessionId", sessionId)
 
@@ -770,11 +751,18 @@ function ReportPageContent() {
           const result = parsed.result as {
             sessionId?: string
             rows?: TableRow[]
-            highlightRows?: HighlightRow[]
             documentType?: string
             confidence?: number
+            model?: string
           } | undefined
           if (result) {
+            if (result.model === "mock-template") {
+              setMockWarning(
+                "未連接大模型，目前為演示資料。請確認 combine-ai-platform/.env 中的 DASHSCOPE_API_KEY 並重啟 dev server。"
+              )
+            } else {
+              setMockWarning(null)
+            }
             if (result.sessionId) setSessionId(result.sessionId)
             if (result.rows && result.rows.length > 0) {
               const sourceLabel = extractMergeRef.current.sourceLabel
@@ -786,18 +774,6 @@ function ReportPageContent() {
                 : result.rows
               setExtractedRows((prev) =>
                 extractMergeRef.current.appendRows ? [...prev, ...rows] : rows
-              )
-            }
-            if (result.highlightRows && result.highlightRows.length > 0) {
-              const sourceLabel = extractMergeRef.current.sourceLabel
-              const highlights = sourceLabel
-                ? result.highlightRows.map((row) => ({
-                    ...row,
-                    field: `${sourceLabel} · ${row.field}`,
-                  }))
-                : result.highlightRows
-              setExtractionHighlights((prev) =>
-                extractMergeRef.current.appendRows ? [...prev, ...highlights] : highlights
               )
             }
             if (result.documentType) setDocumentType(result.documentType)
@@ -1035,6 +1011,12 @@ function ReportPageContent() {
             </button>
           </div>
         </header>
+
+        {mockWarning && (
+          <div className="border-b border-amber-200 bg-amber-50 px-6 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300">
+            {mockWarning}
+          </div>
+        )}
 
         <div className="flex flex-1 overflow-hidden">
           {/* Left: Upload, Email, AI Status, Notes */}
@@ -1331,20 +1313,6 @@ function ReportPageContent() {
               </div>
             )}
 
-            {((fromEmailId && emailSource) || previewFile) && (
-              <div className="mt-4">
-                <label className="mb-1 block text-sm font-medium">Notes / Instructions</label>
-                <textarea
-                  className="w-full resize-none rounded-md border bg-transparent px-3 py-2 text-sm"
-                  rows={2}
-                  value={note}
-                  onChange={(e) => setNote(e.target.value)}
-                  placeholder="Add specific instructions for AI (e.g., focus on compliance items)..."
-                  disabled={extracting || loadingEmailExtract}
-                />
-              </div>
-            )}
-
             {/* ── Extracted Data Table ── */}
             {extractedRows.length > 0 && (
               <div className="mt-6">
@@ -1394,8 +1362,19 @@ function ReportPageContent() {
                             "border-t transition-colors",
                             editingRowIndex === i
                               ? "bg-primary/5"
-                              : "hover:bg-muted/30"
+                              : "hover:bg-muted/30",
+                            isPdfPreview && editingRowIndex !== i && "cursor-pointer",
+                            isPdfPreview &&
+                              selectedTableRowIndex === i &&
+                              editingRowIndex !== i &&
+                              "bg-primary/5 ring-1 ring-inset ring-primary/30"
                           )}
+                          onClick={() => {
+                            if (isPdfPreview && editingRowIndex !== i) {
+                              handleTableRowClick(i, row)
+                            }
+                          }}
+                          title={isPdfPreview ? "Click to highlight in PDF" : undefined}
                         >
                           <td className="px-2 py-1.5 text-[10px] text-muted-foreground">
                             {i + 1}
@@ -1429,15 +1408,21 @@ function ReportPageContent() {
                           ) : (
                             <>
                               <td
-                                className="cursor-pointer px-2 py-1.5 text-xs font-medium"
-                                onClick={() => startEditRow(i)}
+                                className="px-2 py-1.5 text-xs font-medium"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  startEditRow(i)
+                                }}
                                 title="Click to edit"
                               >
                                 {row.field}
                               </td>
                               <td
-                                className="cursor-pointer px-2 py-1.5 text-xs"
-                                onClick={() => startEditRow(i)}
+                                className="px-2 py-1.5 text-xs"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  startEditRow(i)
+                                }}
                                 title="Click to edit"
                               >
                                 {row.value || (
@@ -1473,14 +1458,20 @@ function ReportPageContent() {
                               ) : (
                                 <>
                                   <button
-                                    onClick={() => startEditRow(i)}
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      startEditRow(i)
+                                    }}
                                     className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
                                     title="Edit"
                                   >
                                     <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                                   </button>
                                   <button
-                                    onClick={() => moveRow(i, i - 1)}
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      moveRow(i, i - 1)
+                                    }}
                                     disabled={i === 0}
                                     className="rounded p-0.5 text-muted-foreground hover:bg-muted disabled:opacity-20"
                                     title="Move up"
@@ -1488,7 +1479,10 @@ function ReportPageContent() {
                                     <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="18 15 12 9 6 15"/></svg>
                                   </button>
                                   <button
-                                    onClick={() => deleteRow(i)}
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      deleteRow(i)
+                                    }}
                                     className="rounded p-0.5 text-muted-foreground hover:bg-red-50 hover:text-red-600"
                                     title="Delete"
                                   >
@@ -1624,21 +1618,6 @@ function ReportPageContent() {
               )}
             </div>
 
-            {extractedRows.length > 0 && (
-              <div className="mt-6">
-                <ReportExtractionPanel
-                  rows={extractedRows}
-                  sessionId={activeSessionId}
-                  onUpdateRow={updateExtractedRow}
-                  onAddRow={addExtractedRow}
-                  onDeleteRow={deleteExtractedRow}
-                  onRowsReplace={replaceExtractedRows}
-                  onRowClick={isPdfPreview ? handleTableRowClick : undefined}
-                  selectedRowIndex={selectedTableRowIndex}
-                  saving={savingRows}
-                />
-              </div>
-            )}
           </div>
 
           {/* Right: PDF Preview — always full height */}
@@ -1652,9 +1631,9 @@ function ReportPageContent() {
                 onDocumentChange={setActivePreviewId}
                 highlights={documentHighlights}
                 highlightEnabled={highlightEnabled}
-                onHighlightEnabledChange={setHighlightEnabled}
+                onHighlightEnabledChange={handleHighlightEnabledChange}
                 showAllHighlights={showAllHighlights}
-                onShowAllHighlightsChange={setShowAllHighlights}
+                onShowAllHighlightsChange={handleShowAllHighlightsChange}
                 focusTarget={focusTarget}
                 className="h-full"
               />
