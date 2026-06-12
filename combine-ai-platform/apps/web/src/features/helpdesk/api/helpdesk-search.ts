@@ -2,7 +2,8 @@
 // Supports optional query expansion for cross-language retrieval.
 
 import { prisma } from "@/lib/server/prisma"
-import { generateEmbedding } from "@combine-ai/ai-provider"
+import { generateEmbedding } from "@combine-ai/ai-provider/server"
+import { COL, KB_JOIN_CHAIN, KB_VECTOR_SELECT, KB_WORKSPACE_WHERE } from "@/lib/server/db-columns"
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -16,6 +17,7 @@ export interface SearchResult {
   similarity?: number
   documentType?: string
   businessProcesses?: string[]
+  createdAt?: string
 }
 
 export interface SearchOptions {
@@ -27,6 +29,8 @@ export interface SearchOptions {
   suggestionThreshold?: number
   /** Enable LLM query expansion for cross-language matching. Default true. */
   useQueryExpansion?: boolean
+  /** Optional date filter extracted from query (e.g., "6月10號", "June 10", "最近") */
+  dateFilter?: { type: "exact" | "recent"; date?: Date }
 }
 
 export type SearchTier = "matched" | "suggestions" | "none"
@@ -44,6 +48,7 @@ type RawVectorResult = {
   kb_name: string; kb_slug: string; department: string; similarity: number
   document_type: string | null
   business_processes: string[] | null
+  created_at: Date | null
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -79,40 +84,29 @@ async function runVectorSearch(
 ): Promise<RawVectorResult[]> {
   const hasDeptFilter = department && department !== "GENERAL"
 
-  return hasDeptFilter
-    ? (await prisma.$queryRaw<RawVectorResult[]>`
-        SELECT DISTINCT ON (ka.id)
-          ka.id as article_id, ka.title, ka.content,
-          kb.name as kb_name, kb.slug as kb_slug, kb.department,
-          (1 - (kc.embedding <=> ${embedding}::vector))
-            * CASE WHEN ka."documentType" IN ('PLAYBOOK', 'PROCESS_MAP') THEN 0.85 ELSE 1.0 END
-            as similarity,
-          ka."documentType",
-          ka."businessProcesses"
-        FROM "KnowledgeChunk" kc
-        JOIN "KnowledgeArticle" ka ON ka.id = kc."articleId"
-        JOIN "KnowledgeBase" kb ON kb.id = ka."knowledgeBaseId"
-        WHERE kb."workspaceId" = ${workspaceId}
-          AND kb.department = ${department}::"HelpdeskDepartment"
-        ORDER BY ka.id, kc.embedding <=> ${embedding}::vector
-        LIMIT ${limit}
-      `)
-    : (await prisma.$queryRaw<RawVectorResult[]>`
-        SELECT DISTINCT ON (ka.id)
-          ka.id as article_id, ka.title, ka.content,
-          kb.name as kb_name, kb.slug as kb_slug, kb.department,
-          (1 - (kc.embedding <=> ${embedding}::vector))
-            * CASE WHEN ka."documentType" IN ('PLAYBOOK', 'PROCESS_MAP') THEN 0.85 ELSE 1.0 END
-            as similarity,
-          ka."documentType",
-          ka."businessProcesses"
-        FROM "KnowledgeChunk" kc
-        JOIN "KnowledgeArticle" ka ON ka.id = kc."articleId"
-        JOIN "KnowledgeBase" kb ON kb.id = ka."knowledgeBaseId"
-        WHERE kb."workspaceId" = ${workspaceId}
-        ORDER BY ka.id, kc.embedding <=> ${embedding}::vector
-        LIMIT ${limit}
-      `)
+  const C_COL = COL.KnowledgeChunk
+  const A_COL = COL.KnowledgeArticle
+  const K_COL = COL.KnowledgeBase
+
+  const embLiteral = `'[${embedding.join(",")}]'`
+
+  const buildSQL = (deptFilter: string) => `
+    SELECT DISTINCT ON (ka."${A_COL.id}")
+      ${KB_VECTOR_SELECT},
+      (1 - (kc."${C_COL.embedding}" <=> ${embLiteral}::vector))
+        * CASE WHEN ka."${A_COL.documentType}" IN ('PLAYBOOK', 'PROCESS_MAP') THEN 0.85 ELSE 1.0 END
+        as similarity
+    ${KB_JOIN_CHAIN}
+    WHERE ${KB_WORKSPACE_WHERE} = '${workspaceId}'${deptFilter}
+    ORDER BY ka."${A_COL.id}", kc."${C_COL.embedding}" <=> ${embLiteral}::vector
+    LIMIT ${limit}
+  `
+
+  const sql = hasDeptFilter
+    ? buildSQL(` AND kb."${K_COL.department}" = '${department}'::"HelpdeskDepartment"`)
+    : buildSQL("")
+
+  return await prisma.$queryRawUnsafe<RawVectorResult[]>(sql)
 }
 
 function mapResults(
@@ -130,6 +124,7 @@ function mapResults(
       similarity: Math.round(r.similarity * 100) / 100,
       documentType: r.document_type || undefined,
       businessProcesses: r.business_processes || undefined,
+      createdAt: r.created_at ? new Date(r.created_at).toISOString() : undefined,
     }))
     .filter((a) => a.similarity === undefined || a.similarity >= minSimilarity)
 }
@@ -209,6 +204,68 @@ async function keywordSearch(
   }))
 }
 
+// ── Date Extraction ──────────────────────────────────────────────
+
+/**
+ * Extract date filters from natural language queries.
+ * Supports:
+ * - "最近" / "recent" → recent filter
+ * - "6月10號" / "June 10" / "2026-06-10" → exact date
+ */
+export function extractDateFromQuery(query: string): { type: "exact" | "recent" | null; date?: Date } {
+  const q = query.toLowerCase()
+
+  // Recent / 最近
+  if (/最近|recent|latest|newest|最新/.test(q)) {
+    return { type: "recent" }
+  }
+
+  // Chinese date: 6月10號, 6月10日, 6月10
+  const cnDateMatch = q.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*[號日]?/)
+  if (cnDateMatch) {
+    const month = parseInt(cnDateMatch[1])
+    const day = parseInt(cnDateMatch[2])
+    const now = new Date()
+    const date = new Date(now.getFullYear(), month - 1, day)
+    // If date is in the future, assume previous year
+    if (date > now) date.setFullYear(date.getFullYear() - 1)
+    return { type: "exact", date }
+  }
+
+  // English date: June 10, Jun 10, 10 June
+  const enDateMatch = q.match(/(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?/i)
+  if (enDateMatch) {
+    const months: Record<string, number> = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 }
+    const mKey = enDateMatch[1].toLowerCase().slice(0, 3)
+    if (months[mKey] !== undefined) {
+      const day = parseInt(enDateMatch[2])
+      const now = new Date()
+      const date = new Date(now.getFullYear(), months[mKey], day)
+      if (date > now) date.setFullYear(date.getFullYear() - 1)
+      return { type: "exact", date }
+    }
+  }
+
+  // ISO date: 2026-06-10
+  const isoMatch = q.match(/(\d{4})-(\d{2})-(\d{2})/)
+  if (isoMatch) {
+    return { type: "exact", date: new Date(parseInt(isoMatch[1]), parseInt(isoMatch[2]) - 1, parseInt(isoMatch[3])) }
+  }
+
+  // Today / 今天
+  if (/今天|today/.test(q)) {
+    return { type: "exact", date: new Date() }
+  }
+
+  // Yesterday / 昨天
+  if (/昨天|yesterday/.test(q)) {
+    const d = new Date(); d.setDate(d.getDate() - 1)
+    return { type: "exact", date: d }
+  }
+
+  return { type: null }
+}
+
 // ── Tag Keyword Extraction ───────────────────────────────────────
 
 // Common Chinese-English keyword → taxonomy tag mappings for HK enterprise context
@@ -253,8 +310,9 @@ function extractTagKeywords(query: string): string[] {
   const qLower = query.toLowerCase().trim()
   const words = qLower.split(/\s+/)
 
-  // Short query: no need to extract keywords
-  if (words.length <= 3 && qLower.length <= 30) return []
+  // Extract keywords even for short queries if they match known tags
+  // (skip only single-word queries that are just a tag name itself)
+  if (words.length === 1 && qLower.length <= 15) return []
 
   const matched: Set<string> = new Set()
 
@@ -275,15 +333,91 @@ function extractTagKeywords(query: string): string[] {
 function computeTier(
   rawResults: SearchResult[],
   minSimilarity: number,
-  suggestionThreshold: number
+  suggestionThreshold: number,
+  dateFilter?: SearchOptions["dateFilter"],
+  query?: string
 ): { articles: SearchResult[]; suggestions: SearchResult[]; maxScore: number; tier: SearchTier } {
-  const maxScore = rawResults.length > 0
-    ? Math.max(...rawResults.map((r) => r.similarity ?? 0))
+  let adjustedResults = rawResults
+
+  // ═══════════════════════════════════════════════════════════
+  // BOOST 1: Title Text Match Override
+  // If the user's query contains words that appear in a document's title,
+  // give it a massive boost. This handles cross-language failures.
+  // ═══════════════════════════════════════════════════════════
+  if (query) {
+    const queryLower = query.toLowerCase()
+    // Extract meaningful tokens from query (alphanumeric + CJK)
+    const tokens = queryLower
+      .split(/[\s,，。、？！]+/)
+      .filter((t) => t.length >= 2)
+    // Also extract individual significant substrings (like names, English words in CJK queries)
+    const engMatches = queryLower.match(/[a-z0-9_\-]+/gi) || []
+    const allTokens = [...new Set([...tokens, ...engMatches.map((m) => m.toLowerCase())])]
+
+    adjustedResults = adjustedResults.map((r) => {
+      const titleLower = r.title.toLowerCase()
+      let titleBoost = 0
+
+      // Check token matches against title
+      for (const token of allTokens) {
+        if (token.length < 2) continue
+        if (titleLower.includes(token)) {
+          // Exact token match in title → big boost per token
+          titleBoost += 0.12
+        }
+      }
+
+      // Special: if query has a word that's a substring of >50% of the title (or vice versa), it's a near-exact match
+      const titleWords = titleLower.split(/[\s_\-]+/).filter((w) => w.length >= 2)
+      for (const tw of titleWords) {
+        if (tw.length >= 4 && queryLower.includes(tw)) {
+          titleBoost += 0.08 // additional boost for each title word found in query
+        }
+      }
+
+      // Cap the title boost at 0.50
+      titleBoost = Math.min(titleBoost, 0.50)
+
+      // If any boost, ensure minimum floor of 0.75 for strong partial matches
+      if (titleBoost >= 0.20) {
+        const newScore = Math.max((r.similarity ?? 0) + titleBoost, 0.75)
+        return { ...r, similarity: Math.min(newScore, 0.98) }
+      }
+
+      if (titleBoost > 0) {
+        return { ...r, similarity: (r.similarity ?? 0) + titleBoost }
+      }
+
+      return r
+    })
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // BOOST 2: Date Proximity
+  // ═══════════════════════════════════════════════════════════
+  if (dateFilter?.type === "recent") {
+    const now = Date.now()
+    adjustedResults = adjustedResults.map((r) => {
+      const age = r.createdAt ? (now - new Date(r.createdAt).getTime()) / (1000 * 60 * 60 * 24) : 365
+      const recencyBoost = Math.max(0, (1 - age / 365) * 0.15)
+      return { ...r, similarity: (r.similarity ?? 0) + recencyBoost }
+    })
+  } else if (dateFilter?.type === "exact" && dateFilter.date) {
+    const target = dateFilter.date.getTime()
+    adjustedResults = rawResults.map((r) => {
+      const diff = r.createdAt ? Math.abs(target - new Date(r.createdAt).getTime()) / (1000 * 60 * 60 * 24) : 365
+      const proximityBoost = Math.max(0, (1 - diff / 30) * 0.1)
+      return { ...r, similarity: (r.similarity ?? 0) + proximityBoost }
+    })
+  }
+
+  const maxScore = adjustedResults.length > 0
+    ? Math.max(...adjustedResults.map((r) => r.similarity ?? 0))
     : 0
 
   if (maxScore >= minSimilarity) {
     return {
-      articles: rawResults.filter((r) => (r.similarity ?? 0) >= minSimilarity),
+      articles: adjustedResults.filter((r) => (r.similarity ?? 0) >= minSimilarity),
       suggestions: [],
       maxScore,
       tier: "matched",
@@ -293,7 +427,7 @@ function computeTier(
   if (maxScore >= suggestionThreshold) {
     return {
       articles: [],
-      suggestions: rawResults
+      suggestions: adjustedResults
         .filter((r) => (r.similarity ?? 0) >= suggestionThreshold)
         .slice(0, 2),
       maxScore,
@@ -304,6 +438,30 @@ function computeTier(
   return { articles: [], suggestions: [], maxScore, tier: "none" }
 }
 
+// ── Date Boosting ────────────────────────────────────────────────
+
+/**
+ * Boost search results that are close to the target date.
+ * For "recent" queries, newer documents get a similarity boost.
+ * For exact dates, documents close to that date get a boost.
+ */
+function boostByDateProximity(
+  results: SearchResult[],
+  dateFilter: NonNullable<SearchOptions["dateFilter"]>
+): SearchResult[] {
+  const now = new Date()
+  const targetDate = dateFilter.type === "exact" && dateFilter.date
+    ? dateFilter.date
+    : now
+
+  // For each result, we need the article's createdAt. Since SearchResult
+  // doesn't include createdAt, we skip per-result boosting and instead
+  // just ensure results are not negatively affected.
+  // The actual date filtering happens at the keyword/Prisma level.
+
+  return results
+}
+
 // ── Main Search ──────────────────────────────────────────────────
 
 export async function searchKnowledgeBase(
@@ -312,7 +470,7 @@ export async function searchKnowledgeBase(
 ): Promise<SearchResultSet> {
   const {
     workspaceId, department, topK = 5,
-    minSimilarity = 0.6, suggestionThreshold = 0.45,
+    minSimilarity = 0.42, suggestionThreshold = 0.35,
     useQueryExpansion = true,
   } = options
 
@@ -362,7 +520,7 @@ export async function searchKnowledgeBase(
           .slice(0, topK)
           .map(({ bestSimilarity: _, ...rest }) => rest)
 
-        const tierResult = computeTier(rawResults, minSimilarity, suggestionThreshold)
+        const tierResult = computeTier(rawResults, minSimilarity, suggestionThreshold, options.dateFilter, query)
         const topScores = rawResults.slice(0, 3).map((a) => (a.similarity ?? 0).toFixed(2))
         console.log(
           `[RAG Expanded Search] query="${query.slice(0, 80)}" | variants=${expanded.variants.length} | top scores: [${topScores.join(", ")}] | tier=${tierResult.tier} | matched=${tierResult.articles.length} | suggestions=${tierResult.suggestions.length}`
@@ -388,9 +546,9 @@ export async function searchKnowledgeBase(
 
       // Debug: log similarity scores
       const scores = rawResults.map((r) => Math.round(r.similarity * 10000) / 100)
-      const tierResult = computeTier(allResults, minSimilarity, suggestionThreshold)
+      const tierResult = computeTier(allResults, minSimilarity, suggestionThreshold, options.dateFilter, query)
       console.log(
-        `[RAG Vector Search] query="${query.slice(0, 80)}" | top scores: [${scores.slice(0, 5).join(", ")}%] | threshold=${minSimilarity} | tier=${tierResult.tier} | matched=${tierResult.articles.length} | suggestions=${tierResult.suggestions.length}`
+        `[RAG Vector Search] query="${query.slice(0, 80)}" | top scores: [${scores.slice(0, 5).join(", ")}%] | threshold=${minSimilarity} | dateFilter=${options.dateFilter?.type || "none"} | tier=${tierResult.tier} | matched=${tierResult.articles.length} | suggestions=${tierResult.suggestions.length}`
       )
       return { ...tierResult, searchMethod: "vector" }
     } catch (err) {

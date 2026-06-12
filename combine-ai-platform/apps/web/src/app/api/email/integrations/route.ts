@@ -1,12 +1,20 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
-import { createHmac, timingSafeEqual } from "node:crypto"
+import { createHash, createHmac, timingSafeEqual } from "node:crypto"
 import { IntegrationStatus, MailProvider, MessageDirection } from "@prisma/client"
 import {
   buildAttachmentStoragePath,
   saveAttachmentFile,
 } from "@/lib/server/email-attachment-store"
+import {
+  assertGmailScopesGranted,
+  exchangeGoogleCode,
+  fetchGoogleUserInfo,
+  getGmailOAuthScopeString,
+  upsertGmailIntegration,
+  type GoogleTokenResponse,
+} from "@/lib/server/google-oauth"
 
 export const dynamic = "force-dynamic"
 
@@ -17,15 +25,6 @@ type OAuthStatePayload = {
   issuedAt: number
 }
 
-type GoogleTokenResponse = {
-  access_token?: string
-  refresh_token?: string
-  expires_in?: number
-  scope?: string
-  error?: string
-  error_description?: string
-}
-
 type GmailListMessagesResponse = {
   messages?: Array<{ id: string; threadId: string }>
 }
@@ -33,6 +32,7 @@ type GmailListMessagesResponse = {
 type GmailMessagePart = {
   mimeType?: string
   filename?: string
+  headers?: Array<{ name: string; value: string }>
   body?: { data?: string; attachmentId?: string; size?: number }
   parts?: GmailMessagePart[]
 }
@@ -42,6 +42,7 @@ type GmailAttachmentMeta = {
   mimeType: string
   attachmentId: string
   sizeBytes: number
+  contentId?: string | null
 }
 
 type GmailAttachmentResponse = {
@@ -102,14 +103,6 @@ function decodeState(raw: string): OAuthStatePayload {
   return payload
 }
 
-function getGoogleScopes() {
-  return [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/userinfo.email",
-  ].join(" ")
-}
-
 function parseSender(value: string) {
   const trimmed = value.trim()
   if (!trimmed) return { name: "Unknown sender", email: "unknown@example.com" }
@@ -156,24 +149,77 @@ function stripHtml(value: string) {
   return value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
 }
 
+function getPartHeader(part: GmailMessagePart, headerName: string) {
+  const headers = part.headers || []
+  return headers.find((h) => h.name.toLowerCase() === headerName.toLowerCase())?.value?.trim() || ""
+}
+
+function normalizeContentId(value: string) {
+  return value.replace(/^<|>$/g, "").trim()
+}
+
+function normalizeAttachmentFileName(fileName: string) {
+  return fileName.trim().toLowerCase()
+}
+
+function buildAttachmentRecordId(messageId: string, attachmentId: string) {
+  return createHash("sha256")
+    .update(`${messageId}:${attachmentId}`)
+    .digest("hex")
+    .slice(0, 32)
+}
+
 function collectAttachments(message: GmailMessageDetailResponse): GmailAttachmentMeta[] {
-  const results: GmailAttachmentMeta[] = []
+  const byAttachmentId = new Map<string, GmailAttachmentMeta>()
+  const byFileName = new Map<string, GmailAttachmentMeta>()
   const visit = (part?: GmailMessagePart) => {
     if (!part) return
-    const fileName = part.filename?.trim()
     const attachmentId = part.body?.attachmentId
-    if (fileName && attachmentId) {
-      results.push({
-        fileName,
-        mimeType: part.mimeType || "application/octet-stream",
-        attachmentId,
-        sizeBytes: part.body?.size || 0,
-      })
+    const mimeType = part.mimeType || "application/octet-stream"
+    const mimeLower = mimeType.toLowerCase()
+    const fileName = part.filename?.trim()
+    const contentIdRaw = getPartHeader(part, "Content-ID")
+    const contentId = contentIdRaw ? normalizeContentId(contentIdRaw) : null
+
+    if (attachmentId && (fileName || mimeLower.startsWith("image/") || mimeLower === "application/pdf")) {
+      const ext = mimeLower.split("/")[1]?.split("+")[0] || "bin"
+      const resolvedName = fileName || contentId || `inline-${attachmentId.slice(0, 12)}.${ext}`
+      const normalizedName = fileName ? normalizeAttachmentFileName(resolvedName) : null
+
+      // Gmail MIME trees can expose the same file in multiple parts with different attachmentIds.
+      if (normalizedName && byFileName.has(normalizedName)) {
+        const existing = byFileName.get(normalizedName)!
+        if (!existing.contentId && contentId) {
+          byFileName.set(normalizedName, { ...existing, contentId })
+          byAttachmentId.set(existing.attachmentId, { ...existing, contentId })
+        }
+      } else {
+        const next: GmailAttachmentMeta = {
+          fileName: resolvedName,
+          mimeType,
+          attachmentId,
+          sizeBytes: part.body?.size || 0,
+          contentId,
+        }
+        const existing = byAttachmentId.get(attachmentId)
+        if (!existing) {
+          byAttachmentId.set(attachmentId, next)
+          if (normalizedName) byFileName.set(normalizedName, next)
+        } else if (!existing.fileName && next.fileName) {
+          const merged = {
+            ...existing,
+            fileName: next.fileName,
+            contentId: existing.contentId || next.contentId,
+          }
+          byAttachmentId.set(attachmentId, merged)
+          if (normalizedName) byFileName.set(normalizedName, merged)
+        }
+      }
     }
     for (const child of part.parts || []) visit(child)
   }
   visit(message.payload as GmailMessagePart | undefined)
-  return results
+  return Array.from(byAttachmentId.values())
 }
 
 async function downloadGmailAttachment(accessToken: string, messageId: string, attachmentId: string) {
@@ -183,6 +229,45 @@ async function downloadGmailAttachment(accessToken: string, messageId: string, a
   )
   if (!response.data) return null
   return Buffer.from(response.data, "base64url")
+}
+
+async function dedupeStoredAttachments(workspaceId: string) {
+  const attachments = await prisma.messageAttachment.findMany({
+    where: { workspaceId },
+    orderBy: { createdAt: "asc" },
+    select: { id: true, messageId: true, providerAttachmentId: true, fileName: true },
+  })
+
+  const seenProviderIds = new Set<string>()
+  const seenFileNames = new Set<string>()
+  const duplicateIds: string[] = []
+  for (const att of attachments) {
+    const providerKey =
+      att.providerAttachmentId != null
+        ? `${att.messageId}:${att.providerAttachmentId}`
+        : null
+    const fileNameKey = att.fileName.trim()
+      ? `${att.messageId}:${normalizeAttachmentFileName(att.fileName)}`
+      : null
+
+    const isDuplicate =
+      (providerKey != null && seenProviderIds.has(providerKey)) ||
+      (fileNameKey != null && seenFileNames.has(fileNameKey))
+
+    if (isDuplicate) {
+      duplicateIds.push(att.id)
+      continue
+    }
+
+    if (providerKey) seenProviderIds.add(providerKey)
+    if (fileNameKey) seenFileNames.add(fileNameKey)
+  }
+
+  if (duplicateIds.length > 0) {
+    await prisma.messageAttachment.deleteMany({
+      where: { id: { in: duplicateIds } },
+    })
+  }
 }
 
 async function syncMessageAttachments(params: {
@@ -198,16 +283,32 @@ async function syncMessageAttachments(params: {
       where: {
         workspaceId: params.workspaceId,
         messageId: params.messageId,
-        providerAttachmentId: att.attachmentId,
-        fileName: att.fileName,
+        OR: [
+          { providerAttachmentId: att.attachmentId },
+          ...(att.fileName.trim()
+            ? [{ fileName: { equals: att.fileName, mode: "insensitive" as const } }]
+            : []),
+        ],
       },
     })
-    if (existing) continue
+    if (existing) {
+      await prisma.messageAttachment.update({
+        where: { id: existing.id },
+        data: {
+          fileName: att.fileName,
+          mimeType: att.mimeType,
+          sizeBytes: att.sizeBytes || existing.sizeBytes,
+          contentId: att.contentId || existing.contentId,
+          providerAttachmentId: existing.providerAttachmentId || att.attachmentId,
+        },
+      })
+      continue
+    }
 
     const buffer = await downloadGmailAttachment(params.accessToken, params.gmailMessageId, att.attachmentId)
     if (!buffer || buffer.length === 0) continue
 
-    const recordId = `att-${params.messageId}-${att.attachmentId}`.slice(0, 80)
+    const recordId = buildAttachmentRecordId(params.messageId, att.attachmentId)
     const storagePath = buildAttachmentStoragePath(params.workspaceId, recordId, att.fileName)
     await saveAttachmentFile(storagePath, buffer)
 
@@ -224,6 +325,7 @@ async function syncMessageAttachments(params: {
         sourceProvider: MailProvider.GMAIL,
         providerMessageId: params.gmailMessageId,
         providerAttachmentId: att.attachmentId,
+        contentId: att.contentId || null,
       },
     })
   }
@@ -295,6 +397,18 @@ async function runManualSync(params: {
   accessToken: string
   externalEmail: string | null
 }) {
+  // Drop legacy thread-grouped Gmail rows (pre per-message sync)
+  await prisma.conversation.deleteMany({
+    where: {
+      workspaceId: params.workspaceId,
+      inboxId: params.inboxId,
+      sourceProvider: MailProvider.GMAIL,
+      providerMessageId: null,
+    },
+  })
+
+  await dedupeStoredAttachments(params.workspaceId)
+
   const list = await gmailApi<GmailListMessagesResponse>(
     params.accessToken,
     "/gmail/v1/users/me/messages?maxResults=50"
@@ -316,80 +430,73 @@ async function runManualSync(params: {
     if (!messages.length) continue
     fetchedMessages += messages.length
 
-    const labels = Array.from(new Set(messages.flatMap((m) => m.labelIds || [])))
-    const latest = messages[messages.length - 1]
-    const latestInbound = [...messages].reverse().find((m) => {
-      if (m.labelIds?.includes("SENT")) return false
-      if (!params.externalEmail) return true
-      const sender = parseSender(getHeader(m, "From"))
-      return sender.email.toLowerCase() !== params.externalEmail.toLowerCase()
-    }) || latest
-
-    const sender = parseSender(getHeader(latestInbound, "From"))
-    const subject = getHeader(latestInbound, "Subject") || "(No subject)"
-    const replyTo = getHeader(latestInbound, "Reply-To") || sender.email
-    const bodies = collectBodies(latestInbound)
-    const preview = (
-      bodies.text ||
-      latestInbound.snippet ||
-      stripHtml(bodies.html || "") ||
-      "(No preview)"
-    ).replace(/\s+/g, " ").trim().slice(0, 220)
-
-    const existingConversation = await prisma.conversation.findUnique({
-      where: {
-        inboxId_sourceProvider_providerThreadId: {
-          inboxId: params.inboxId,
-          sourceProvider: MailProvider.GMAIL,
-          providerThreadId: thread.id,
-        },
-      },
-    })
-
-    const conversation = existingConversation
-      ? await prisma.conversation.update({
-          where: { id: existingConversation.id },
-          data: {
-            folderId: mapFolder(labels),
-            read: !labels.includes("UNREAD"),
-            starred: labels.includes("STARRED"),
-            senderName: sender.name,
-            senderEmail: sender.email,
-            subject,
-            preview,
-            replyTo,
-          },
-        })
-      : await prisma.conversation.create({
-          data: {
-            workspaceId: params.workspaceId,
-            inboxId: params.inboxId,
-            folderId: mapFolder(labels),
-            status: "OPEN",
-            subject,
-            senderName: sender.name,
-            senderEmail: sender.email,
-            preview,
-            replyTo,
-            read: !labels.includes("UNREAD"),
-            starred: labels.includes("STARRED"),
-            labels: [],
-            sourceProvider: MailProvider.GMAIL,
-            providerThreadId: thread.id,
-          },
-        })
-
-    if (existingConversation) conversationsUpdated += 1
-    else conversationsCreated += 1
-
     for (const msg of messages) {
-      const direction = msg.labelIds?.includes("SENT")
-        ? MessageDirection.OUTBOUND
-        : MessageDirection.INBOUND
+      const msgLabels = msg.labelIds || []
+      const sender = parseSender(getHeader(msg, "From"))
+      const subject = getHeader(msg, "Subject") || "(No subject)"
+      const replyTo = getHeader(msg, "Reply-To") || sender.email
       const parts = collectBodies(msg)
       const bodyText = parts.text
       const bodyHtml = parts.html
       const body = bodyText || msg.snippet || stripHtml(bodyHtml || "") || "(No body)"
+      const preview = (
+        bodyText ||
+        msg.snippet ||
+        stripHtml(bodyHtml || "") ||
+        "(No preview)"
+      ).replace(/\s+/g, " ").trim().slice(0, 220)
+
+      const existingConversation = await prisma.conversation.findUnique({
+        where: {
+          inboxId_sourceProvider_providerMessageId: {
+            inboxId: params.inboxId,
+            sourceProvider: MailProvider.GMAIL,
+            providerMessageId: msg.id,
+          },
+        },
+      })
+
+      const conversation = existingConversation
+        ? await prisma.conversation.update({
+            where: { id: existingConversation.id },
+            data: {
+              folderId: mapFolder(msgLabels),
+              read: !msgLabels.includes("UNREAD"),
+              starred: msgLabels.includes("STARRED"),
+              senderName: sender.name,
+              senderEmail: sender.email,
+              subject,
+              preview,
+              replyTo,
+              providerThreadId: thread.id,
+            },
+          })
+        : await prisma.conversation.create({
+            data: {
+              workspaceId: params.workspaceId,
+              inboxId: params.inboxId,
+              folderId: mapFolder(msgLabels),
+              status: "OPEN",
+              subject,
+              senderName: sender.name,
+              senderEmail: sender.email,
+              preview,
+              replyTo,
+              read: !msgLabels.includes("UNREAD"),
+              starred: msgLabels.includes("STARRED"),
+              labels: [],
+              sourceProvider: MailProvider.GMAIL,
+              providerMessageId: msg.id,
+              providerThreadId: thread.id,
+            },
+          })
+
+      if (existingConversation) conversationsUpdated += 1
+      else conversationsCreated += 1
+
+      const direction = msgLabels.includes("SENT")
+        ? MessageDirection.OUTBOUND
+        : MessageDirection.INBOUND
 
       const existed = await prisma.message.findUnique({
         where: {
@@ -402,7 +509,16 @@ async function runManualSync(params: {
       })
 
       const dbMessage = existed
-        ? existed
+        ? await prisma.message.update({
+            where: { id: existed.id },
+            data: {
+              conversationId: conversation.id,
+              body,
+              bodyText,
+              bodyHtml,
+              gmailLabelIds: msgLabels,
+            },
+          })
         : await prisma.message.create({
             data: {
               workspaceId: params.workspaceId,
@@ -414,7 +530,7 @@ async function runManualSync(params: {
               body,
               bodyText,
               bodyHtml,
-              gmailLabelIds: msg.labelIds || [],
+              gmailLabelIds: msgLabels,
               createdAt: msg.internalDate ? new Date(Number(msg.internalDate)) : new Date(),
             },
           })
@@ -462,54 +578,20 @@ export async function GET(request: NextRequest) {
 
       try {
         const state = decodeState(stateRaw)
-        const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            code,
-            client_id: process.env.GOOGLE_CLIENT_ID || "",
-            client_secret: process.env.GOOGLE_CLIENT_SECRET || "",
-            redirect_uri: process.env.GOOGLE_OAUTH_REDIRECT_URI || "",
-            grant_type: "authorization_code",
-          }),
-        })
-        const tokens = (await tokenResponse.json()) as GoogleTokenResponse
-        if (!tokenResponse.ok || !tokens.access_token) {
-          throw new Error(tokens.error_description || tokens.error || "Failed to exchange code")
-        }
+        const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI || ""
+        const tokens = await exchangeGoogleCode(code, redirectUri)
+        assertGmailScopesGranted(tokens.scope)
 
-        const grantedScopes = (tokens.scope || "").split(" ").filter(Boolean)
-        const hasGmailScope = grantedScopes.some((scope) => scope.includes("gmail"))
-        if (!hasGmailScope) {
-          throw new Error("Gmail permissions not granted — reconnect and allow all permissions")
-        }
+        const userInfo = await fetchGoogleUserInfo(tokens.access_token!)
 
-        const userInfo = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-          headers: { Authorization: `Bearer ${tokens.access_token}` },
-        }).then(async (r) => (r.ok ? (await r.json() as { email?: string }) : null))
-
-        await prisma.mailIntegration.upsert({
-          where: { inboxId_provider: { inboxId: state.inboxId, provider: "GMAIL" } },
-          update: {
-            status: "CONNECTED",
-            accessToken: tokens.access_token,
-            refreshToken: tokens.refresh_token || undefined,
-            scopes: (tokens.scope || "").split(" ").filter(Boolean),
-            tokenExpiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null,
-            externalEmail: userInfo?.email || null,
-            lastSyncError: null,
-          },
-          create: {
-            workspaceId: state.workspaceId,
-            inboxId: state.inboxId,
-            provider: "GMAIL",
-            status: "CONNECTED",
-            accessToken: tokens.access_token,
-            refreshToken: tokens.refresh_token || null,
-            scopes: (tokens.scope || "").split(" ").filter(Boolean),
-            tokenExpiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null,
-            externalEmail: userInfo?.email || null,
-          },
+        await upsertGmailIntegration({
+          workspaceId: state.workspaceId,
+          inboxId: state.inboxId,
+          accessToken: tokens.access_token!,
+          refreshToken: tokens.refresh_token,
+          scopes: (tokens.scope || "").split(" ").filter(Boolean),
+          tokenExpiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null,
+          externalEmail: userInfo.email,
         })
 
         return NextResponse.redirect(new URL(`${frontendRedirect}?gmail=connected`, request.url))
@@ -571,7 +653,7 @@ export async function GET(request: NextRequest) {
         client_id: clientId,
         redirect_uri: redirectUri,
         response_type: "code",
-        scope: getGoogleScopes(),
+        scope: getGmailOAuthScopeString(),
         access_type: "offline",
         prompt: "consent",
         state: encodeState({

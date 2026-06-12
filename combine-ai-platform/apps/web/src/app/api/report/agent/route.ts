@@ -1,14 +1,51 @@
 import { NextResponse, type NextRequest } from "next/server"
+import type { Prisma } from "@prisma/client"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
 import { mockReportExtraction } from "@/lib/server/mock-extraction"
-import { extractTextFromDocument } from "@/lib/server/document-text"
+import { extractTextFromDocument, validateDocumentText } from "@/lib/server/document-text"
 import { searchKnowledgeChunks, type KnowledgeSearchResult } from "@/lib/server/knowledge-search"
 import { extractKbHighlightPhrases } from "@/lib/server/kb-highlight-phrases"
-import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { buildReportDocx } from "@/lib/server/report-docx-export"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { getDashScopeProvider, ensureAiEnvLoaded } from "@combine-ai/ai-provider/server"
+import path from "path"
+import fs from "fs"
 
 export const dynamic = "force-dynamic"
-export const maxDuration = 120
+export const maxDuration = 300
+
+// ── File Storage ───────────────────────────────────────────────
+
+const REPORTS_DATA_DIR = path.resolve(process.cwd(), "data", "reports")
+
+function ensureSessionDir(sessionId: string): string {
+  const dir = path.join(REPORTS_DATA_DIR, sessionId)
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+function saveUploadedFile(sessionId: string, buffer: Buffer, fileName: string): string {
+  const dir = ensureSessionDir(sessionId)
+  // Sanitize filename and keep extension
+  const ext = path.extname(fileName) || ".bin"
+  const safeFileName = `file${ext}`
+  const filePath = path.join(dir, safeFileName)
+  fs.writeFileSync(filePath, buffer)
+  return filePath
+}
+
+function getStoredFilePath(sessionId: string): string | null {
+  const dir = path.join(REPORTS_DATA_DIR, sessionId)
+  if (!fs.existsSync(dir)) return null
+  const entries = fs.readdirSync(dir)
+  // Return first file found (there should be only one: "file.pdf" etc.)
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry)
+    if (fs.statSync(fullPath).isFile()) return fullPath
+  }
+  return null
+}
 
 // ── AI Provider ───────────────────────────────────────────────
 
@@ -20,6 +57,7 @@ async function callAI(req: {
   messages: Array<{ role: string; content: string | unknown[] }>
   tools?: unknown[]
 }) {
+  ensureAiEnvLoaded()
   const provider = getDashScopeProvider()
   return provider.createCompletion({
     model: req.model || DEFAULT_MODELS.report,
@@ -48,7 +86,7 @@ Rules:
 8. Preserve exact values — do not modify, summarize, or translate.
 9. Flag any unclear or ambiguous text with "⚠️" prefix.
 10. When possible, identify the page number (1-based) where each field appears in the document and include it as the "page" field in the row.
-11. For PDF highlighting: "value" must match the document text EXACTLY (same punctuation, currency symbols, spacing). For amounts, dates, titles, and reference numbers, "page" is REQUIRED.
+11. For PDF highlighting: "value" must match the document text EXACTLY (same punctuation, currency symbols, spacing). "field" should use the label text as it appears in the PDF when visible (e.g. "Invoice Date", not a paraphrase), so field+value can be highlighted together. For amounts, dates, titles, and reference numbers, "page" is REQUIRED.
 
 Respond ONLY with valid JSON:
 {
@@ -78,7 +116,7 @@ User instructions:
 Apply the user's instructions to modify the rows. You may:
 - Add new rows
 - Update existing rows' field names or values
-- Remove rows as requested
+- Remove rows as requested (e.g. "刪除第 3 行", "delete row 3", "remove rows containing 備註")
 - Reorganize or reformat data
 
 Respond ONLY with valid JSON:
@@ -142,31 +180,6 @@ function sseEvent(event: string, data: Record<string, unknown>): string {
 
 type ExtractRow = { field: string; value: string; page?: number }
 
-function highlightRowScore(row: ExtractRow): number {
-  let score = 0
-  if (row.page && row.page >= 1) score += 100
-  const v = row.value?.trim() || ""
-  if (v.length >= 2 && v.length <= 80) score += 20
-  if (/\d/.test(v)) score += 10
-  if (/[$¥€£]|HKD|USD|CNY/i.test(v)) score += 15
-  if (/\d{4}[-/]\d{1,2}/.test(v)) score += 10
-  score -= Math.min(v.length, 100)
-  return score
-}
-
-const HIGHLIGHT_SOFT_CAP = 60
-
-function selectHighlightRows(rows: ExtractRow[], limit = HIGHLIGHT_SOFT_CAP): ExtractRow[] {
-  const filtered = [...rows].filter((r) => {
-    const v = r.value?.trim() || ""
-    return v.length >= 2 && v.length <= 80
-  })
-  if (filtered.length <= limit) return filtered
-  return filtered
-    .sort((a, b) => highlightRowScore(b) - highlightRowScore(a))
-    .slice(0, limit)
-}
-
 async function saveStreamExtraction(
   session: { workspaceId: string },
   sessionId: string,
@@ -182,7 +195,7 @@ async function saveStreamExtraction(
       await prisma.reportSession.update({
         where: { id: sessionId },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        data: { rows: rows as any, status: "active" },
+        data: { rows: rows as any, status: "completed" },
       })
       await prisma.reportConversationTurn.createMany({
         data: [
@@ -216,7 +229,8 @@ async function extractDocumentTextFromBase64(
   try {
     const text = await extractTextFromDocument(buffer, fileName, mimeType)
     return text || undefined
-  } catch {
+  } catch (err) {
+    console.error("Document text extraction failed:", fileName, err)
     return undefined
   }
 }
@@ -346,6 +360,18 @@ async function performReportSummary(
   }
 }
 
+// ── Background Job Runner ──────────────────────────────────────
+
+/**
+ * Run an extraction task in the background, detached from the HTTP request lifecycle.
+ * The caller immediately returns to the client; this continues in-process.
+ */
+function runBackgroundJob(fn: () => Promise<void>, label: string) {
+  setImmediate(() => {
+    fn().catch((err) => console.error(`[Background Job] ${label} failed:`, err))
+  })
+}
+
 // ── POST Handler ──────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
@@ -359,10 +385,11 @@ export async function POST(request: NextRequest) {
     const contentType = request.headers.get("content-type") || ""
 
     // ── Multipart file upload ──
+    // stream=1 → SSE real-time extraction; otherwise → background job
     if (contentType.includes("multipart/form-data")) {
       return stream
         ? handleStreamMultipartExtract(request, session)
-        : handleMultipartExtract(request, session)
+        : handleMultipartExtractBackground(request, session)
     }
 
     const body = (await request.json()) as Record<string, unknown>
@@ -371,7 +398,7 @@ export async function POST(request: NextRequest) {
       case "extract":
         return stream
           ? handleStreamExtract(session, body)
-          : handleExtract(session, body)
+          : handleExtractBackground(session, body)
 
       case "refine":
         return handleRefine(session, body)
@@ -406,7 +433,7 @@ async function handleStreamMultipartExtract(
   try {
     const formData = await request.formData()
     const file = formData.get("file") as File | null
-    const sessionId = formData.get("sessionId") as string | null
+    const sessionId = (formData.get("sessionId") as string) || `report-${Date.now()}`
     const instructions = formData.get("instructions") as string | null
     const model = formData.get("model") as string | null
 
@@ -415,25 +442,40 @@ async function handleStreamMultipartExtract(
     }
 
     const arrayBuffer = await file.arrayBuffer()
-    const base64 = Buffer.from(arrayBuffer).toString("base64")
+    const buffer = Buffer.from(arrayBuffer)
+    const base64 = buffer.toString("base64")
     const mimeType = file.type || "application/octet-stream"
     const dataUrl = `data:${mimeType};base64,${base64}`
 
+    // Save file to disk for later session viewing
+    try { saveUploadedFile(sessionId, buffer, file.name) } catch (err) {
+      console.error("Failed to save uploaded file:", err)
+    }
+
+    // Ensure session exists
+    await prisma.reportSession.upsert({
+      where: { id: sessionId },
+      create: {
+        id: sessionId,
+        workspaceId: session.workspaceId,
+        title: file.name || "New Report",
+        status: "processing",
+      },
+      update: { status: "processing", title: file.name || undefined },
+    })
+
     let documentText: string | undefined
     try {
-      documentText = await extractTextFromDocument(
-        Buffer.from(arrayBuffer),
-        file.name,
-        mimeType
-      )
-    } catch {
+      documentText = await extractTextFromDocument(buffer, file.name, mimeType)
+    } catch (err) {
+      console.error("Stream multipart document extraction failed:", file.name, err)
       documentText = undefined
     }
 
     return handleStreamExtract(session, {
       fileBase64: dataUrl,
       fileName: file.name,
-      sessionId: sessionId || undefined,
+      sessionId,
       instructions: instructions || undefined,
       documentText,
       model: model || undefined,
@@ -450,7 +492,7 @@ async function handleStreamMultipartExtract(
   }
 }
 
-async function handleMultipartExtract(request: NextRequest, session: { sub: string; workspaceId: string }) {
+async function handleMultipartExtractBackground(request: NextRequest, session: { sub: string; workspaceId: string }) {
   try {
     const formData = await request.formData()
     const file = formData.get("file") as File | null
@@ -461,31 +503,162 @@ async function handleMultipartExtract(request: NextRequest, session: { sub: stri
       return NextResponse.json({ error: "file is required" }, { status: 400 })
     }
 
-    // Convert file to base64
     const arrayBuffer = await file.arrayBuffer()
-    const base64 = Buffer.from(arrayBuffer).toString("base64")
+    const buffer = Buffer.from(arrayBuffer)
     const mimeType = file.type || "application/octet-stream"
-    const dataUrl = `data:${mimeType};base64,${base64}`
+    const effectiveSessionId = sessionId || `report-${Date.now()}`
+    const fileName = file.name
 
-    return performExtraction(session, {
-      fileBase64: dataUrl,
-      fileName: file.name,
-      sessionId: sessionId || undefined,
-      instructions: instructions || undefined,
+    // Save file to disk for session viewing
+    try { saveUploadedFile(effectiveSessionId, buffer, fileName) } catch (err) {
+      console.error("Failed to save uploaded file for background extraction:", err)
+    }
+
+    // Extract text from the document BEFORE starting background job
+    let documentText: string | undefined
+    let fileBase64: string | undefined
+    const isImage = mimeType.startsWith("image/")
+
+    if (isImage) {
+      // Images: pass as base64 for AI vision
+      const base64 = buffer.toString("base64")
+      fileBase64 = `data:${mimeType};base64,${base64}`
+    } else {
+      // PDF/DOCX/TXT: extract text now
+      try {
+        documentText = await extractTextFromDocument(buffer, fileName, mimeType)
+      } catch (err) {
+        console.error("Text extraction failed:", err)
+        return NextResponse.json({
+          error: "Failed to extract text from document",
+          detail: err instanceof Error ? err.message : "Unknown error",
+        }, { status: 422 })
+      }
+      if (!documentText || documentText.trim().length < 50) {
+        return NextResponse.json({
+          error: "Document contains insufficient readable text",
+          detail: `Extracted ${documentText?.length || 0} characters (minimum 50 required)`,
+        }, { status: 422 })
+      }
+    }
+
+    // Ensure session exists with processing status
+    await prisma.reportSession.upsert({
+      where: { id: effectiveSessionId },
+      create: {
+        id: effectiveSessionId,
+        workspaceId: session.workspaceId,
+        title: fileName || "New Report",
+        status: "processing",
+      },
+      update: { status: "processing", title: fileName || undefined },
+    })
+
+    // Return IMMEDIATELY — AI runs in background
+    runBackgroundJob(async () => {
+      try {
+        await performExtraction(session, {
+          fileBase64,
+          fileName,
+          sessionId: effectiveSessionId,
+          instructions: instructions || undefined,
+          documentText,
+        })
+      } catch (err) {
+        console.error("Background extraction failed:", err)
+        await prisma.reportSession.update({
+          where: { id: effectiveSessionId },
+          data: { status: "failed" },
+        }).catch(() => {})
+      }
+    }, `report-extract:${effectiveSessionId}`)
+
+    return NextResponse.json({
+      success: true,
+      sessionId: effectiveSessionId,
+      status: "processing",
+      message: `Extraction started (${documentText ? documentText.length + " chars" : "image analysis"}). Poll GET /api/report/sessions for status.`,
     })
   } catch (error) {
-    console.error("Multipart extraction error:", error)
+    console.error("Multipart extraction setup error:", error)
     return NextResponse.json(
-      {
-        error: "File processing failed",
-        detail: error instanceof Error ? error.message : "Unknown error",
-      },
+      { error: "File processing failed", detail: error instanceof Error ? error.message : "Unknown error" },
       { status: 500 }
     )
   }
 }
 
 // ── Standard Extraction ───────────────────────────────────────
+
+// Background version — creates session, returns immediately, runs AI in background
+async function handleExtractBackground(
+  session: { sub: string; workspaceId: string },
+  body: Record<string, unknown>
+) {
+  const sessionId = (body.sessionId as string) || `report-${Date.now()}`
+  const fileBase64 = body.fileBase64 as string | undefined
+  const fileName = (body.fileName as string) || "Report Document"
+  const instructions = body.instructions as string | undefined
+  const documentText = body.documentText as string | undefined
+  const model = body.model as string | undefined
+
+  if (!fileBase64 && !documentText) {
+    return NextResponse.json({ error: "fileBase64 or documentText required" }, { status: 400 })
+  }
+
+  // Save file to disk for session viewing (if base64 provided)
+  if (fileBase64) {
+    try {
+      const match = fileBase64.match(/^data:([^;]+);base64,([\s\S]+)$/)
+      if (match) {
+        const ext = match[1].split("/")[1] || "bin"
+        saveUploadedFile(sessionId, Buffer.from(match[2], "base64"), `${fileName}.${ext}`)
+      }
+    } catch (err) {
+      console.error("Failed to save file for background extraction:", err)
+    }
+  }
+
+  // Create/update session with processing status
+  await prisma.reportSession.upsert({
+    where: { id: sessionId },
+    create: {
+      id: sessionId,
+      workspaceId: session.workspaceId,
+      userId: session.sub,
+      title: fileName,
+      status: "processing",
+    },
+    update: { status: "processing", title: fileName },
+  })
+
+  // Run AI in background
+  runBackgroundJob(async () => {
+    try {
+      await performExtraction(session, {
+        fileBase64,
+        fileName,
+        sessionId,
+        instructions,
+        documentText,
+        model,
+      })
+    } catch (err) {
+      console.error("Background extraction failed:", err)
+      await prisma.reportSession.update({
+        where: { id: sessionId },
+        data: { status: "failed" },
+      }).catch(() => {})
+    }
+  }, `report-extract:${sessionId}`)
+
+  return NextResponse.json({
+    success: true,
+    sessionId,
+    status: "processing",
+    message: "Extraction started. Poll GET /api/report/sessions for status.",
+  })
+}
 
 async function handleExtract(
   session: { sub: string; workspaceId: string },
@@ -526,6 +699,11 @@ async function performExtraction(
   params: ExtractionParams
 ) {
   const { fileBase64, fileName, sessionId, instructions, documentText, model } = params
+
+  // Set session to processing
+  if (sessionId) {
+    try { await prisma.reportSession.update({ where: { id: sessionId }, data: { status: "processing" } }) } catch { /* best-effort */ }
+  }
 
   // Build messages
   const messages: Array<{ role: string; content: Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }> }> = [
@@ -635,7 +813,7 @@ async function performExtraction(
         await prisma.reportSession.update({
           where: { id: sessionId },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          data: { rows: rows as any, status: "active" },
+          data: { rows: rows as any, status: "completed" },
         })
 
         // Create conversation turns
@@ -679,6 +857,25 @@ async function performExtraction(
     console.error("Failed to create AgentRun:", dbErr)
   }
 
+  // Generate summary in background (don't block the response)
+  runBackgroundJob(async () => {
+    try {
+      const summaryResult = await performReportSummary(session, {
+        documentText: documentText as string | undefined,
+        fileName: fileName as string | undefined,
+        documentType: extracted.documentType,
+        title: extracted.title,
+        rows: rows as Array<{ field: string; value: string }>,
+      })
+      await prisma.reportSession.update({
+        where: { id: sessionId },
+        data: { summary: summaryResult as unknown as Prisma.InputJsonValue },
+      })
+    } catch (err) {
+      console.error("Background summary generation failed:", err)
+    }
+  }, `report-summary:${sessionId}`)
+
   return NextResponse.json({
     rows,
     documentType: extracted.documentType,
@@ -695,7 +892,7 @@ async function handleStreamExtract(
   session: { sub: string; workspaceId: string },
   body: Record<string, unknown>
 ) {
-  const sessionId = body.sessionId as string | undefined
+  const effectiveSessionId = (body.sessionId as string) || `report-${Date.now()}`
   const fileBase64 = body.fileBase64 as string | undefined
   const fileName = body.fileName as string | undefined
   const instructions = body.instructions as string | undefined
@@ -705,6 +902,33 @@ async function handleStreamExtract(
   if (!fileBase64 && !documentText) {
     return NextResponse.json({ error: "fileBase64 or documentText required" }, { status: 400 })
   }
+
+  // Save file to disk for session viewing (if base64 provided and not already saved by multipart handler)
+  if (fileBase64) {
+    try {
+      const match = fileBase64.match(/^data:([^;]+);base64,([\s\S]+)$/)
+      if (match && !getStoredFilePath(effectiveSessionId)) {
+        const ext = match[1].split("/")[1] || "bin"
+        saveUploadedFile(effectiveSessionId, Buffer.from(match[2], "base64"), `${fileName || "file"}.${ext}`)
+      }
+    } catch (err) {
+      console.error("Failed to save file in stream extract:", err)
+    }
+  }
+
+  // Ensure session exists
+  try {
+    await prisma.reportSession.upsert({
+      where: { id: effectiveSessionId },
+      create: {
+        id: effectiveSessionId,
+        workspaceId: session.workspaceId,
+        title: fileName || "New Report",
+        status: "processing",
+      },
+      update: { status: "processing", title: fileName || undefined },
+    })
+  } catch { /* best-effort */ }
 
   const encoder = new TextEncoder()
 
@@ -730,6 +954,19 @@ async function handleStreamExtract(
           )
         }
 
+        const isImageUpload = Boolean(fileBase64?.startsWith("data:image/"))
+        if (!isImageUpload) {
+          const validationError = validateDocumentText(resolvedDocumentText)
+          if (validationError) {
+            send("error", {
+              error: "Text extraction failed",
+              detail: validationError,
+              code: "TEXT_EXTRACTION_FAILED",
+            })
+            return
+          }
+        }
+
         // Start KB search in parallel with extraction (overlaps embedding latency)
         const kbSearchQuery = [
           fileName,
@@ -742,7 +979,7 @@ async function handleStreamExtract(
           ? searchKnowledgeChunks(session.workspaceId, kbSearchQuery, { limit: 5 })
           : Promise.resolve({ chunks: [], searchType: "keyword" })
 
-        // Step 1: Sending to AI
+        // Set session to processing (session was already upserted above)
         send("trace", {
           trace: {
             id: "report-extract-start",
@@ -858,7 +1095,6 @@ async function handleStreamExtract(
         }
 
         const rows = (extracted.rows || []) as ExtractRow[]
-        const highlightRows = selectHighlightRows(rows)
 
         send("trace", {
           trace: {
@@ -874,8 +1110,8 @@ async function handleStreamExtract(
         // Send extraction result immediately so PDF highlights can start
         send("result", {
           result: {
+            sessionId: effectiveSessionId,
             rows,
-            highlightRows,
             documentType: extracted.documentType,
             title: extracted.title,
             metadata: extracted.metadata,
@@ -886,16 +1122,14 @@ async function handleStreamExtract(
           },
         })
 
-        // Persist to DB without blocking summary / highlight
-        if (sessionId) {
-          void saveStreamExtraction(
-            session,
-            sessionId,
-            fileName as string | undefined,
-            rows,
-            extracted as Record<string, unknown>
-          )
-        }
+        // Persist to DB — await to ensure it completes
+        await saveStreamExtraction(
+          session,
+          effectiveSessionId,
+          fileName as string | undefined,
+          rows,
+          extracted as Record<string, unknown>
+        ).catch((err) => console.error("Failed to save stream extraction:", err))
 
         // Step 2: KB-aware summary (KB search already in flight)
         send("trace", {
@@ -940,6 +1174,16 @@ async function handleStreamExtract(
         })
 
         send("summary", { summary: summaryResult })
+
+        // Persist summary to DB so it's available on subsequent page loads
+        try {
+          await prisma.reportSession.update({
+            where: { id: effectiveSessionId },
+            data: { summary: summaryResult as unknown as Prisma.InputJsonValue },
+          })
+        } catch (err) {
+          console.error("Failed to persist summary to session:", err)
+        }
       } catch (error) {
         console.error("Stream extraction error:", error)
         send("error", {
@@ -1058,19 +1302,21 @@ async function handleSummarize(
 
 // ── Generate Full Report ──────────────────────────────────────
 
-const REPORT_GENERATE_PROMPT = `你是香港企業的報告撰寫助手。根據文件內容、郵件背景（如有）與知識庫參考資料，撰寫完整繁體中文分析報告。
+const REPORT_GENERATE_PROMPT = `你是香港企業的高級分析師，負責撰寫可直接呈交上司的正式內部報告（繁體中文）。
 
 要求：
-1. 以 Markdown 格式輸出，包含以下章節（標題使用 ##）：
-   - 報告概要
-   - 郵件／文件背景（若無郵件背景則改為「文件背景」）
-   - 重點發現（條列，引用抽取欄位中的具體數據）
-   - 知識庫政策對照與合規注意事項
+1. 語氣專業、客觀、簡潔，結論先行；像資深同事寫給管理層的備忘錄，而非 AI 分析摘要
+2. 禁止使用：「AI 分析」「知識庫搜尋」「產生時間」「本報告由…生成」等元描述
+3. 以 Markdown 格式輸出正文（## 章節標題），建議章節：
+   - 報告標題（一句話）
+   - 背景及目的
+   - 主要發現（引用具體數據與事實，條列）
+   - 風險與合規事項
    - 建議行動
-   - 附錄：參考條文
-2. 知識庫條文須在正文中引用並說明關聯；附錄列出所有參考條文
-3. 語氣專業、條理清晰，每章節 2-6 段或條列
-4. 僅回傳 Markdown 正文，不要 JSON 包裝，不要 code fence`
+   - 結論
+4. 政策／合規內容自然融入正文，不要單獨列出「參考條文清單」或技術性附錄
+5. 每章節 2–5 段或條列，可直接複製到 Word 使用
+6. 僅回傳 Markdown 正文，不要 JSON，不要 code fence`
 
 async function performReportGenerate(
   session: { workspaceId: string },
@@ -1083,7 +1329,7 @@ async function performReportGenerate(
     reportSummary?: ReportSummaryResult
     emailContext?: { subject?: string; sender?: string; body?: string }
   }
-): Promise<{ markdown: string; fileName: string }> {
+): Promise<{ docxBase64: string; fileName: string }> {
   const { documentText, fileName, documentType, title, rows, reportSummary, emailContext } = params
 
   let reportContent = documentText?.trim() || ""
@@ -1180,59 +1426,55 @@ async function performReportGenerate(
       ],
     })
 
-    let markdown = result.messageContent.trim()
-    markdown = markdown.replace(/^```(?:markdown|md)?\s*|\s*```$/g, "").trim()
+    let bodyText = result.messageContent.trim()
+    bodyText = bodyText.replace(/^```(?:markdown|md)?\s*|\s*```$/g, "").trim()
 
-    const header = [
-      `# 分析報告 — ${baseName}`,
-      "",
-      `> 產生時間：${new Date().toLocaleString("zh-HK", { timeZone: "Asia/Hong_Kong" })}`,
-      emailContext?.sender ? `> 郵件來源：${emailContext.sender}` : "",
-      "",
-    ]
-      .filter(Boolean)
-      .join("\n")
+    const reportTitle = title || fileName || emailContext?.subject || "內部報告"
+    const docxBuffer = await buildReportDocx({
+      title: reportTitle.replace(/\.[^.]+$/, ""),
+      bodyText,
+    })
 
     return {
-      markdown: header + markdown,
-      fileName: `report-${safeName}-${Date.now()}.md`,
+      docxBase64: docxBuffer.toString("base64"),
+      fileName: `report-${safeName}-${Date.now()}.docx`,
     }
   } catch (err) {
     console.warn("Report generate AI unavailable:", (err as Error).message)
 
-    const fallbackSections = [
-      `# 分析報告 — ${baseName}`,
-      "",
-      `> 產生時間：${new Date().toLocaleString("zh-HK", { timeZone: "Asia/Hong_Kong" })}`,
-      "",
-      "## 報告概要",
-      reportSummary?.summary || reportContent.slice(0, 500) || "無法取得報告內容。",
-      "",
-      "## 郵件／文件背景",
+    const fallbackBody = [
+      "## 背景及目的",
       emailContext
-        ? `主旨：${emailContext.subject || ""}\n寄件人：${emailContext.sender || ""}`
-        : fileName || "（無背景資訊）",
+        ? `本報告就「${emailContext.subject || "相關郵件"}」所附文件作出摘要，供管理層審閱。`
+        : fileName
+          ? `本報告就「${fileName}」所載內容作出摘要，供管理層審閱。`
+          : "本報告就相關文件內容作出摘要，供管理層審閱。",
       "",
-      "## 重點發現",
-      extractedFields,
+      "## 主要發現",
+      reportSummary?.summary || reportContent.slice(0, 500) || "請參閱附件及抽取欄位。",
       "",
-      "## 知識庫政策對照與合規注意事項",
-      reportSummary?.keyPoints?.map((p) => `- ${p}`).join("\n") || "（AI 暫不可用）",
+      extractedFields !== "（無抽取欄位）" ? extractedFields : "",
+      "",
+      "## 風險與合規事項",
+      reportSummary?.keyPoints?.map((p) => `- ${p}`).join("\n") || "請人工覆核相關合規要求。",
       "",
       "## 建議行動",
-      "- 請人工覆核上述重點與知識庫條文",
+      "- 請管理層確認上述重點及建議後，指示後續跟進。",
       "",
-      "## 附錄：參考條文",
-      chunks.length > 0
-        ? chunks
-            .map((c) => `- **${c.articleTitle}** (${c.knowledgeBaseName})\n  ${c.excerpt.slice(0, 200)}`)
-            .join("\n")
-        : "（知識庫中未找到相關條文）",
+      "## 結論",
+      reportSummary?.summary?.slice(0, 200) || "綜上，建議按上述行動跟進。",
     ]
+      .filter(Boolean)
+      .join("\n")
+
+    const docxBuffer = await buildReportDocx({
+      title: (title || fileName || "內部報告").replace(/\.[^.]+$/, ""),
+      bodyText: fallbackBody,
+    })
 
     return {
-      markdown: fallbackSections.join("\n"),
-      fileName: `report-${safeName}-${Date.now()}.md`,
+      docxBase64: docxBuffer.toString("base64"),
+      fileName: `report-${safeName}-${Date.now()}.docx`,
     }
   }
 }

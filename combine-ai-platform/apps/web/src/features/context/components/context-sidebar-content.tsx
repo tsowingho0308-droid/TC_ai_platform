@@ -2,9 +2,9 @@
 
 import { useEffect, useState, useCallback } from "react"
 import Link from "next/link"
-import { usePathname } from "next/navigation"
+import { useSearchParams } from "next/navigation"
 import { cn } from "@combine-ai/shared-ui"
-import { BookOpen, FileText, FolderOpen, Database } from "lucide-react"
+import { FileText, FolderOpen, Database } from "lucide-react"
 
 interface KnowledgeBase {
   id: string
@@ -23,7 +23,9 @@ const DEPARTMENT_ICONS: Record<string, string> = {
 }
 
 export function ContextSidebarContent() {
-  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const activeDepartment = searchParams.get("department") || ""
+
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -60,6 +62,21 @@ export function ContextSidebarContent() {
         <h3 className="mb-1 px-2 text-xs font-semibold tracking-wider text-muted-foreground uppercase">
           Knowledge Bases
         </h3>
+
+        {/* All Documents */}
+        <Link
+          href="/context"
+          className={cn(
+            "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors",
+            activeDepartment === ""
+              ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+              : "text-sidebar-foreground hover:bg-sidebar-accent/50"
+          )}
+        >
+          <FileText className="h-4 w-4" />
+          <span className="truncate">All Documents</span>
+        </Link>
+
         {loading ? (
           <div className="space-y-2 px-2 py-2">
             {[1, 2, 3].map((i) => (
@@ -83,13 +100,13 @@ export function ContextSidebarContent() {
             No knowledge bases yet.
           </div>
         ) : (
-          <nav className="space-y-0.5">
+          <nav className="space-y-0.5 mt-1">
             {knowledgeBases.map((kb) => {
-              const isActive = pathname === `/context/knowledge/${kb.slug}`
+              const isActive = activeDepartment === kb.department
               return (
                 <Link
                   key={kb.id}
-                  href={`/context/knowledge/${kb.slug}`}
+                  href={`/context?department=${kb.department}`}
                   className={cn(
                     "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors",
                     isActive
@@ -107,24 +124,6 @@ export function ContextSidebarContent() {
             })}
           </nav>
         )}
-      </div>
-
-      {/* Quick Actions */}
-      <div className="border-t pt-3">
-        <Link
-          href="/context"
-          className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
-        >
-          <FileText className="h-4 w-4" />
-          All Documents
-        </Link>
-        <Link
-          href="/context?upload=true"
-          className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
-        >
-          <BookOpen className="h-4 w-4" />
-          Upload Document
-        </Link>
       </div>
     </div>
   )

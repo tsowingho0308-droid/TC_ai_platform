@@ -21,6 +21,7 @@ export async function GET() {
         status: true,
         updatedAt: true,
         rows: true,
+        summary: true,
         draftNote: true,
       },
     })
@@ -104,10 +105,11 @@ export async function PATCH(request: Request) {
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
   try {
-    const { id, title, rows, draftNote, status: newStatus } = (await request.json()) as {
+    const { id, title, rows, summary, draftNote, status: newStatus } = (await request.json()) as {
       id?: string
       title?: string
       rows?: Array<{ field: string; value: string }>
+      summary?: Record<string, unknown>
       draftNote?: string
       status?: string
     }
@@ -127,6 +129,7 @@ export async function PATCH(request: Request) {
     const updateData: Record<string, unknown> = {}
     if (title !== undefined) updateData.title = title
     if (rows !== undefined) updateData.rows = rows as Prisma.InputJsonValue
+    if (summary !== undefined) updateData.summary = summary as Prisma.InputJsonValue
     if (draftNote !== undefined) updateData.draftNote = draftNote
     if (newStatus !== undefined) updateData.status = newStatus
 

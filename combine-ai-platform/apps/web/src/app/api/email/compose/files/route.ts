@@ -15,6 +15,28 @@ export const dynamic = "force-dynamic"
 const MAX_FILE_BYTES = 10 * 1024 * 1024
 const TEXT_EXCERPT_LIMIT = 8000
 
+function inferMimeType(rawType: string, fileName: string) {
+  if (rawType) return rawType
+  const lower = fileName.toLowerCase()
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg"
+  if (lower.endsWith(".png")) return "image/png"
+  if (lower.endsWith(".gif")) return "image/gif"
+  if (lower.endsWith(".webp")) return "image/webp"
+  if (lower.endsWith(".pdf")) return "application/pdf"
+  if (lower.endsWith(".txt")) return "text/plain"
+  if (lower.endsWith(".docx")) {
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  }
+  if (lower.endsWith(".doc")) return "application/msword"
+  if (lower.endsWith(".xlsx")) {
+    return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  }
+  if (lower.endsWith(".xls")) return "application/vnd.ms-excel"
+  if (lower.endsWith(".csv")) return "text/csv"
+  if (lower.endsWith(".zip")) return "application/zip"
+  return "application/octet-stream"
+}
+
 export async function POST(request: NextRequest) {
   const session = await requireSession().catch(() => null)
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
@@ -31,21 +53,17 @@ export async function POST(request: NextRequest) {
     }
 
     const fileName = file.name || "attachment"
-    const mimeType = file.type || "application/octet-stream"
-    if (!isSupportedDocumentMimeType(mimeType, fileName)) {
-      return NextResponse.json(
-        { error: "Unsupported file type. Use txt, pdf, doc, or docx." },
-        { status: 400 }
-      )
-    }
+    const mimeType = inferMimeType(file.type, fileName)
 
     const buffer = Buffer.from(await file.arrayBuffer())
     let textExcerpt = ""
-    try {
-      const text = await extractTextFromDocument(buffer, fileName, mimeType)
-      textExcerpt = text.slice(0, TEXT_EXCERPT_LIMIT)
-    } catch {
-      textExcerpt = ""
+    if (isSupportedDocumentMimeType(mimeType, fileName)) {
+      try {
+        const text = await extractTextFromDocument(buffer, fileName, mimeType)
+        textExcerpt = text.slice(0, TEXT_EXCERPT_LIMIT)
+      } catch {
+        textExcerpt = ""
+      }
     }
 
     const id = crypto.randomUUID()

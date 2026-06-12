@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
-import { generateEmbedding } from "@combine-ai/ai-provider"
+import { generateEmbedding } from "@combine-ai/ai-provider/server"
 
 export const dynamic = "force-dynamic"
 
@@ -38,23 +38,25 @@ export async function GET(request: NextRequest) {
     const vectorAvailable = await checkPgVector()
 
     if (vectorAvailable) {
-      // Semantic vector search
-      const embedding = await generateEmbedding(q)
+      // Semantic vector search — wrapped in try-catch for graceful fallback
+      // (embedding column may not exist after schema migrations)
+      try {
+        const embedding = await generateEmbedding(q)
 
-      const rawResults = await prisma.$queryRaw<
-        Array<{
-          chunk_id: string
-          content: string
-          chunk_index: number
-          article_id: string
-          article_title: string
-          knowledge_base_id: string
-          knowledge_base_name: string
-          knowledge_base_slug: string
-          department: string
-          similarity: number
-        }>
-      >`
+        const rawResults = await prisma.$queryRaw<
+          Array<{
+            chunk_id: string
+            content: string
+            chunk_index: number
+            article_id: string
+            article_title: string
+            knowledge_base_id: string
+            knowledge_base_name: string
+            knowledge_base_slug: string
+            department: string
+            similarity: number
+          }>
+        >`
         SELECT
           kc.id as chunk_id,
           kc.content,
@@ -71,7 +73,7 @@ export async function GET(request: NextRequest) {
         JOIN "KnowledgeBase" kb ON kb.id = ka."knowledgeBaseId"
         WHERE kb."workspaceId" = ${session.workspaceId}
           ${
-            department && department !== "GENERAL"
+            department
               ? prisma.$queryRaw`AND kb.department = ${department}::text`
               : prisma.$queryRaw`AND 1=1`
           }
@@ -79,62 +81,67 @@ export async function GET(request: NextRequest) {
         LIMIT ${limit}
       `
 
-      const results = rawResults.map((r) => ({
-        chunkId: r.chunk_id,
-        content: r.content,
-        chunkIndex: r.chunk_index,
-        articleId: r.article_id,
-        articleTitle: r.article_title,
-        knowledgeBaseId: r.knowledge_base_id,
-        knowledgeBaseName: r.knowledge_base_name,
-        knowledgeBaseSlug: r.knowledge_base_slug,
-        department: r.department,
-        similarity: Math.round(r.similarity * 100) / 100,
-        excerpt: r.content.slice(0, 300),
-      }))
+        const results = rawResults.map((r) => ({
+          chunkId: r.chunk_id,
+          content: r.content,
+          chunkIndex: r.chunk_index,
+          articleId: r.article_id,
+          articleTitle: r.article_title,
+          knowledgeBaseId: r.knowledge_base_id,
+          knowledgeBaseName: r.knowledge_base_name,
+          knowledgeBaseSlug: r.knowledge_base_slug,
+          department: r.department,
+          similarity: Math.round(r.similarity * 100) / 100,
+          excerpt: r.content.slice(0, 300),
+        }))
 
-      return NextResponse.json({ results, total: results.length, searchType: "semantic" })
-    } else {
-      // Fallback to keyword search
-      const articles = await prisma.knowledgeArticle.findMany({
-        where: {
-          knowledgeBase: {
-            workspaceId: session.workspaceId,
-            ...(department && department !== "GENERAL"
-              ? { department: department as any }
-              : {}),
-          },
-          OR: [
-            { title: { contains: q, mode: "insensitive" } },
-            { content: { contains: q, mode: "insensitive" } },
-            { tags: { hasSome: [q] } },
-          ],
-        },
-        include: {
-          knowledgeBase: {
-            select: { id: true, name: true, slug: true, department: true },
-          },
-        },
-        take: limit,
-        orderBy: { updatedAt: "desc" },
-      })
-
-      const results = articles.map((a) => ({
-        chunkId: null,
-        content: a.content,
-        chunkIndex: 0,
-        articleId: a.id,
-        articleTitle: a.title,
-        knowledgeBaseId: a.knowledgeBase.id,
-        knowledgeBaseName: a.knowledgeBase.name,
-        knowledgeBaseSlug: a.knowledgeBase.slug,
-        department: a.knowledgeBase.department,
-        similarity: 0,
-        excerpt: a.content.slice(0, 300),
-      }))
-
-      return NextResponse.json({ results, total: results.length, searchType: "keyword" })
+        if (results.length > 0) {
+          return NextResponse.json({ results, total: results.length, searchType: "semantic" })
+        }
+      } catch (err) {
+        console.warn("Vector search failed, falling back to keyword:", (err as Error).message)
+      }
     }
+
+    // Fallback to keyword search
+    const articles = await prisma.knowledgeArticle.findMany({
+      where: {
+        knowledgeBase: {
+          workspaceId: session.workspaceId,
+          ...(department
+            ? { department: department as any }
+            : {}),
+        },
+        OR: [
+          { title: { contains: q, mode: "insensitive" } },
+          { content: { contains: q, mode: "insensitive" } },
+          { tags: { hasSome: [q] } },
+        ],
+      },
+      include: {
+        knowledgeBase: {
+          select: { id: true, name: true, slug: true, department: true },
+        },
+      },
+      take: limit,
+      orderBy: { updatedAt: "desc" },
+    })
+
+    const results = articles.map((a) => ({
+      chunkId: null,
+      content: a.content,
+      chunkIndex: 0,
+      articleId: a.id,
+      articleTitle: a.title,
+      knowledgeBaseId: a.knowledgeBase.id,
+      knowledgeBaseName: a.knowledgeBase.name,
+      knowledgeBaseSlug: a.knowledgeBase.slug,
+      department: a.knowledgeBase.department,
+      similarity: 0,
+      excerpt: a.content.slice(0, 300),
+    }))
+
+    return NextResponse.json({ results, total: results.length, searchType: "keyword" })
   } catch (error) {
     console.error("Context search API error:", error)
     return NextResponse.json(

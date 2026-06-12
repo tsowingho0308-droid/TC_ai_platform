@@ -26,7 +26,7 @@ export async function GET(request: NextRequest) {
       where.knowledgeBaseId = knowledgeBaseId
     }
 
-    if (department && department !== "GENERAL") {
+    if (department) {
       where.knowledgeBase = {
         ...(where.knowledgeBase as Record<string, unknown>),
         department: department,
@@ -135,7 +135,8 @@ export async function POST(request: NextRequest) {
       try {
         const { extractText } = await import("@/lib/server/document-processor")
         const sampleText = await extractText(buffer, file.type)
-        const { getDashScopeProvider, DEFAULT_MODELS } = await import("@combine-ai/ai-provider")
+        const { DEFAULT_MODELS } = await import("@combine-ai/ai-provider")
+        const { getDashScopeProvider } = await import("@combine-ai/ai-provider/server")
         const provider = getDashScopeProvider()
 
         const result = await provider.createCompletion({
@@ -165,10 +166,11 @@ Assign to ONE OR MORE departments based on content:
 - **HR**: leave, benefits, training, recruitment, performance, employee relations, payroll
 - **IT**: software, hardware, VPN, security, email systems, cloud, infrastructure, technical specifications
 - **ADMIN**: facilities, access cards, travel, office supplies, visitors, meeting rooms
-- **FINANCE**: expenses, procurement, budget, invoices, tax, payments, pricing, financial terms
+- **FINANCE**: expenses, procurement, budget, invoices, tax, payments, pricing, financial terms, tenders, RFPs, RFQs, bidding, quotations, contracts
 - **GENERAL**: company-wide policies, handbook, holidays, compliance, emergency
 
-Example: An IT infrastructure tender → category: "Tender", departments: ["IT", "FINANCE"] (IT for technical scope, FINANCE for budget/procurement)
+IMPORTANT: All tender/RFP/RFQ/bidding/procurement documents MUST be assigned to FINANCE as the primary department. Tender documents are always managed by the Finance department.
+Example: An IT infrastructure tender → category: "Tender", departments: ["FINANCE"] (tender documents are Finance responsibility)
 Example: An expense policy document → category: "Policy", departments: ["FINANCE", "GENERAL"]
 
 Return ONLY valid JSON:
@@ -280,7 +282,8 @@ Return ONLY valid JSON:
     let aiSummary: string | null = null
 
     try {
-      const { getDashScopeProvider, DEFAULT_MODELS } = await import("@combine-ai/ai-provider")
+      const { DEFAULT_MODELS } = await import("@combine-ai/ai-provider")
+      const { getDashScopeProvider } = await import("@combine-ai/ai-provider/server")
       const { buildTaxonomyPrompt, PREDEFINED_TAGS } = await import("@/lib/server/tag-taxonomy")
 
       const provider = getDashScopeProvider()
@@ -320,7 +323,10 @@ ${taxonomyText}
 
 Return: { "tags": [{"tag": "tag-name", "confidence": 0.9, "reason": "short reason"}], "suggestedDocumentType": "STANDARD|PLAYBOOK|PROCESS_MAP|FAQ", "summary": "one-line summary in the document's language" }`,
           },
-          { role: "user", content: `Analyze and suggest tags:\n\n${truncatedText}` },
+          {
+            role: "user",
+            content: `Filename: ${article!.sourceDocName || article!.title}\n\nAnalyze and suggest tags:\n\n${truncatedText}`,
+          },
         ],
       })
 
@@ -331,6 +337,32 @@ Return: { "tags": [{"tag": "tag-name", "confidence": 0.9, "reason": "short reaso
       aiSuggestedDepartment = parsed.suggestedDepartment || null
       aiSuggestedDocumentType = parsed.suggestedDocumentType || null
       aiSummary = parsed.summary || null
+
+      // ── Filename keyword fallback ──────────────────────────
+      // If filename contains obvious type keywords, add them as tags
+      const fileName = (article!.sourceDocName || article!.title).toLowerCase()
+      const existingTags = new Set(aiSuggestedTags.map((t) => t.tag))
+      const FILENAME_TAG_HINTS: Record<string, string> = {
+        report: "report",
+        tender: "tender",
+        rfp: "tender",
+        rfq: "tender",
+        invoice: "invoice-doc",
+        receipt: "invoice-doc",
+        contract: "contract",
+        agreement: "contract",
+        policy: "policy-doc",
+        handbook: "handbook",
+        manual: "manual",
+        form: "form",
+        application: "form",
+        email: "email-thread",
+      }
+      for (const [keyword, tag] of Object.entries(FILENAME_TAG_HINTS)) {
+        if (fileName.includes(keyword) && !existingTags.has(tag)) {
+          aiSuggestedTags.push({ tag, confidence: 0.95, reason: `Filename contains "${keyword}"` })
+        }
+      }
 
       // Apply AI suggestions to the article if no user-specified tags were provided
       if (aiSuggestedTags.length > 0) {

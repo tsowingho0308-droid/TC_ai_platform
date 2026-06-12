@@ -276,6 +276,7 @@ model Conversation {
   labels       String[]
   replyTo      String
   sourceProvider MailProvider?
+  providerMessageId String?
   providerThreadId String?
   aiTriagedAt   DateTime?
   aiRouteConfidence Float?
@@ -311,7 +312,7 @@ model Conversation {
   @@index([workspaceId, parentConversationId, createdAt])
   @@index([workspaceId, parentConversationId, departmentReviewStatus])
   @@index([workspaceId, departmentSubmittedById])
-  @@unique([inboxId, sourceProvider, providerThreadId])
+  @@unique([inboxId, sourceProvider, providerMessageId])
 }
 
 model InboxMembership {
@@ -365,12 +366,13 @@ model MessageAttachment {
   sourceProvider       MailProvider?
   providerMessageId    String?
   providerAttachmentId String?
+  contentId            String?
   createdAt            DateTime @default(now())
   workspace            Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   conversation         Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   message              Message      @relation(fields: [messageId], references: [id], onDelete: Cascade)
 
-  @@unique([workspaceId, messageId, providerAttachmentId, fileName])
+  @@unique([workspaceId, messageId, providerAttachmentId])
   @@index([workspaceId, conversationId])
   @@index([workspaceId, messageId])
 }
@@ -566,6 +568,7 @@ model ReportSession {
   title       String
   status      String   @default("active") // active, completed, archived
   rows        Json?    // Array<{field: string, value: string}>
+  summary     Json?    // ReportSummary { summary, keyPoints, kbReferences, searchType }
   draftNote   String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -872,6 +875,7 @@ model HelpdeskConversation {
   status      HelpdeskConversationStatus   @default(ACTIVE)
   department  HelpdeskDepartment           @default(GENERAL)
   ticketId    String?
+  messages    Json?                        // Array<{role, content, thinking?, sources?, needsEscalation?, suggestedDepartment?}>
   createdAt   DateTime                     @default(now())
   updatedAt   DateTime                     @updatedAt
   workspace   Workspace                    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)

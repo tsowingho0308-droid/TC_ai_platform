@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
-import { Loader2, Bot, Send, FileText, ExternalLink, Paperclip, PencilLine } from "lucide-react"
+import { Loader2, Bot, Send, FileText, ExternalLink, Paperclip, PencilLine, Receipt } from "lucide-react"
 import {
   getConversation,
   generateReplySuggestion,
@@ -12,6 +12,7 @@ import {
 } from "../api/email-client"
 import { useCrossAgent } from "@/features/cross-agent/use-cross-agent"
 import { cn } from "@combine-ai/shared-ui"
+import { isInlineImageAttachment, prepareEmailHtml } from "@/lib/email-html"
 
 interface ConversationDetail {
   id: string
@@ -30,6 +31,7 @@ interface ConversationDetail {
     direction: string
     body: string
     bodyText: string | null
+    bodyHtml: string | null
     createdAt: string
   }>
   attachments: Array<{
@@ -38,6 +40,7 @@ interface ConversationDetail {
     mimeType: string
     sizeBytes: number
     messageId: string
+    contentId?: string | null
     createdAt: string
   }>
   inquiryTasks: Array<{
@@ -58,7 +61,7 @@ interface MailDisplayProps {
 
 export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
   const router = useRouter()
-  const { openInTenderAgent, openInReportAgent, createLink } = useCrossAgent()
+  const { openInTenderAgent, openInReportAgent, openInFinanceAgent, createLink } = useCrossAgent()
   const [conversation, setConversation] = useState<ConversationDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [replyDraft, setReplyDraft] = useState("")
@@ -68,6 +71,7 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
   const [triaging, setTriaging] = useState(false)
   const [openingTender, setOpeningTender] = useState(false)
   const [openingReport, setOpeningReport] = useState(false)
+  const [openingFinance, setOpeningFinance] = useState(false)
 
   useEffect(() => {
     if (!conversationId) {
@@ -220,6 +224,31 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
     }
   }
 
+  async function handleAnalyzeWithFinance() {
+    if (!conversationId || !conversation) return
+    setOpeningFinance(true)
+    try {
+      const primaryAttachment = getPrimaryDocumentAttachment()
+      await createLink({
+        sourceType: "email",
+        sourceId: conversationId,
+        targetType: "finance",
+        targetId: conversationId,
+        linkType: primaryAttachment ? "attachment" : "reference",
+      })
+      await openInFinanceAgent({
+        sourceId: conversationId,
+        subject: conversation.subject,
+        attachmentId: primaryAttachment?.id,
+        attachmentName: primaryAttachment?.fileName,
+      })
+    } catch (err) {
+      console.error("Failed to analyze with Finance:", err)
+    } finally {
+      setOpeningFinance(false)
+    }
+  }
+
   if (!conversationId) {
     return (
       <div className="flex h-full items-center justify-center text-muted-foreground">
@@ -330,12 +359,27 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
             <FileText className="h-3.5 w-3.5" />
             {openingReport ? "Opening..." : "Extract with Report"}
           </button>
+          <button
+            onClick={handleAnalyzeWithFinance}
+            disabled={openingFinance}
+            className="inline-flex items-center gap-1.5 rounded border px-2.5 py-1 text-xs hover:bg-accent disabled:opacity-50"
+          >
+            <Receipt className="h-3.5 w-3.5" />
+            {openingFinance ? "Opening..." : "Analyze with Finance"}
+          </button>
         </div>
       </header>
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {conversation.messages.map((msg) => (
+        {conversation.messages.map((msg) => {
+          const messageAttachments = attachments.filter((att) => att.messageId === msg.id)
+          const fileAttachments = messageAttachments.filter((att) => !isInlineImageAttachment(att))
+          const htmlBody = msg.bodyHtml
+            ? prepareEmailHtml(msg.bodyHtml, messageAttachments)
+            : null
+
+          return (
           <div key={msg.id} className="rounded-lg border p-4">
             <div className="mb-2 flex items-center justify-between text-xs text-muted-foreground">
               <span className="font-medium">
@@ -343,12 +387,17 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
               </span>
               <span>{new Date(msg.createdAt).toLocaleString()}</span>
             </div>
-            <div className="prose prose-sm max-w-none text-sm whitespace-pre-wrap">
-              {msg.bodyText || msg.body}
-            </div>
-            {attachments
-              .filter((att) => att.messageId === msg.id)
-              .map((att) => (
+            {htmlBody ? (
+              <div
+                className="prose prose-sm max-w-none text-sm [&_img]:max-w-full [&_img]:h-auto [&_a]:text-primary [&_a]:underline"
+                dangerouslySetInnerHTML={{ __html: htmlBody }}
+              />
+            ) : (
+              <div className="prose prose-sm max-w-none text-sm whitespace-pre-wrap">
+                {msg.bodyText || msg.body}
+              </div>
+            )}
+            {fileAttachments.map((att) => (
                 <a
                   key={att.id}
                   href={`/api/email/attachments?action=download&id=${encodeURIComponent(att.id)}`}
@@ -362,7 +411,8 @@ export function MailDisplay({ conversationId, onClose }: MailDisplayProps) {
                 </a>
               ))}
           </div>
-        ))}
+          )
+        })}
       </div>
 
       {/* Inquiry Tasks */}

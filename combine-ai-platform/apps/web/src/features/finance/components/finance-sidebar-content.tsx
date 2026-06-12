@@ -4,7 +4,12 @@ import { useEffect, useState, useCallback } from "react"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@combine-ai/shared-ui"
-import { Plus, Trash2, Receipt, GitCompare } from "lucide-react"
+import { Plus, Trash2, Receipt, GitCompare, Loader2 } from "lucide-react"
+import {
+  FINANCE_ANALYSIS_UPDATED,
+  getPendingFinanceAnalyses,
+  isFinanceAnalysisInProgress,
+} from "@/features/finance/finance-analysis-tracker"
 
 interface FinanceSessionSummary {
   id: string
@@ -20,6 +25,13 @@ export function FinanceSidebarContent() {
   const [sessions, setSessions] = useState<FinanceSessionSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
+  const [analyzingSessionIds, setAnalyzingSessionIds] = useState<string[]>(() =>
+    getPendingFinanceAnalyses().map((item) => item.sessionId)
+  )
+
+  const refreshAnalyzingState = useCallback(() => {
+    setAnalyzingSessionIds(getPendingFinanceAnalyses().map((item) => item.sessionId))
+  }, [])
 
   const activeSessionId = pathname.startsWith("/finance/")
     ? decodeURIComponent(pathname.split("/").pop() || "")
@@ -41,10 +53,16 @@ export function FinanceSidebarContent() {
 
   useEffect(() => {
     fetchSessions()
-    const handler = () => fetchSessions()
-    window.addEventListener("finance:sessions-updated", handler)
-    return () => window.removeEventListener("finance:sessions-updated", handler)
-  }, [fetchSessions])
+    refreshAnalyzingState()
+    const onSessionsUpdated = () => fetchSessions()
+    const onAnalysisUpdated = () => refreshAnalyzingState()
+    window.addEventListener("finance:sessions-updated", onSessionsUpdated)
+    window.addEventListener(FINANCE_ANALYSIS_UPDATED, onAnalysisUpdated)
+    return () => {
+      window.removeEventListener("finance:sessions-updated", onSessionsUpdated)
+      window.removeEventListener(FINANCE_ANALYSIS_UPDATED, onAnalysisUpdated)
+    }
+  }, [fetchSessions, refreshAnalyzingState])
 
   const handleCreateSession = useCallback(async (sessionType: string) => {
     const id = `finance-${Date.now()}`
@@ -61,6 +79,7 @@ export function FinanceSidebarContent() {
   }, [router])
 
   const handleDeleteSession = useCallback(async (sessionId: string) => {
+    if (isFinanceAnalysisInProgress(sessionId)) return
     if (pendingDelete === sessionId) {
       const res = await fetch(`/api/finance/sessions`, {
         method: "DELETE",
@@ -118,6 +137,8 @@ export function FinanceSidebarContent() {
           <nav className="space-y-0.5">
             {expenseSessions.map((session) => {
               const isActive = session.id === activeSessionId
+              const isAnalyzing =
+                analyzingSessionIds.includes(session.id) || session.status === "analyzing"
               return (
                 <div key={session.id} className="group relative">
                   <Link
@@ -129,10 +150,16 @@ export function FinanceSidebarContent() {
                         : "text-sidebar-foreground hover:bg-sidebar-accent/50"
                     )}
                   >
-                    <Receipt className="h-4 w-4 shrink-0" />
+                    {isAnalyzing ? (
+                      <Loader2 className="h-4 w-4 shrink-0 animate-spin text-primary" />
+                    ) : (
+                      <Receipt className="h-4 w-4 shrink-0" />
+                    )}
                     <div className="min-w-0 flex-1">
                       <p className="truncate">{session.title}</p>
-                      <p className="text-xs text-muted-foreground">{formatDate(session.updatedAt)}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {isAnalyzing ? "Analyzing..." : formatDate(session.updatedAt)}
+                      </p>
                     </div>
                   </Link>
                   <button
@@ -141,11 +168,18 @@ export function FinanceSidebarContent() {
                       e.stopPropagation()
                       handleDeleteSession(session.id)
                     }}
+                    disabled={isAnalyzing}
                     className={cn(
-                      "absolute right-1 top-1/2 -translate-y-1/2 rounded p-1 opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100",
+                      "absolute right-1 top-1/2 -translate-y-1/2 rounded p-1 opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30",
                       pendingDelete === session.id && "opacity-100 text-destructive bg-destructive/10"
                     )}
-                    title={pendingDelete === session.id ? "Click again to confirm delete" : "Delete session"}
+                    title={
+                      isAnalyzing
+                        ? "Cannot delete while analysis is running"
+                        : pendingDelete === session.id
+                          ? "Click again to confirm delete"
+                          : "Delete session"
+                    }
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>

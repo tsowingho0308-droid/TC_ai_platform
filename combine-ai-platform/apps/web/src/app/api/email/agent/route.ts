@@ -1,13 +1,14 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
-import { getDashScopeProvider, DEFAULT_MODELS, ALL_MODELS } from "@combine-ai/ai-provider"
+import { DEFAULT_MODELS, ALL_MODELS } from "@combine-ai/ai-provider"
+import { getDashScopeProvider } from "@combine-ai/ai-provider/server"
 
 export const dynamic = "force-dynamic"
 
 function resolveComposeModel(model: unknown) {
   if (typeof model !== "string" || !model.trim()) return DEFAULT_MODELS.email
-  const allowed = new Set(ALL_MODELS.map((m) => m.value))
+  const allowed = new Set<string>(ALL_MODELS.map((m) => m.value))
   return allowed.has(model) ? model : DEFAULT_MODELS.email
 }
 

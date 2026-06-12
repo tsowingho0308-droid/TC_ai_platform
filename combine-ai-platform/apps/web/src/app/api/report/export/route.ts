@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server"
 import { requireSession } from "@/lib/server/auth-helpers"
+import { prisma } from "@/lib/server/prisma"
+import {
+  buildBatchMarkdown,
+  buildBatchXlsx,
+} from "@/lib/server/report-batch-export"
 import * as XLSX from "xlsx"
 
 export const dynamic = "force-dynamic"
@@ -11,7 +16,7 @@ export async function POST(request: Request) {
   try {
     const body = (await request.json()) as {
       rows?: Array<{ field: string; value: string }>
-      format?: "xlsx" | "csv" | "md"
+      format?: "xlsx" | "csv" | "md" | "batch-md" | "batch-xlsx"
       summary?: string
       keyPoints?: string[]
       kbReferences?: Array<{
@@ -20,10 +25,72 @@ export async function POST(request: Request) {
         relevance: string
       }>
       fileName?: string
+      sessionIds?: string[]
+      includeSummaries?: boolean
     }
 
-    const { rows, format, summary, keyPoints, kbReferences, fileName } = body
+    const {
+      rows,
+      format,
+      summary,
+      keyPoints,
+      kbReferences,
+      fileName,
+      sessionIds,
+      includeSummaries = true,
+    } = body
     const exportFormat = format || "xlsx"
+
+    if (exportFormat === "batch-md" || exportFormat === "batch-xlsx") {
+      if (!sessionIds || sessionIds.length === 0) {
+        return NextResponse.json({ error: "sessionIds required for batch export" }, { status: 400 })
+      }
+
+      const sessions = await prisma.reportSession.findMany({
+        where: {
+          id: { in: sessionIds },
+          workspaceId: session.workspaceId,
+        },
+        select: {
+          id: true,
+          title: true,
+          rows: true,
+          draftNote: true,
+        },
+      })
+
+      if (sessions.length === 0) {
+        return NextResponse.json({ error: "No sessions found" }, { status: 404 })
+      }
+
+      const ordered = sessionIds
+        .map((id) => sessions.find((s) => s.id === id))
+        .filter((s): s is (typeof sessions)[number] => Boolean(s))
+        .map((s) => ({
+          id: s.id,
+          title: s.title,
+          rows: (s.rows as Array<{ field: string; value: string }> | null) || undefined,
+          draftNote: s.draftNote,
+        }))
+
+      if (exportFormat === "batch-md") {
+        const markdown = buildBatchMarkdown(ordered, includeSummaries)
+        return new NextResponse(markdown, {
+          headers: {
+            "Content-Type": "text/markdown; charset=utf-8",
+            "Content-Disposition": `attachment; filename="integrated-report-${Date.now()}.md"`,
+          },
+        })
+      }
+
+      const buffer = buildBatchXlsx(ordered, includeSummaries)
+      return new NextResponse(new Uint8Array(buffer), {
+        headers: {
+          "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "Content-Disposition": `attachment; filename="integrated-report-${Date.now()}.xlsx"`,
+        },
+      })
+    }
 
     if (exportFormat === "md") {
       if (!summary) {
@@ -33,10 +100,21 @@ export async function POST(request: Request) {
       const lines = [
         `# Report Summary — ${fileName || "document"}`,
         "",
-        "## 總述",
-        summary,
-        "",
       ]
+
+      if (rows && rows.length > 0) {
+        lines.push("## 抽取欄位", "")
+        lines.push("| Field | Value |")
+        lines.push("| --- | --- |")
+        for (const row of rows) {
+          const field = (row.field || "").replace(/\|/g, "\\|")
+          const value = (row.value || "").replace(/\|/g, "\\|")
+          lines.push(`| ${field} | ${value} |`)
+        }
+        lines.push("")
+      }
+
+      lines.push("## 總述", summary, "")
 
       if (keyPoints && keyPoints.length > 0) {
         lines.push("## 知識庫相關要點", "")

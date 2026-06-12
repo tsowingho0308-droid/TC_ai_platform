@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation"
 
-export type CrossAgentSource = "email" | "report" | "tender"
+export type CrossAgentSource = "email" | "report" | "tender" | "finance"
 
 export function useCrossAgent() {
   const router = useRouter()
@@ -11,12 +11,17 @@ export function useCrossAgent() {
     sourceId: string
     subject?: string
     attachmentId?: string
+    attachmentIds?: string[]
     attachmentName?: string
   }) {
     const searchParams = new URLSearchParams()
     searchParams.set("fromEmail", params.sourceId)
     if (params.subject) searchParams.set("emailSubject", params.subject)
-    if (params.attachmentId) searchParams.set("attachmentId", params.attachmentId)
+    if (params.attachmentIds?.length) {
+      searchParams.set("attachmentIds", params.attachmentIds.join(","))
+    } else if (params.attachmentId) {
+      searchParams.set("attachmentId", params.attachmentId)
+    }
     if (params.attachmentName) searchParams.set("attachmentName", params.attachmentName)
 
     router.push(`/tender?${searchParams.toString()}`)
@@ -26,15 +31,40 @@ export function useCrossAgent() {
     sourceId: string
     subject?: string
     attachmentId?: string
+    attachmentIds?: string[]
     attachmentName?: string
   }) {
     const searchParams = new URLSearchParams()
     searchParams.set("fromEmail", params.sourceId)
     if (params.subject) searchParams.set("emailSubject", params.subject)
-    if (params.attachmentId) searchParams.set("attachmentId", params.attachmentId)
+    if (params.attachmentIds?.length) {
+      searchParams.set("attachmentIds", params.attachmentIds.join(","))
+    } else if (params.attachmentId) {
+      searchParams.set("attachmentId", params.attachmentId)
+    }
     if (params.attachmentName) searchParams.set("attachmentName", params.attachmentName)
 
     router.push(`/report?${searchParams.toString()}`)
+  }
+
+  async function openInFinanceAgent(params: {
+    sourceId: string
+    subject?: string
+    attachmentId?: string
+    attachmentIds?: string[]
+    attachmentName?: string
+  }) {
+    const searchParams = new URLSearchParams()
+    searchParams.set("fromEmail", params.sourceId)
+    if (params.subject) searchParams.set("emailSubject", params.subject)
+    if (params.attachmentIds?.length) {
+      searchParams.set("attachmentIds", params.attachmentIds.join(","))
+    } else if (params.attachmentId) {
+      searchParams.set("attachmentId", params.attachmentId)
+    }
+    if (params.attachmentName) searchParams.set("attachmentName", params.attachmentName)
+
+    router.push(`/finance?${searchParams.toString()}`)
   }
 
   async function sendViaEmail(params: {
@@ -49,9 +79,9 @@ export function useCrossAgent() {
   }
 
   async function createLink(params: {
-    sourceType: "email" | "report" | "tender"
+    sourceType: CrossAgentSource
     sourceId: string
-    targetType: "email" | "report" | "tender"
+    targetType: CrossAgentSource
     targetId: string
     linkType: "attachment" | "reference" | "export"
   }) {
@@ -69,6 +99,7 @@ export function useCrossAgent() {
   return {
     openInTenderAgent,
     openInReportAgent,
+    openInFinanceAgent,
     sendViaEmail,
     createLink,
   }

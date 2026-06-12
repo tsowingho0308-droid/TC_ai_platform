@@ -1,5 +1,6 @@
 "use client"
 
+import { FinanceBackgroundAnalysis } from "@/features/finance/components/finance-background-analysis"
 import { AuthProvider, useAuth } from "@/features/auth/auth-context"
 import { AppSidebar } from "@/components/app-sidebar"
 import { GlobalSearchBar } from "@/features/search/components/global-search-bar"
@@ -44,6 +45,7 @@ function PlatformLayoutInner({ children }: { children: React.ReactNode }) {
 
       {/* Main Content Area */}
       <div className="flex flex-1 overflow-hidden">
+        <FinanceBackgroundAnalysis />
         <AppSidebar />
         <main className="flex-1 overflow-y-auto bg-background">
           {children}

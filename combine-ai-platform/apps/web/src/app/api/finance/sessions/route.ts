@@ -43,12 +43,14 @@ export async function POST(request: NextRequest) {
 
   try {
     const body = await request.json() as {
+      id?: string
       title?: string
       sessionType?: string
     }
 
     const session = await prisma.financeSession.create({
       data: {
+        ...(body.id ? { id: body.id } : {}),
         workspaceId: authSession.workspaceId,
         userId: authSession.sub,
         title: body.title || "New Finance Session",

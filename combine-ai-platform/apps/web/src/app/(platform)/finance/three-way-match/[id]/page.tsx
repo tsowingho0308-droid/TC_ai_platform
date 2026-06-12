@@ -73,11 +73,22 @@ export default function ThreeWayMatchPage() {
   )
 
   const extractDocument = useCallback(
-    async (base64: string, fileName: string): Promise<Record<string, unknown>> => {
+    async (
+      base64: string,
+      fileName: string,
+      docType: "PURCHASE_ORDER" | "GOODS_RECEIPT" | "INVOICE"
+    ): Promise<Record<string, unknown>> => {
       const res = await fetch("/api/finance/agent?action=extract", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: id, fileBase64: base64, fileName }),
+        body: JSON.stringify({
+          sessionId: id,
+          fileBase64: base64,
+          fileName,
+          docType,
+          appendRows: true,
+          sourceLabel: docType.replace(/_/g, " "),
+        }),
       })
       if (!res.ok) throw new Error("Extraction failed")
       const data = await res.json()
@@ -94,9 +105,9 @@ export default function ThreeWayMatchPage() {
       toast.info("Extracting data from documents...")
 
       const [poData, grnData, invData] = await Promise.all([
-        extractDocument(poDoc.base64, poDoc.fileName),
-        extractDocument(grnDoc.base64, grnDoc.fileName),
-        extractDocument(invDoc.base64, invDoc.fileName),
+        extractDocument(poDoc.base64, poDoc.fileName, "PURCHASE_ORDER"),
+        extractDocument(grnDoc.base64, grnDoc.fileName, "GOODS_RECEIPT"),
+        extractDocument(invDoc.base64, invDoc.fileName, "INVOICE"),
       ])
 
       setExtractedData({ poData, grnData, invData })
@@ -131,14 +142,14 @@ export default function ThreeWayMatchPage() {
       const res = await fetch("/api/finance/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: id, format: "csv" }),
+        body: JSON.stringify({ sessionId: id, format: "xlsx" }),
       })
       if (!res.ok) throw new Error("Export failed")
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = url
-      a.download = `three-way-match-${id.slice(0, 8)}.csv`
+      a.download = `three-way-match-${id.slice(0, 8)}.xlsx`
       a.click()
       URL.revokeObjectURL(url)
       toast.success("Report exported")
@@ -220,7 +231,7 @@ export default function ThreeWayMatchPage() {
                 >
                   <input
                     type="file"
-                    accept="image/*,.pdf"
+                    accept="image/*,.pdf,.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     onChange={(e) => handleFileChange(e, setPoDoc)}
                     className="hidden"
                   />
@@ -245,7 +256,7 @@ export default function ThreeWayMatchPage() {
                 >
                   <input
                     type="file"
-                    accept="image/*,.pdf"
+                    accept="image/*,.pdf,.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     onChange={(e) => handleFileChange(e, setGrnDoc)}
                     className="hidden"
                   />
@@ -270,7 +281,7 @@ export default function ThreeWayMatchPage() {
                 >
                   <input
                     type="file"
-                    accept="image/*,.pdf"
+                    accept="image/*,.pdf,.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     onChange={(e) => handleFileChange(e, setInvDoc)}
                     className="hidden"
                   />

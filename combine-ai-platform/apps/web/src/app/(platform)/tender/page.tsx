@@ -5,12 +5,25 @@ import { useSearchParams } from "next/navigation"
 import Link from "next/link"
 import {
   Upload, FileText, Download, Plus, Trash2, Loader2,
-  GitCompare, Brain, BarChart3, Search, Check, X, ArrowLeft,
+  GitCompare, Brain, BarChart3, Search, Pencil, BookOpen, ArrowLeft,
   Mail, Paperclip, Sparkles,
 } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import {
+  getInitialSelectedAttachmentIds,
+  getSelectedAnalyzableAttachments,
+  isAnalyzableEmailAttachment,
+  parseAttachmentIdsFromSearchParams,
+} from "@/features/cross-agent/email-attachments"
+import { TenderComparisonPanel } from "@/features/tender/components/tender-comparison-panel"
+import { TenderStructuredFields } from "@/features/tender/components/tender-structured-fields"
+import { TenderKbImportDialog } from "@/features/tender/components/tender-kb-import-dialog"
+import {
+  buildComparisonKbText,
+  defaultComparisonKbTitle,
+} from "@/features/tender/lib/tender-comparison-kb-text"
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -19,6 +32,7 @@ interface TenderField { field: string; value: string }
 interface TenderItem {
   id: string
   name: string
+  fileName?: string
   fields: TenderField[]
   type: string | null
 }
@@ -57,37 +71,6 @@ interface EmailSource {
   attachments: EmailAttachment[]
 }
 
-function getPrimaryDocumentAttachment(
-  attachments: EmailAttachment[],
-  preferredId?: string | null
-): EmailAttachment | null {
-  if (preferredId) {
-    const found = attachments.find((a) => a.id === preferredId)
-    if (found) return found
-  }
-  return (
-    attachments.find(
-      (att) =>
-        att.mimeType === "application/pdf" ||
-        att.fileName.toLowerCase().endsWith(".pdf") ||
-        att.fileName.toLowerCase().endsWith(".docx") ||
-        att.fileName.toLowerCase().endsWith(".doc") ||
-        att.fileName.toLowerCase().endsWith(".txt")
-    ) || null
-  )
-}
-
-function isAnalyzableAttachment(att: EmailAttachment): boolean {
-  const name = att.fileName.toLowerCase()
-  return (
-    att.mimeType === "application/pdf" ||
-    name.endsWith(".pdf") ||
-    name.endsWith(".docx") ||
-    name.endsWith(".doc") ||
-    name.endsWith(".txt")
-  )
-}
-
 interface ComparisonField {
   field: string
   values: Array<{ tenderId: string; tenderTitle: string; value: string }>
@@ -105,6 +88,7 @@ interface AiCompareResult {
   risksA?: string[]
   risksB?: string[]
   recommendation?: { preferred?: string; reason?: string } | null
+  mockWarning?: string | null
 }
 
 interface ExtractionResult {
@@ -112,6 +96,12 @@ interface ExtractionResult {
   tenderTitle?: string
   tenderType?: string
   confidence?: number
+  model?: string
+}
+
+interface PendingUploadFile {
+  id: string
+  file: File
 }
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -183,7 +173,7 @@ function buildComparison(tenders: TenderItem[]): ComparisonResult | null {
         const found = t.fields.find((f) => normalizeFieldName(f.field) === canonical)
         return {
           tenderId: t.id,
-          tenderTitle: t.name,
+          tenderTitle: t.fileName || t.name,
           value: found?.value || "—",
         }
       })
@@ -205,8 +195,18 @@ function buildComparison(tenders: TenderItem[]): ComparisonResult | null {
 
   return {
     comparisonFields,
-    tenders: tenders.map((t) => ({ id: t.id, title: t.name })),
+    tenders: tenders.map((t) => ({ id: t.id, title: t.fileName || t.name })),
   }
+}
+
+function buildUploadFileId(file: File): string {
+  return `${file.name}-${file.size}-${file.lastModified}`
+}
+
+function formatFileSize(sizeBytes: number): string {
+  if (sizeBytes < 1024) return `${sizeBytes} B`
+  if (sizeBytes < 1024 * 1024) return `${Math.max(1, Math.round(sizeBytes / 1024))} KB`
+  return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -238,6 +238,7 @@ function TenderPageContent() {
   const fromEmailId = searchParams.get("fromEmail")
   const emailSubjectParam = searchParams.get("emailSubject")
   const attachmentIdParam = searchParams.get("attachmentId")
+  const attachmentIdsParam = searchParams.get("attachmentIds")
 
   const [viewMode, setViewMode] = useState<"edit" | "compare">("edit")
   const [tenders, setTenders] = useState<TenderItem[]>([])
@@ -250,19 +251,35 @@ function TenderPageContent() {
   const [error, setError] = useState<string | null>(null)
   const [streamingStatus, setStreamingStatus] = useState<"idle" | "connecting" | "thinking" | "done" | "error">("idle")
   const [confidence, setConfidence] = useState<number | null>(null)
-  const [previewFile, setPreviewFile] = useState<File | null>(null)
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [pendingFiles, setPendingFiles] = useState<PendingUploadFile[]>([])
+  const [selectedUploadFileIds, setSelectedUploadFileIds] = useState<Set<string>>(new Set())
   const [showDiffsOnly, setShowDiffsOnly] = useState(true)
   const [aiCompareResult, setAiCompareResult] = useState<AiCompareResult | null>(null)
   const [loadingAiCompare, setLoadingAiCompare] = useState(false)
+  const [mockWarning, setMockWarning] = useState<string | null>(null)
+  const [kbImportOpen, setKbImportOpen] = useState(false)
+  const [statusBanner, setStatusBanner] = useState<{ tone: "success" | "error"; message: string } | null>(null)
+  const [exportingPdf, setExportingPdf] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const [emailSource, setEmailSource] = useState<EmailSource | null>(null)
   const [loadingEmail, setLoadingEmail] = useState(false)
-  const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null)
+  const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<Set<string>>(new Set())
   const [loadingEmailExtract, setLoadingEmailExtract] = useState(false)
 
   const comparisonResult = useMemo(() => buildComparison(tenders), [tenders])
+  const comparisonKbText = useMemo(() => {
+    if (!comparisonResult) return ""
+    return buildComparisonKbText({
+      comparisonResult,
+      tenderNames: tenders.map((t) => t.fileName || t.name),
+      diffCount: comparisonResult.comparisonFields.filter((f) => !f.match).length,
+      matchCount: comparisonResult.comparisonFields.filter((f) => f.match).length,
+      showDiffsOnly,
+      aiCompareResult,
+    })
+  }, [comparisonResult, tenders, showDiffsOnly, aiCompareResult])
+  const hasEditableFields = tenders.some((t) => t.fields.length > 0)
 
   useEffect(() => {
     fetch("/api/tender/templates")
@@ -289,8 +306,8 @@ function TenderPageContent() {
           .filter(Boolean)
           .join("\n\n")
         const attachments = conv.attachments || []
-        const primary = getPrimaryDocumentAttachment(attachments, attachmentIdParam)
-        setSelectedAttachmentId(primary?.id ?? null)
+        const preferredIds = parseAttachmentIdsFromSearchParams(attachmentIdsParam, attachmentIdParam)
+        setSelectedAttachmentIds(getInitialSelectedAttachmentIds(attachments, preferredIds))
         setEmailSource({
           id: conv.id,
           subject: emailSubjectParam || conv.subject,
@@ -302,14 +319,13 @@ function TenderPageContent() {
       })
       .catch(console.error)
       .finally(() => setLoadingEmail(false))
-  }, [fromEmailId, emailSubjectParam])
+  }, [fromEmailId, emailSubjectParam, attachmentIdParam, attachmentIdsParam])
 
   useEffect(() => {
     return () => {
       abortRef.current?.abort()
-      if (previewUrl) URL.revokeObjectURL(previewUrl)
     }
-  }, [previewUrl])
+  }, [])
 
   useEffect(() => {
     if (tenders.length < 2 && viewMode === "compare") {
@@ -331,14 +347,23 @@ function TenderPageContent() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         tenders: tenders.map((t) => ({
-          title: t.name,
+          title: t.fileName || t.name,
           fields: t.fields,
         })),
       }),
     })
       .then((r) => r.json())
       .then((data: AiCompareResult) => {
-        if (!cancelled) setAiCompareResult(data)
+        if (!cancelled) {
+          setAiCompareResult(data)
+          if (data.mockWarning) {
+            setMockWarning(
+              data.mockWarning === "AI unavailable, using demo data"
+                ? "未連接大模型，目前為演示資料。請確認 combine-ai-platform/.env 中的 DASHSCOPE_API_KEY 並重啟 dev server。"
+                : data.mockWarning
+            )
+          }
+        }
       })
       .catch(console.error)
       .finally(() => {
@@ -358,6 +383,7 @@ function TenderPageContent() {
     setThinkingText("")
     setError(null)
     setConfidence(null)
+    setMockWarning(null)
   }
 
   function applyExtractionResult(result: ExtractionResult, fileName: string) {
@@ -365,6 +391,7 @@ function TenderPageContent() {
       const newTender: TenderItem = {
         id: `tender-${Date.now()}`,
         name: result.tenderTitle || fileName.replace(/\.(pdf|docx?|txt)$/i, ""),
+        fileName,
         fields: result.fields,
         type: result.tenderType || null,
       }
@@ -389,6 +416,16 @@ function TenderPageContent() {
     }
     if (!response.body) throw new Error("Response body is not available")
 
+    const appendTraceEvent = (trace: TraceEvent) => {
+      setTraceEvents((prev) => [
+        ...prev,
+        {
+          ...trace,
+          id: `${trace.id}-${fileName}-${prev.length}`,
+        },
+      ])
+    }
+
     const bodyReader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ""
@@ -406,14 +443,23 @@ function TenderPageContent() {
           const parsed = parseSseRecord(record)
           switch (parsed.event) {
             case "trace":
-              if (parsed.data?.trace) setTraceEvents((prev) => [...prev, parsed.data!.trace as TraceEvent])
+              if (parsed.data?.trace) appendTraceEvent(parsed.data.trace as TraceEvent)
               break
             case "thinking":
               if (parsed.data?.text) setThinkingText(parsed.data.text)
               break
-            case "result":
-              if (parsed.data?.result) result = parsed.data.result as ExtractionResult
+            case "result": {
+              if (parsed.data?.result) {
+                result = parsed.data.result as ExtractionResult
+                if (result.model === "mock-template") {
+                  setMockWarning("未連接大模型，目前為演示資料")
+                }
+              }
+              if (parsed.data?.warning) {
+                setMockWarning("未連接大模型，目前為演示資料")
+              }
               break
+            }
             case "error": {
               const code = parsed.data?.code as string | undefined
               streamError =
@@ -438,8 +484,8 @@ function TenderPageContent() {
     return false
   }
 
-  async function runExtraction(documentText: string, fileName: string) {
-    resetState()
+  async function runExtraction(documentText: string, fileName: string, options?: { skipReset?: boolean }) {
+    if (!options?.skipReset) resetState()
     setAnalyzing(true)
     setStreamingStatus("connecting")
     const controller = new AbortController()
@@ -467,8 +513,8 @@ function TenderPageContent() {
     }
   }
 
-  async function extractFromFile(file: File) {
-    resetState()
+  async function extractFromFile(file: File, options?: { skipReset?: boolean }) {
+    if (!options?.skipReset) resetState()
     setAnalyzing(true)
     setStreamingStatus("connecting")
     const controller = new AbortController()
@@ -485,23 +531,29 @@ function TenderPageContent() {
         body: formData,
         signal: controller.signal,
       })
-      await consumeExtractionStream(response, file.name)
+      return await consumeExtractionStream(response, file.name)
     } catch (err) {
-      if ((err as Error).name === "AbortError") return
+      if ((err as Error).name === "AbortError") return false
       setError(err instanceof Error ? err.message : "Unknown error")
       setStreamingStatus("error")
+      return false
     } finally {
       setAnalyzing(false)
     }
   }
 
-  async function loadEmailAttachmentAndAnalyze(attachmentId: string) {
+  async function loadEmailAttachmentAndAnalyze(
+    attachmentId: string,
+    options?: { skipReset?: boolean }
+  ) {
     if (!emailSource) return
     const att = emailSource.attachments.find((a) => a.id === attachmentId)
     if (!att) return
 
-    setLoadingEmailExtract(true)
-    setError(null)
+    if (!options?.skipReset) {
+      setLoadingEmailExtract(true)
+      setError(null)
+    }
     try {
       const res = await fetch(
         `/api/email/attachments?action=extract&id=${encodeURIComponent(attachmentId)}`
@@ -514,64 +566,170 @@ function TenderPageContent() {
       if (!data.text?.trim()) {
         throw new Error("No text could be extracted from the attachment")
       }
-      setSelectedAttachmentId(attachmentId)
-      await runExtraction(data.text, data.fileName || att.fileName)
+      await runExtraction(data.text, data.fileName || att.fileName, options)
     } catch (err) {
       console.error("Email attachment analyze error:", err)
       setError(err instanceof Error ? err.message : "Failed to analyze email attachment")
       setStreamingStatus("error")
       setAnalyzing(false)
+      throw err
     } finally {
-      setLoadingEmailExtract(false)
+      if (!options?.skipReset) {
+        setLoadingEmailExtract(false)
+      }
     }
   }
 
   async function handleAnalyzeEmail() {
     if (!emailSource) return
-    const att = getPrimaryDocumentAttachment(
+    const selected = getSelectedAnalyzableAttachments(
       emailSource.attachments,
-      selectedAttachmentId || attachmentIdParam
+      selectedAttachmentIds
     )
-    if (att) {
-      await loadEmailAttachmentAndAnalyze(att.id)
-    } else if (emailSource.body.trim()) {
+
+    if (selected.length > 0) {
+      resetState()
+      setLoadingEmailExtract(true)
+      setError(null)
+      try {
+        for (let i = 0; i < selected.length; i++) {
+          await loadEmailAttachmentAndAnalyze(selected[i].id, { skipReset: i > 0 })
+        }
+      } catch {
+        // Error already surfaced in loadEmailAttachmentAndAnalyze
+      } finally {
+        setLoadingEmailExtract(false)
+        setAnalyzing(false)
+      }
+      return
+    }
+
+    if (emailSource.body.trim()) {
       await runExtraction(emailSource.body, `${emailSource.subject || "email"}.txt`)
     } else {
-      setError("Email has no content to analyze")
+      setError("Select at least one attachment to analyze")
       setStreamingStatus("error")
     }
   }
 
-  const emailAnalyzableAttachment = emailSource
-    ? getPrimaryDocumentAttachment(
-        emailSource.attachments,
-        selectedAttachmentId || attachmentIdParam
-      )
-    : null
+  const selectedAnalyzableAttachments = emailSource
+    ? getSelectedAnalyzableAttachments(emailSource.attachments, selectedAttachmentIds)
+    : []
+
+  const emailAnalyzableAttachments = emailSource
+    ? emailSource.attachments.filter((att) => isAnalyzableEmailAttachment(att))
+    : []
 
   const canAnalyzeEmail = Boolean(
     emailSource &&
-      (emailAnalyzableAttachment || emailSource.body.trim().length > 0)
+      (selectedAnalyzableAttachments.length > 0 || emailSource.body.trim().length > 0)
   )
 
+  function toggleAttachmentSelection(attachmentId: string) {
+    setSelectedAttachmentIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(attachmentId)) next.delete(attachmentId)
+      else next.add(attachmentId)
+      return next
+    })
+  }
+
+  function selectAllAnalyzableAttachments() {
+    if (!emailSource) return
+    setSelectedAttachmentIds(
+      new Set(emailAnalyzableAttachments.map((att) => att.id))
+    )
+  }
+
+  function clearAttachmentSelection() {
+    setSelectedAttachmentIds(new Set())
+  }
+
+  function toggleUploadFileSelection(fileId: string) {
+    setSelectedUploadFileIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(fileId)) next.delete(fileId)
+      else next.add(fileId)
+      return next
+    })
+  }
+
+  function selectAllUploadFiles() {
+    setSelectedUploadFileIds(new Set(pendingFiles.map((f) => f.id)))
+  }
+
+  function clearUploadFileSelection() {
+    setSelectedUploadFileIds(new Set())
+  }
+
+  function removeUploadFile(fileId: string) {
+    setPendingFiles((prev) => prev.filter((f) => f.id !== fileId))
+    setSelectedUploadFileIds((prev) => {
+      const next = new Set(prev)
+      next.delete(fileId)
+      return next
+    })
+  }
+
+  function removeSelectedUploadFiles() {
+    setPendingFiles((prev) => prev.filter((f) => !selectedUploadFileIds.has(f.id)))
+    setSelectedUploadFileIds(new Set())
+  }
+
+  function clearPendingFiles() {
+    setPendingFiles([])
+    setSelectedUploadFileIds(new Set())
+  }
+
   function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (!file) return
+    const files = Array.from(e.target.files ?? [])
+    if (files.length === 0) return
+
+    const nextEntries = files.map((file) => ({
+      id: buildUploadFileId(file),
+      file,
+    }))
+
+    const uniqueAdded = nextEntries.filter(
+      (entry, idx, arr) => arr.findIndex((a) => a.id === entry.id) === idx
+    )
+
+    if (uniqueAdded.length === 0) return
 
     resetState()
-    if (previewUrl) URL.revokeObjectURL(previewUrl)
-    setPreviewUrl(URL.createObjectURL(file))
-    setPreviewFile(file)
+    setPendingFiles((prev) => {
+      const existingIds = new Set(prev.map((p) => p.id))
+      const merged = [...prev]
+      for (const entry of uniqueAdded) {
+        if (!existingIds.has(entry.id)) merged.push(entry)
+      }
+      return merged
+    })
+    setSelectedUploadFileIds((prev) => {
+      const next = new Set(prev)
+      for (const entry of uniqueAdded) next.add(entry.id)
+      return next
+    })
     if (fileInputRef.current) fileInputRef.current.value = ""
   }
 
-  async function handleAnalyzeFile() {
-    if (!previewFile) return
-    await extractFromFile(previewFile)
+  async function handleAnalyzeSelectedUploadFiles() {
+    const selectedFiles = pendingFiles.filter((f) => selectedUploadFileIds.has(f.id))
+    if (selectedFiles.length === 0) {
+      setError("Select at least one uploaded document to analyze")
+      setStreamingStatus("error")
+      return
+    }
+
+    resetState()
+    setError(null)
+    for (let i = 0; i < selectedFiles.length; i++) {
+      await extractFromFile(selectedFiles[i].file, { skipReset: i > 0 })
+    }
   }
 
-  function addField(ti: number) {
-    setTenders(tenders.map((t, i) => i === ti ? { ...t, fields: [...t.fields, { field: "", value: "" }] } : t))
+  function addField(ti: number, defaultFieldLabel?: string) {
+    setTenders(tenders.map((t, i) => i === ti ? { ...t, fields: [...t.fields, { field: defaultFieldLabel ?? "", value: "" }] } : t))
   }
   function updateField(ti: number, fi: number, update: Partial<TenderField>) {
     setTenders(tenders.map((t, i) => i === ti ? { ...t, fields: t.fields.map((f, j) => j === fi ? { ...f, ...update } : f) } : t))
@@ -580,6 +738,11 @@ function TenderPageContent() {
     setTenders(tenders.map((t, i) => i === ti ? { ...t, fields: t.fields.filter((_, j) => j !== fi) } : t))
   }
   function removeTender(ti: number) { setTenders(tenders.filter((_, i) => i !== ti)) }
+
+  const diffCount = comparisonResult?.comparisonFields.filter((f) => !f.match).length ?? 0
+  const matchCount = comparisonResult
+    ? comparisonResult.comparisonFields.length - diffCount
+    : 0
 
   function exportTenders() {
     const rows = tenders.flatMap((t) => t.fields.map((f) => ({ field: `${t.name} - ${f.field}`, value: f.value })))
@@ -591,81 +754,75 @@ function TenderPageContent() {
 
   function exportComparison() {
     if (!comparisonResult) return
-    const flatRows = comparisonResult.comparisonFields.flatMap((cf) =>
-      cf.values.map((v) => ({ field: `${cf.field} [${v.tenderTitle}]`, value: v.value }))
-    )
-    fetch("/api/report/export", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ rows: flatRows, format: "xlsx" }) })
-      .then((r) => r.blob())
-      .then((blob) => { const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = `tender-comparison-${Date.now()}.xlsx`; a.click(); URL.revokeObjectURL(url) })
+    fetch("/api/tender/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        comparisonResult,
+        showDiffsOnly,
+        diffCount,
+        matchCount,
+      }),
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error("Export failed")
+        return r.blob()
+      })
+      .then((blob) => {
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = `tender-comparison-${Date.now()}.xlsx`
+        a.click()
+        URL.revokeObjectURL(url)
+      })
       .catch(console.error)
   }
 
-  const diffCount = comparisonResult?.comparisonFields.filter((f) => !f.match).length ?? 0
-  const matchCount = comparisonResult
-    ? comparisonResult.comparisonFields.length - diffCount
-    : 0
+  async function exportEditedPdfs() {
+    const tendersWithFields = tenders.filter((t) => t.fields.length > 0)
+    if (tendersWithFields.length === 0) return
 
-  function filterForDisplay(fields: ComparisonField[]) {
-    return showDiffsOnly ? fields.filter((f) => !f.match) : fields
-  }
+    setExportingPdf(true)
+    setStatusBanner(null)
+    try {
+      for (let i = 0; i < tendersWithFields.length; i++) {
+        const tender = tendersWithFields[i]
+        const res = await fetch("/api/tender/export-pdf", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: tender.name,
+            fileName: tender.fileName,
+            fields: tender.fields,
+          }),
+        })
+        if (!res.ok) throw new Error("PDF export failed")
 
-  const keyFields = filterForDisplay(comparisonResult?.comparisonFields.filter((f) => f.isKey) ?? [])
-  const otherFields = filterForDisplay(comparisonResult?.comparisonFields.filter((f) => !f.isKey) ?? [])
+        const blob = await res.blob()
+        const disposition = res.headers.get("Content-Disposition")
+        const filenameMatch = disposition?.match(/filename="([^"]+)"/)
+        const downloadName = filenameMatch?.[1] || `tender-edited-${Date.now()}.pdf`
 
-  function renderComparisonTable(fields: ComparisonField[], label?: string) {
-    if (!comparisonResult || fields.length === 0) return null
-    return (
-      <div>
-        {label && (
-          <h3 className="mb-3 text-sm font-semibold text-muted-foreground uppercase tracking-wider">{label}</h3>
-        )}
-        <div className="overflow-x-auto rounded-lg border">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b bg-muted/50">
-                <th className="px-4 py-3 text-left font-medium w-48">Field</th>
-                {comparisonResult.tenders.map((tender) => (
-                  <th key={tender.id} className="px-4 py-3 text-left font-medium min-w-[160px]">
-                    {tender.title}
-                  </th>
-                ))}
-                <th className="px-4 py-3 text-center font-medium w-20">Match</th>
-              </tr>
-            </thead>
-            <tbody>
-              {fields.map((cf, idx) => (
-                <tr
-                  key={cf.field}
-                  className={cn(
-                    "border-b",
-                    idx % 2 === 0 ? "bg-background" : "bg-muted/20",
-                    !cf.match && "bg-amber-50/30 dark:bg-amber-950/10"
-                  )}
-                >
-                  <td className="px-4 py-2.5 font-medium text-muted-foreground">{cf.field}</td>
-                  {cf.values.map((v) => (
-                    <td key={`${cf.field}-${v.tenderId}`} className="px-4 py-2.5">
-                      {cf.match ? (
-                        <span>{v.value}</span>
-                      ) : (
-                        <span className="text-amber-700 dark:text-amber-400">{v.value}</span>
-                      )}
-                    </td>
-                  ))}
-                  <td className="px-4 py-2.5 text-center">
-                    {cf.match ? (
-                      <Check className="inline h-4 w-4 text-green-500" />
-                    ) : (
-                      <X className="inline h-4 w-4 text-amber-500" />
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    )
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement("a")
+        a.href = url
+        a.download = downloadName
+        a.click()
+        URL.revokeObjectURL(url)
+
+        if (i < tendersWithFields.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 300))
+        }
+      }
+    } catch (err) {
+      setStatusBanner({
+        tone: "error",
+        message: err instanceof Error ? err.message : "PDF export failed",
+      })
+    } finally {
+      setExportingPdf(false)
+    }
   }
 
   return (
@@ -708,8 +865,16 @@ function TenderPageContent() {
                 onClick={() => setViewMode("edit")}
                 className="inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent"
               >
-                <ArrowLeft className="h-4 w-4" />
-                Back to Edit
+                <Pencil className="h-4 w-4" />
+                Edit Fields
+              </button>
+              <button
+                onClick={() => setKbImportOpen(true)}
+                disabled={!comparisonResult}
+                className="inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent disabled:opacity-50"
+              >
+                <BookOpen className="h-4 w-4" />
+                Save to Knowledge Base
               </button>
               <button
                 onClick={exportComparison}
@@ -733,6 +898,18 @@ function TenderPageContent() {
                 </button>
               )}
               <button
+                disabled={exportingPdf || !hasEditableFields}
+                onClick={exportEditedPdfs}
+                className="inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-accent disabled:opacity-50"
+              >
+                {exportingPdf ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <FileText className="h-4 w-4" />
+                )}
+                Export PDF
+              </button>
+              <button
                 disabled={tenders.length === 0}
                 onClick={exportTenders}
                 className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-50"
@@ -744,6 +921,36 @@ function TenderPageContent() {
           )}
         </div>
       </header>
+
+      {mockWarning && (
+        <div className="border-b border-amber-200 bg-amber-50 px-6 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300">
+          {mockWarning === "AI unavailable, using demo data"
+            ? "未連接大模型，目前為演示資料。請確認 combine-ai-platform/.env 中的 DASHSCOPE_API_KEY 並重啟 dev server。"
+            : mockWarning}
+        </div>
+      )}
+
+      {statusBanner && (
+        <div
+          className={cn(
+            "border-b px-6 py-2 text-sm",
+            statusBanner.tone === "success"
+              ? "border-green-200 bg-green-50 text-green-800 dark:border-green-900 dark:bg-green-950/30 dark:text-green-300"
+              : "border-red-200 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300"
+          )}
+        >
+          {statusBanner.message}
+        </div>
+      )}
+
+      <TenderKbImportDialog
+        open={kbImportOpen}
+        onClose={() => setKbImportOpen(false)}
+        defaultTitle={defaultComparisonKbTitle()}
+        text={comparisonKbText}
+        onSuccess={(message) => setStatusBanner({ tone: "success", message })}
+        onError={(message) => setStatusBanner({ tone: "error", message })}
+      />
 
       <div className="flex flex-1 overflow-hidden">
         {/* Left: Upload Panel */}
@@ -786,50 +993,78 @@ function TenderPageContent() {
                     )}
                     {loadingEmailExtract || analyzing
                       ? "Analyzing..."
-                      : "Analyze with Tender"}
+                      : selectedAnalyzableAttachments.length > 1
+                        ? `Analyze ${selectedAnalyzableAttachments.length} with Tender`
+                        : "Analyze with Tender"}
                   </button>
                   {emailSource.attachments.length > 0 && (
                     <div className="mt-3 space-y-2">
-                      <p className="text-xs font-medium text-muted-foreground">
-                        Attachments — click to select for analysis
-                      </p>
-                      {emailSource.attachments.map((att) => (
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs font-medium text-muted-foreground">
+                          Attachments — select one or more
+                        </p>
+                        {emailAnalyzableAttachments.length > 0 && (
+                          <div className="flex items-center gap-2 text-[10px]">
+                            <button
+                              type="button"
+                              onClick={selectAllAnalyzableAttachments}
+                              className="text-primary hover:underline"
+                            >
+                              All
+                            </button>
+                            <button
+                              type="button"
+                              onClick={clearAttachmentSelection}
+                              className="text-muted-foreground hover:underline"
+                            >
+                              Clear
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                      {emailSource.attachments.map((att) => {
+                        const analyzable = isAnalyzableEmailAttachment(att)
+                        const selected = selectedAttachmentIds.has(att.id)
+                        return (
                         <div
                           key={att.id}
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => {
-                            if (isAnalyzableAttachment(att)) setSelectedAttachmentId(att.id)
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" && isAnalyzableAttachment(att)) {
-                              setSelectedAttachmentId(att.id)
-                            }
-                          }}
                           className={cn(
                             "flex items-start gap-2 rounded-md border p-2",
-                            isAnalyzableAttachment(att) && "cursor-pointer hover:bg-accent/50",
-                            (selectedAttachmentId || attachmentIdParam) === att.id &&
-                              "border-primary bg-primary/5"
+                            analyzable && "hover:bg-accent/50",
+                            selected && "border-primary bg-primary/5"
                           )}
                         >
-                          <Paperclip className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            disabled={!analyzable}
+                            onChange={() => {
+                              if (analyzable) toggleAttachmentSelection(att.id)
+                            }}
+                            className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary disabled:opacity-40"
+                            aria-label={`Select ${att.fileName}`}
+                          />
                           <div className="min-w-0 flex-1">
                             <p className="truncate text-xs font-medium">{att.fileName}</p>
                             <p className="text-[10px] text-muted-foreground">
                               {Math.max(1, Math.round(att.sizeBytes / 1024))} KB
-                              {!isAnalyzableAttachment(att) && " — not analyzable"}
+                              {!analyzable && " — not analyzable"}
                             </p>
                           </div>
                           <a
                             href={`/api/email/attachments?action=download&id=${encodeURIComponent(att.id)}`}
-                            onClick={(e) => e.stopPropagation()}
                             className="shrink-0 text-[10px] text-primary hover:underline"
                           >
                             Download
                           </a>
                         </div>
-                      ))}
+                        )
+                      })}
+                      {selectedAnalyzableAttachments.length > 0 && (
+                        <p className="text-[10px] text-muted-foreground">
+                          {selectedAnalyzableAttachments.length} selected for analysis
+                        </p>
+                      )}
                     </div>
                   )}
                 </>
@@ -851,52 +1086,117 @@ function TenderPageContent() {
               ref={fileInputRef}
               type="file"
               accept=".pdf,.docx,.doc,.txt"
+              multiple
               onChange={handleFileUpload}
               className="hidden"
             />
-            {previewUrl ? (
-              <div className="rounded-lg border-2 border-dashed p-6 text-center">
-                <div className="flex h-24 flex-col items-center justify-center rounded-lg bg-muted">
-                  <FileText className="h-8 w-8 text-muted-foreground/50" />
-                  <span className="mt-2 text-sm text-muted-foreground">{previewFile?.name}</span>
+            <div
+              className="cursor-pointer rounded-lg border-2 border-dashed p-6 text-center transition-colors hover:border-primary/50 hover:bg-accent/50"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Upload className="mx-auto h-8 w-8 text-muted-foreground" />
+              <p className="mt-2 text-sm font-medium">Upload Tender Documents</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                PDF, DOCX, DOC, or TXT — pick one or more to batch analyze
+              </p>
+            </div>
+
+            {pendingFiles.length > 0 && (
+              <div className="mt-3 rounded-lg border bg-muted/20 p-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <div className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    <Paperclip className="h-3.5 w-3.5" />
+                    Upload Queue ({pendingFiles.length})
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px]">
+                    <button
+                      type="button"
+                      onClick={selectAllUploadFiles}
+                      className="text-primary hover:underline"
+                    >
+                      All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={clearUploadFileSelection}
+                      className="text-muted-foreground hover:underline"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      type="button"
+                      onClick={removeSelectedUploadFiles}
+                      disabled={selectedUploadFileIds.size === 0}
+                      className="text-muted-foreground hover:underline disabled:opacity-50"
+                    >
+                      Remove selected
+                    </button>
+                  </div>
                 </div>
-                <div className="mt-4 flex flex-col items-center gap-2">
+                <div className="max-h-60 space-y-2 overflow-auto pr-1">
+                  {pendingFiles.map((entry) => {
+                    const selected = selectedUploadFileIds.has(entry.id)
+                    return (
+                      <div
+                        key={entry.id}
+                        className={cn(
+                          "flex items-start gap-2 rounded-md border p-2",
+                          selected && "border-primary bg-primary/5",
+                          "hover:bg-accent/40"
+                        )}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selected}
+                          onChange={() => toggleUploadFileSelection(entry.id)}
+                          className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary"
+                          aria-label={`Select ${entry.file.name}`}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-xs font-medium">{entry.file.name}</p>
+                          <p className="text-[10px] text-muted-foreground">
+                            {formatFileSize(entry.file.size)}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => removeUploadFile(entry.id)}
+                          className="shrink-0 text-[10px] text-muted-foreground hover:text-destructive"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+                <p className="mt-2 text-[10px] text-muted-foreground">
+                  {selectedUploadFileIds.size} selected for analysis
+                </p>
+                <div className="mt-3 flex items-center gap-2">
                   <button
-                    onClick={handleAnalyzeFile}
-                    disabled={analyzing}
-                    className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
+                    onClick={handleAnalyzeSelectedUploadFiles}
+                    disabled={analyzing || selectedUploadFileIds.size === 0}
+                    className="inline-flex flex-1 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
                   >
                     {analyzing ? (
                       <Loader2 className="h-4 w-4 animate-spin" />
                     ) : (
                       <Sparkles className="h-4 w-4" />
                     )}
-                    {analyzing ? "Analyzing..." : "Analyze File"}
+                    {analyzing
+                      ? "Analyzing..."
+                      : selectedUploadFileIds.size > 1
+                        ? `Analyze Selected (${selectedUploadFileIds.size})`
+                        : "Analyze Selected"}
                   </button>
                   <button
-                    onClick={() => {
-                      if (previewUrl) URL.revokeObjectURL(previewUrl)
-                      setPreviewUrl(null)
-                      setPreviewFile(null)
-                      resetState()
-                      fileInputRef.current?.click()
-                    }}
-                    className="text-sm text-primary hover:underline"
+                    type="button"
+                    onClick={clearPendingFiles}
+                    className="rounded-md border px-3 py-2 text-xs hover:bg-accent"
                   >
-                    Change file
+                    Clear list
                   </button>
                 </div>
-              </div>
-            ) : (
-              <div
-                className="cursor-pointer rounded-lg border-2 border-dashed p-6 text-center transition-colors hover:border-primary/50 hover:bg-accent/50"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <Upload className="mx-auto h-8 w-8 text-muted-foreground" />
-                <p className="mt-2 text-sm font-medium">Upload Tender Document</p>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  PDF, DOCX, or TXT — upload multiple to compare
-                </p>
               </div>
             )}
           </div>
@@ -1000,109 +1300,18 @@ function TenderPageContent() {
         {/* Right: Edit or Compare */}
         <div className="flex-1 p-6 overflow-y-auto">
           {viewMode === "compare" && comparisonResult ? (
-            <div className="space-y-8">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <GitCompare className="h-4 w-4" />
-                  <span>
-                    <strong className="text-foreground">{diffCount}</strong> differing /{" "}
-                    <strong className="text-foreground">{matchCount}</strong> matching across{" "}
-                    {tenders.length} tenders
-                  </span>
-                </div>
-                <label className="inline-flex cursor-pointer items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={showDiffsOnly}
-                    onChange={(e) => setShowDiffsOnly(e.target.checked)}
-                    className="rounded border"
-                  />
-                  Show differences only
-                </label>
-              </div>
-
-              {showDiffsOnly && keyFields.length === 0 && otherFields.length === 0 && (
-                <div className="rounded-lg border bg-green-50/50 p-4 text-center text-sm text-green-700 dark:bg-green-950/20 dark:text-green-400">
-                  All compared fields match across tenders.
-                </div>
-              )}
-
-              {renderComparisonTable(keyFields, "Key Information")}
-              {renderComparisonTable(otherFields, keyFields.length > 0 ? "Other Fields" : undefined)}
-
-              <div className="rounded-lg border bg-muted/20 p-5">
-                <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-                  <Brain className="h-4 w-4" />
-                  AI Comparison Summary
-                </h3>
-                {loadingAiCompare ? (
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Generating comparison insights...
-                  </div>
-                ) : aiCompareResult ? (
-                  <div className="space-y-4 text-sm">
-                    {aiCompareResult.keyDifferences && aiCompareResult.keyDifferences.length > 0 && (
-                      <div>
-                        <p className="mb-2 font-medium">Key Differences</p>
-                        <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
-                          {aiCompareResult.keyDifferences.map((d, i) => (
-                            <li key={i}>{d}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {aiCompareResult.recommendation && (
-                      <div className="rounded-md border bg-background p-3">
-                        <p className="font-medium">
-                          Recommendation:{" "}
-                          <span className="text-primary capitalize">
-                            {aiCompareResult.recommendation.preferred || "—"}
-                          </span>
-                        </p>
-                        {aiCompareResult.recommendation.reason && (
-                          <p className="mt-1 text-muted-foreground">
-                            {aiCompareResult.recommendation.reason}
-                          </p>
-                        )}
-                      </div>
-                    )}
-                    {(aiCompareResult.risksA?.length || aiCompareResult.risksB?.length) ? (
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        {aiCompareResult.risksA && aiCompareResult.risksA.length > 0 && (
-                          <div>
-                            <p className="mb-1 font-medium">{tenders[0]?.name} — Risks</p>
-                            <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
-                              {aiCompareResult.risksA.map((r, i) => (
-                                <li key={i}>{r}</li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-                        {aiCompareResult.risksB && aiCompareResult.risksB.length > 0 && tenders[1] && (
-                          <div>
-                            <p className="mb-1 font-medium">{tenders[1].name} — Risks</p>
-                            <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
-                              {aiCompareResult.risksB.map((r, i) => (
-                                <li key={i}>{r}</li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-                      </div>
-                    ) : null}
-                    {!aiCompareResult.keyDifferences?.length &&
-                      !aiCompareResult.recommendation &&
-                      !aiCompareResult.risksA?.length &&
-                      !aiCompareResult.risksB?.length && (
-                        <p className="text-muted-foreground">No AI insights available for this comparison.</p>
-                      )}
-                  </div>
-                ) : (
-                  <p className="text-sm text-muted-foreground">AI insights unavailable.</p>
-                )}
-              </div>
-            </div>
+            <TenderComparisonPanel
+              comparisonResult={comparisonResult}
+              tenderNames={tenders.map((t) => t.fileName || t.name)}
+              showDiffsOnly={showDiffsOnly}
+              onShowDiffsOnlyChange={setShowDiffsOnly}
+              diffCount={diffCount}
+              matchCount={matchCount}
+              aiCompareResult={aiCompareResult}
+              loadingAiCompare={loadingAiCompare}
+              onEditFields={() => setViewMode("edit")}
+              onSaveToKb={() => setKbImportOpen(true)}
+            />
           ) : viewMode === "compare" ? (
             <div className="flex h-full flex-col items-center justify-center text-center">
               <GitCompare className="h-12 w-12 text-muted-foreground/50" />
@@ -1127,57 +1336,14 @@ function TenderPageContent() {
           ) : (
             <div className="space-y-8">
               {tenders.map((tender, ti) => (
-                <div key={tender.id}>
-                  <div className="flex items-center justify-between mb-3">
-                    <div>
-                      <h2 className="font-semibold">{tender.name}</h2>
-                      {tender.type && (
-                        <span className="text-xs text-muted-foreground capitalize">{tender.type.replace(/_/g, " ")}</span>
-                      )}
-                    </div>
-                    <button
-                      onClick={() => addField(ti)}
-                      className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
-                    >
-                      <Plus className="h-3 w-3" />
-                      Add Field
-                    </button>
-                  </div>
-                  <div className="space-y-2">
-                    {tender.fields.map((field, fi) => (
-                      <div key={fi} className="flex items-start gap-2 group">
-                        <input
-                          type="text"
-                          value={field.field}
-                          onChange={(e) => updateField(ti, fi, { field: e.target.value })}
-                          placeholder="Field"
-                          className="flex-1 rounded-md border bg-transparent px-3 py-2 text-sm font-medium"
-                        />
-                        <input
-                          type="text"
-                          value={field.value}
-                          onChange={(e) => updateField(ti, fi, { value: e.target.value })}
-                          placeholder="Value"
-                          className="flex-[3] rounded-md border bg-transparent px-3 py-2 text-sm"
-                        />
-                        <button
-                          onClick={() => deleteField(ti, fi)}
-                          className="rounded-md p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                  {tender.fields.length === 0 && (
-                    <p className="text-sm text-muted-foreground text-center py-4">
-                      No fields extracted —{" "}
-                      <button onClick={() => fileInputRef.current?.click()} className="text-primary hover:underline">
-                        upload a new document
-                      </button>
-                    </p>
-                  )}
-                </div>
+                <TenderStructuredFields
+                  key={tender.id}
+                  tender={tender}
+                  tenderIndex={ti}
+                  onAddField={addField}
+                  onUpdateField={updateField}
+                  onDeleteField={deleteField}
+                />
               ))}
             </div>
           )}

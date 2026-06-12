@@ -22,6 +22,8 @@ eggs/
 lib/
 !combine-ai-platform/apps/web/src/lib/
 !combine-ai-platform/apps/web/src/lib/**
+!combine-ai-platform/apps/web/src/features/**/lib/
+!combine-ai-platform/apps/web/src/features/**/lib/**
 lib64/
 parts/
 sdist/

@@ -1,16 +1,32 @@
 "use client"
 
-import { useEffect, useState, useCallback } from "react"
+import { useEffect, useState, useCallback, useRef } from "react"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@combine-ai/shared-ui"
-import { Plus, Trash2, Download, FileSpreadsheet } from "lucide-react"
+import { Plus, Trash2, Download, FileSpreadsheet, Loader2 } from "lucide-react"
 
 interface ReportSession {
   id: string
   title: string
   status: string
   updatedAt: string
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const config: Record<string, { label: string; className: string }> = {
+    processing: { label: "Processing", className: "bg-blue-100 text-blue-700" },
+    completed: { label: "Done", className: "bg-green-100 text-green-700" },
+    failed: { label: "Failed", className: "bg-red-100 text-red-700" },
+    active: { label: "Ready", className: "bg-muted text-muted-foreground" },
+  }
+  const cfg = config[status] || { label: status, className: "bg-muted text-muted-foreground" }
+  return (
+    <span className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0 text-[10px] font-medium ${cfg.className}`}>
+      {status === "processing" && <Loader2 className="h-2.5 w-2.5 animate-spin" />}
+      {cfg.label}
+    </span>
+  )
 }
 
 export function ReportSidebarContent() {
@@ -24,12 +40,24 @@ export function ReportSidebarContent() {
     ? decodeURIComponent(pathname.split("/").pop() || "")
     : null
 
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
   const fetchSessions = useCallback(async () => {
     try {
       const res = await fetch("/api/report/sessions")
       if (res.ok) {
         const data = await res.json()
-        setSessions(data.sessions || [])
+        const list: ReportSession[] = data.sessions || []
+        setSessions(list)
+
+        // Auto-poll if any session is processing
+        const hasProcessing = list.some((s) => s.status === "processing")
+        if (hasProcessing && !intervalRef.current) {
+          intervalRef.current = setInterval(fetchSessions, 3000)
+        } else if (!hasProcessing && intervalRef.current) {
+          clearInterval(intervalRef.current)
+          intervalRef.current = null
+        }
       }
     } catch (err) {
       console.error("Failed to load report sessions:", err)
@@ -39,10 +67,21 @@ export function ReportSidebarContent() {
   }, [])
 
   useEffect(() => {
+    // Fetch immediately on mount
     fetchSessions()
+
+    // Listen for update events
     const handler = () => fetchSessions()
     window.addEventListener("report:sessions-updated", handler)
-    return () => window.removeEventListener("report:sessions-updated", handler)
+
+    return () => {
+      window.removeEventListener("report:sessions-updated", handler)
+      // Clean up polling interval
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+    }
   }, [fetchSessions])
 
   const handleCreateSession = useCallback(async () => {
@@ -53,8 +92,7 @@ export function ReportSidebarContent() {
       body: JSON.stringify({ id, title: `New Report ${new Date().toLocaleDateString()}` }),
     })
     if (res.ok) {
-      const data = await res.json()
-      setSessions(data.sessions || [])
+      await fetchSessions() // refresh full list
       router.push(`/report/${id}`)
     }
   }, [router])
@@ -132,7 +170,10 @@ export function ReportSidebarContent() {
                     <FileSpreadsheet className="h-4 w-4 shrink-0" />
                     <div className="min-w-0 flex-1">
                       <p className="truncate">{session.title}</p>
-                      <p className="text-xs text-muted-foreground">{formatDate(session.updatedAt)}</p>
+                      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                        <span>{formatDate(session.updatedAt)}</span>
+                        <StatusBadge status={session.status} />
+                      </div>
                     </div>
                   </Link>
                   <button

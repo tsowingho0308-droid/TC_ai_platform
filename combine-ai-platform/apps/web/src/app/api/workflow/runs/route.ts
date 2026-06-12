@@ -131,3 +131,27 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Failed to create run" }, { status: 500 })
   }
 }
+
+export async function DELETE(request: NextRequest) {
+  const session = await requireSession().catch(() => null)
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+
+  try {
+    const { id } = (await request.json()) as { id?: string }
+    if (!id) return NextResponse.json({ error: "id is required" }, { status: 400 })
+
+    const run = await prisma.workflowRun.findFirst({
+      where: { id, workspaceId: session.workspaceId },
+    })
+    if (!run) return NextResponse.json({ error: "Run not found" }, { status: 404 })
+
+    // Delete steps first, then the run
+    await prisma.workflowStepRun.deleteMany({ where: { workflowRunId: id } })
+    await prisma.workflowRun.delete({ where: { id } })
+
+    return NextResponse.json({ success: true })
+  } catch (error) {
+    console.error("Workflow run DELETE error:", error)
+    return NextResponse.json({ error: "Failed to delete run" }, { status: 500 })
+  }
+}

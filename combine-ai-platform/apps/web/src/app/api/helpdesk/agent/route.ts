@@ -1,12 +1,14 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
-import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { getDashScopeProvider } from "@combine-ai/ai-provider/server"
 import type { ChatMessage, ToolDefinition } from "@combine-ai/ai-provider"
 import {
   searchKnowledgeBase,
   checkPgVector,
   formatSourcesText,
+  extractDateFromQuery,
   type SearchResult,
 } from "@/features/helpdesk/api/helpdesk-search"
 import { parseAIJson } from "@/lib/server/parse-json"
@@ -82,6 +84,25 @@ You have access to tools. Use them proactively:
 - **search_knowledge_base**: Search for relevant policies and procedures. Use this when the initial context does NOT contain the answer. Provide a specific search query. **IMPORTANT: Only call this ONCE. If it returns no results, do NOT search again — tell the user the information is not in the knowledge base and call create_ticket.**
 - **create_ticket**: Escalate to a human team. Include a clear reason for escalation and any partial answer you've gathered.
 - **check_ticket_status**: Look up the current status of an existing ticket by its ID.
+- **trigger_workflow**: Start a business workflow process for the user. Use this when the user explicitly asks to perform an action that matches a known workflow (employee onboarding, leave application, expense reimbursement, equipment/asset request, offboarding, procurement/purchase request).
+
+## Workflow Intent Recognition
+You are an intelligent workflow trigger. When a user describes a task that requires a multi-department process, you MUST proactively call the trigger_workflow tool instead of just explaining the process.
+
+### Workflow Categories & When to Trigger:
+- **ONBOARDING**: "I need to onboard a new employee", "set up a new hire", "new staff joining", "someone new starting next week"
+- **OFFBOARDING**: "someone is leaving", "offboard an employee", "last day procedures", "exit process"
+- **LEAVE_APPROVAL**: "apply for leave", "annual leave request", "sick leave", "maternity/paternity leave"
+- **PROCUREMENT**: "request new equipment", "order laptops", "purchase office supplies", "procurement request", "need to buy"
+- **CUSTOM**: Any other structured multi-step process the user describes
+
+### Workflow Trigger Rules:
+1. If the user's request clearly matches a workflow category → call trigger_workflow immediately (do NOT just explain the process)
+2. Pass the appropriate "category" parameter to find the right template
+3. If the user mentions a specific person (e.g., "new hire John Smith"), include their info in "targetPerson"
+4. After triggering, tell the user: "✅ 我已成功為您啟動【流程名稱】，目前進度已更新至第一步：{first_step_title}（負責部門：{department}）。您可以在 Workflow Agent 中追蹤進度。"
+5. If NO matching template exists, tell the user and suggest escalation or manual process
+6. Only skip trigger_workflow if the user is just asking a general question (not requesting an action)
 
 ## Current Knowledge Context
 {sources}
@@ -99,7 +120,8 @@ After using any necessary tools, provide your final answer as a JSON object with
 }
 
 Include "requiredReading" when the answer depends on multiple documents (e.g., playbook references).
-Include "processSteps" ONLY when answering a multi-step process question and a playbook/process map was found.`
+Include "processSteps" ONLY when answering a multi-step process question and a playbook/process map was found.
+Include "workflowRunId" when a workflow was triggered (the run ID from trigger_workflow result).`
 
 // ── Legacy Prompt (kept for backward-compatible ask/ask-stream) ──
 
@@ -183,7 +205,43 @@ const CHECK_TICKET_TOOL: ToolDefinition = {
   },
 }
 
-const HELPDESK_TOOLS = [SEARCH_KB_TOOL, CREATE_TICKET_TOOL, CHECK_TICKET_TOOL]
+const TRIGGER_WORKFLOW_TOOL: ToolDefinition = {
+  type: "function",
+  function: {
+    name: "trigger_workflow",
+    description:
+      "Start a workflow process for the user based on their request. Use this when the user asks to perform a business process that matches a known workflow template (e.g., employee onboarding, leave application, expense reimbursement, equipment request, offboarding). This creates a new workflow run with all the required steps assigned to the correct departments. The user can then track the progress of their request.",
+    parameters: {
+      type: "object",
+      properties: {
+        templateId: {
+          type: "string",
+          description:
+            "Optional: The specific template ID to use. If omitted, the system will search for the best matching template based on the user's request intent.",
+        },
+        category: {
+          type: "string",
+          enum: ["ONBOARDING", "OFFBOARDING", "PROCUREMENT", "LEAVE_APPROVAL", "CUSTOM"],
+          description:
+            "The category of workflow to trigger. Used to find the matching template if templateId is not provided.",
+        },
+        targetPerson: {
+          type: "object",
+          description:
+            "Optional: Information about the person who is the subject of this workflow (e.g., the new employee for onboarding, the person going on leave). Include name, department, and any other relevant details the user provided.",
+        },
+        title: {
+          type: "string",
+          description:
+            "Optional: A descriptive title for this workflow run. If not provided, one will be generated.",
+        },
+      },
+      required: [],
+    },
+  },
+}
+
+const HELPDESK_TOOLS = [SEARCH_KB_TOOL, CREATE_TICKET_TOOL, CHECK_TICKET_TOOL, TRIGGER_WORKFLOW_TOOL]
 
 // ── Tool Execution ───────────────────────────────────────────────
 
@@ -223,7 +281,7 @@ async function executeToolCall(
           workspaceId: session.workspaceId,
           department: args.department as string | undefined,
           topK: 5,
-          minSimilarity: 0.6,
+          minSimilarity: 0.42,
         }
       )
 
@@ -394,6 +452,150 @@ async function executeToolCall(
 
       return {
         result: ticket,
+        messages: [
+          {
+            role: "tool" as const,
+            toolCallId: toolCall.id,
+            name: fn.name,
+            content: JSON.stringify(resultContent),
+          },
+        ],
+      }
+    }
+
+    // ── trigger_workflow ──
+    case "trigger_workflow": {
+      const templateId = args.templateId as string | undefined
+      const category = (args.category as string) || undefined
+      const targetPerson = args.targetPerson as Record<string, unknown> | undefined
+      const customTitle = args.title as string | undefined
+
+      // Find matching template
+      let template: {
+        id: string
+        name: string
+        description: string | null
+        category: string
+        steps: Array<{ stepIndex: number; title: string; department: string; slaHours?: number | null }>
+      } | null = null
+
+      if (templateId) {
+        template = await prisma.workflowTemplate.findFirst({
+          where: { id: templateId, workspaceId: session.workspaceId },
+        }) as typeof template
+      }
+
+      // If no templateId, search by category
+      if (!template && category) {
+        template = await prisma.workflowTemplate.findFirst({
+          where: { workspaceId: session.workspaceId, category: category as never },
+          orderBy: { isDefault: "desc" },
+        }) as typeof template
+      }
+
+      // If still no match, try any default template
+      if (!template) {
+        template = await prisma.workflowTemplate.findFirst({
+          where: { workspaceId: session.workspaceId },
+          orderBy: [{ isDefault: "desc" }, { createdAt: "desc" }],
+        }) as typeof template
+      }
+
+      if (!template) {
+        return {
+          result: null,
+          messages: [
+            {
+              role: "tool" as const,
+              toolCallId: toolCall.id,
+              name: fn.name,
+              content: JSON.stringify({
+                error: "No workflow template found",
+                message:
+                  "There are no workflow templates configured yet. Please ask an admin to set up workflow templates first, then try again.",
+              }),
+            },
+          ],
+        }
+      }
+
+      // Create the workflow run
+      const stepsData = (template.steps || []) as Array<{
+        stepIndex: number
+        title: string
+        department: string
+        slaHours?: number | null
+      }>
+
+      const run = await prisma.workflowRun.create({
+        data: {
+          workspaceId: session.workspaceId,
+          userId: session.sub,
+          title:
+            customTitle ||
+            `${template.name} - ${new Date().toLocaleDateString("zh-HK")}`,
+          category: template.category as "ONBOARDING" | "OFFBOARDING" | "PROCUREMENT" | "LEAVE_APPROVAL" | "CUSTOM",
+          templateId: template.id,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          targetPerson: (targetPerson || undefined) as any,
+          steps: {
+            create: stepsData.map((s) => ({
+              stepIndex: s.stepIndex,
+              title: s.title,
+              department: s.department,
+              slaHours: s.slaHours || null,
+            })),
+          },
+        },
+        include: { steps: true },
+      })
+
+      // Build a user-friendly summary of the workflow
+      const stepList = stepsData
+        .map(
+          (s, i) =>
+            `${i + 1}. **${s.title}** → ${s.department}${s.slaHours ? ` (SLA: ${s.slaHours}h)` : ""}`
+        )
+        .join("\n")
+
+      const resultContent = {
+        success: true,
+        runId: run.id,
+        title: run.title,
+        category: run.category,
+        totalSteps: run.steps.length,
+        steps: stepList,
+        message: `Workflow "${template.name}" has been started with ${run.steps.length} steps. The first step has been assigned to the ${stepsData[0]?.department || "relevant"} department.`,
+        nextStep: stepsData[0]
+          ? {
+              title: stepsData[0].title,
+              department: stepsData[0].department,
+            }
+          : null,
+        templateName: template.name,
+      }
+
+      // Log AgentRun
+      await prisma.agentRun.create({
+        data: {
+          workspaceId: session.workspaceId,
+          kind: "WORKFLOW_EXECUTION",
+          status: "COMPLETED",
+          input: {
+            triggeredFrom: "HELPDESK_QA",
+            templateId: template.id,
+            templateName: template.name,
+            category: template.category,
+          } as never,
+          output: {
+            runId: run.id,
+            stepCount: run.steps.length,
+          } as never,
+        },
+      }).catch((err) => console.error("Failed to log workflow trigger:", err))
+
+      return {
+        result: run,
         messages: [
           {
             role: "tool" as const,
@@ -596,12 +798,18 @@ export async function POST(request: NextRequest) {
         const streamEncoder = new TextEncoder()
         const stream = new ReadableStream({
           async start(controller) {
+            let clientDisconnected = false
             const sendSSE = (event: string, data: Record<string, unknown>) => {
-              controller.enqueue(
-                streamEncoder.encode(
-                  `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+              if (clientDisconnected) return
+              try {
+                controller.enqueue(
+                  streamEncoder.encode(
+                    `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+                  )
                 )
-              )
+              } catch {
+                clientDisconnected = true
+              }
             }
             try {
               sendSSE("trace", {
@@ -672,12 +880,12 @@ export async function POST(request: NextRequest) {
                 result: qaStreamResult,
                 thinkingProcess: fullThinking || undefined,
               })
-              controller.close()
+              if (!clientDisconnected) controller.close()
             } catch (err) {
               sendSSE("error", {
                 detail: err instanceof Error ? err.message : "Unknown error",
               })
-              controller.close()
+              if (!clientDisconnected) controller.close()
             }
           },
         })
@@ -796,12 +1004,14 @@ export async function POST(request: NextRequest) {
         const userQuestion =
           typeof lastUserMsg?.content === "string" ? lastUserMsg.content : ""
 
+        const dateFilter = extractDateFromQuery(userQuestion)
         const searchResult = userQuestion
           ? await searchKnowledgeBase(userQuestion, {
               workspaceId: session.workspaceId,
               department: department as string | undefined,
               topK: 5,
-              minSimilarity: 0.6,
+              minSimilarity: 0.42,
+              dateFilter: dateFilter.type ? dateFilter as { type: "exact" | "recent"; date?: Date } : undefined,
             })
           : { articles: [] as SearchResult[], suggestions: [] as SearchResult[], maxScore: 0, tier: "none" as const, searchMethod: "none" as const }
 
@@ -811,21 +1021,27 @@ export async function POST(request: NextRequest) {
         let sourcesText: string
         if (searchTier === "suggestions" && suggestions.length > 0) {
           const sugTitles = suggestions.map((s) => `"${s.title}" (${s.department}, ${Math.round((s.similarity ?? 0) * 100)}% match)`).join(", ")
-          sourcesText = `⚠️ SUGGESTIONS FALLBACK — No strong matches found (best score: ${Math.round(maxScore * 100)}%).
+          sourcesText = `⚠️ SUGGESTIONS FALLBACK — These documents are the CLOSEST matches found (best score: ${Math.round(maxScore * 100)}%).
 
-The following documents are PARTIALLY relevant but below the confidence threshold:
-${suggestions.map((s, i) => `[Suggestion ${i + 1}] Title: ${s.title}\nDepartment: ${s.department}\nContent: ${s.content.slice(0, 1000)}\nRelevance: ${Math.round((s.similarity ?? 0) * 100)}%\n`).join("\n")}
+You MUST follow these IRON RULES:
+1. You MUST NOT say "找不到相關資料" / "未找到" / "I cannot find" / "not found" — these phrases are FORBIDDEN.
+2. You MUST acknowledge the closest match and present it helpfully.
+3. You MUST respond in this EXACT format (adapt language to match the user):
 
-INSTRUCTIONS: You MUST respond in this format:
-"找不到與您提問完全相符的內容 😢，或許您是指以下相關規定？
+"沒有找到完全100%匹配的文件，但為您找到最接近的相關文件如下：
 
-- **${suggestions[0]?.title || "[文件標題]"}**（${suggestions[0]?.department || ""}）
-${suggestions.length > 1 ? `- **${suggestions[1]?.title || "[文件標題]"}**（${suggestions[1]?.department || ""}）` : ""}
+📄 **${suggestions[0]?.title || "[文件標題]"}**（${suggestions[0]?.department || ""}，相關度 ${Math.round((suggestions[0]?.similarity ?? 0) * 100)}%）
+> ${suggestions[0]?.content.slice(0, 200) || ""}...
+${suggestions.length > 1 ? `\n📄 **${suggestions[1]?.title || "[文件標題]"}**（${suggestions[1]?.department || ""}，相關度 ${Math.round((suggestions[1]?.similarity ?? 0) * 100)}%）\n> ${suggestions[1]?.content.slice(0, 200) || ""}...` : ""}
 
-請問您想查詢以上哪一份文件的詳細內容？如果都不是您要找的，我可以為您建立工單轉交相關部門跟進。"
+這份就是目前知識庫中最接近您需求的內容。請問需要我為您：
+- 📖 提供這份文件的完整摘要？
+- 🎫 建立工單請相關部門提供更精確的文件？
+- 🔍 用其他關鍵字重新搜尋？"
 
-Do NOT call search_knowledge_base. Do NOT create a ticket unless the user confirms.
-Respond in the SAME LANGUAGE as the user.`
+4. Do NOT call search_knowledge_base. Do NOT call create_ticket unless user explicitly requests it.
+5. Do NOT answer the user's original question — you don't have enough info. Focus on presenting the closest match.
+6. Respond in the SAME LANGUAGE as the user.`
         } else {
           sourcesText = formatSourcesText(articles)
         }
@@ -968,12 +1184,19 @@ Respond in the SAME LANGUAGE as the user.`
         const streamEncoder = new TextEncoder()
         const stream = new ReadableStream({
           async start(controller) {
+            let clientDisconnected = false
+
             const sendSSE = (event: string, data: Record<string, unknown>) => {
-              controller.enqueue(
-                streamEncoder.encode(
-                  `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+              if (clientDisconnected) return
+              try {
+                controller.enqueue(
+                  streamEncoder.encode(
+                    `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+                  )
                 )
-              )
+              } catch {
+                clientDisconnected = true
+              }
             }
 
             try {
@@ -1028,12 +1251,14 @@ Respond in the SAME LANGUAGE as the user.`
                   ? lastUserMsg.content
                   : ""
 
+              const streamDateFilter = extractDateFromQuery(userQuestion)
               const searchResult = userQuestion
                 ? await searchKnowledgeBase(userQuestion, {
                     workspaceId: session.workspaceId,
                     department: streamDept as string | undefined,
                     topK: 5,
-                    minSimilarity: 0.6,
+                    minSimilarity: 0.42,
+                    dateFilter: streamDateFilter.type ? streamDateFilter as { type: "exact" | "recent"; date?: Date } : undefined,
                   })
                 : { articles: [] as SearchResult[], suggestions: [] as SearchResult[], maxScore: 0, tier: "none" as const, searchMethod: "none" as const }
 
@@ -1042,14 +1267,21 @@ Respond in the SAME LANGUAGE as the user.`
               // Build sources text with suggestions fallback
               let sourcesText: string
               if (searchTier === "suggestions" && suggestions.length > 0) {
-                const sugTitles = suggestions.map((s) => `"${s.title}"`).join(", ")
-                sourcesText = `⚠️ SUGGESTIONS FALLBACK — No strong matches (best: ${Math.round(maxScore * 100)}%).
+                sourcesText = `⚠️ SUGGESTIONS FALLBACK — CLOSEST matches (best: ${Math.round(maxScore * 100)}%).
 
-Suggestions: ${sugTitles}
+IRON RULES:
+1. NEVER say "找不到" / "not found" / "沒有相關資料"
+2. MUST present the closest match with title and preview
+3. MUST use this format:
+"沒有找到完全100%匹配的文件，但為您找到最接近的相關文件：
 
-INSTRUCTIONS: Respond with "找不到與您提問完全相符的內容 😢，或許您是指以下相關規定？" and list the suggestion titles. Do NOT call search_knowledge_base. Ask user to confirm before creating ticket.
+📄 **${suggestions[0]?.title || ""}**（${suggestions[0]?.department || ""}，相關度 ${Math.round((suggestions[0]?.similarity ?? 0) * 100)}%）
+> ${suggestions[0]?.content.slice(0, 200) || ""}...
 
-${suggestions.map((s) => `[Suggestion] ${s.title} (${s.department}, ${Math.round((s.similarity ?? 0) * 100)}%)\n${s.content.slice(0, 500)}`).join("\n\n")}`
+這份就是目前知識庫中最接近您需求的內容。請問需要我提供更多資訊，還是為您建立工單？"
+4. Do NOT call tools unless user requests.
+
+${suggestions.map((s) => `[Doc] ${s.title} (${s.department}, ${Math.round((s.similarity ?? 0) * 100)}%)\n${s.content.slice(0, 500)}`).join("\n\n")}`
               } else {
                 sourcesText = formatSourcesText(articles)
               }
@@ -1122,9 +1354,8 @@ ${suggestions.map((s) => `[Suggestion] ${s.title} (${s.department}, ${Math.round
 
                 // No tool calls → final answer
                 if (!result.toolCalls || result.toolCalls.length === 0) {
-                  const finalResult = parseJsonResult(
-                    accumulatedContent || result.messageContent
-                  )
+                  const answer = accumulatedContent || result.messageContent
+                  const finalResult = parseJsonResult(answer)
 
                   // Log AgentRun
                   await prisma.agentRun.create({
@@ -1146,6 +1377,36 @@ ${suggestions.map((s) => `[Suggestion] ${s.title} (${s.department}, ${Math.round
                     },
                   })
 
+                  // Persist the AI response to the conversation's messages
+                  if (convId) {
+                    try {
+                      const conv = await prisma.helpdeskConversation.findUnique({
+                        where: { id: convId },
+                        select: { messages: true },
+                      })
+                      const existingMessages =
+                        (conv?.messages as Array<Record<string, unknown>>) || []
+                      const updatedMessages = [
+                        ...existingMessages,
+                        {
+                          role: "assistant",
+                          content: answer,
+                          thinking: accumulatedThinking || undefined,
+                          sources: finalResult.sources || undefined,
+                          needsEscalation: finalResult.needsEscalation || false,
+                          suggestedDepartment: finalResult.suggestedDepartment || undefined,
+                        },
+                      ]
+                      await prisma.helpdeskConversation.update({
+                        where: { id: convId },
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                        data: { messages: updatedMessages as any },
+                      })
+                    } catch (err) {
+                      console.error("Failed to persist AI response to conversation:", err)
+                    }
+                  }
+
                   sendSSE("result", {
                     result: {
                       conversationId: convId,
@@ -1159,7 +1420,9 @@ ${suggestions.map((s) => `[Suggestion] ${s.title} (${s.department}, ${Math.round
                     },
                     thinkingProcess: accumulatedThinking || undefined,
                   })
-                  controller.close()
+                  if (!clientDisconnected) {
+                    controller.close()
+                  }
                   return
                 }
 
@@ -1226,12 +1489,12 @@ ${suggestions.map((s) => `[Suggestion] ${s.title} (${s.department}, ${Math.round
                 detail:
                   "I could not find the information you need in our knowledge base. Please try rephrasing or contact a human agent for assistance.",
               })
-              controller.close()
+              if (!clientDisconnected) controller.close()
             } catch (err) {
               sendSSE("error", {
                 detail: err instanceof Error ? err.message : "Unknown error",
               })
-              controller.close()
+              if (!clientDisconnected) controller.close()
             }
           },
         })
