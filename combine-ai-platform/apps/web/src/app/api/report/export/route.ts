@@ -5,9 +5,54 @@ import {
   buildBatchMarkdown,
   buildBatchXlsx,
 } from "@/lib/server/report-batch-export"
+import { buildReportDocx } from "@/lib/server/report-docx-export"
 import * as XLSX from "xlsx"
 
 export const dynamic = "force-dynamic"
+
+function buildReportSummaryBody(params: {
+  fileName?: string
+  summary: string
+  rows?: Array<{ field: string; value: string }>
+  keyPoints?: string[]
+  kbReferences?: Array<{
+    articleTitle: string
+    knowledgeBaseName: string
+    relevance: string
+  }>
+}): { title: string; bodyText: string } {
+  const { fileName, summary, rows, keyPoints, kbReferences } = params
+  const title = `Report Summary — ${fileName || "document"}`
+  const lines: string[] = []
+
+  if (rows && rows.length > 0) {
+    lines.push("## 抽取欄位", "")
+    for (const row of rows) {
+      lines.push(`- ${row.field || ""}: ${row.value || ""}`)
+    }
+    lines.push("")
+  }
+
+  lines.push("## 總述", summary, "")
+
+  if (keyPoints && keyPoints.length > 0) {
+    lines.push("## 知識庫相關要點", "")
+    for (const point of keyPoints) {
+      lines.push(`- ${point}`)
+    }
+    lines.push("")
+  }
+
+  if (kbReferences && kbReferences.length > 0) {
+    lines.push("## 參考條文", "")
+    for (const ref of kbReferences) {
+      lines.push(`- **${ref.articleTitle}** (${ref.knowledgeBaseName}) — ${ref.relevance}`)
+    }
+    lines.push("")
+  }
+
+  return { title, bodyText: lines.join("\n") }
+}
 
 export async function POST(request: Request) {
   const session = await requireSession().catch(() => null)
@@ -16,7 +61,7 @@ export async function POST(request: Request) {
   try {
     const body = (await request.json()) as {
       rows?: Array<{ field: string; value: string }>
-      format?: "xlsx" | "csv" | "md" | "batch-md" | "batch-xlsx"
+      format?: "xlsx" | "csv" | "md" | "docx" | "batch-md" | "batch-xlsx"
       summary?: string
       keyPoints?: string[]
       kbReferences?: Array<{
@@ -92,47 +137,31 @@ export async function POST(request: Request) {
       })
     }
 
-    if (exportFormat === "md") {
+    if (exportFormat === "md" || exportFormat === "docx") {
       if (!summary) {
-        return NextResponse.json({ error: "summary required for md export" }, { status: 400 })
+        return NextResponse.json({ error: "summary required for report export" }, { status: 400 })
       }
 
-      const lines = [
-        `# Report Summary — ${fileName || "document"}`,
-        "",
-      ]
+      const { title, bodyText } = buildReportSummaryBody({
+        fileName,
+        summary,
+        rows,
+        keyPoints,
+        kbReferences,
+      })
 
-      if (rows && rows.length > 0) {
-        lines.push("## 抽取欄位", "")
-        lines.push("| Field | Value |")
-        lines.push("| --- | --- |")
-        for (const row of rows) {
-          const field = (row.field || "").replace(/\|/g, "\\|")
-          const value = (row.value || "").replace(/\|/g, "\\|")
-          lines.push(`| ${field} | ${value} |`)
-        }
-        lines.push("")
+      if (exportFormat === "docx") {
+        const docxBuffer = await buildReportDocx({ title, bodyText })
+        return new NextResponse(new Uint8Array(docxBuffer), {
+          headers: {
+            "Content-Type":
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "Content-Disposition": `attachment; filename="report-summary-${Date.now()}.docx"`,
+          },
+        })
       }
 
-      lines.push("## 總述", summary, "")
-
-      if (keyPoints && keyPoints.length > 0) {
-        lines.push("## 知識庫相關要點", "")
-        for (const point of keyPoints) {
-          lines.push(`- ${point}`)
-        }
-        lines.push("")
-      }
-
-      if (kbReferences && kbReferences.length > 0) {
-        lines.push("## 參考條文", "")
-        for (const ref of kbReferences) {
-          lines.push(`- **${ref.articleTitle}** (${ref.knowledgeBaseName}) — ${ref.relevance}`)
-        }
-        lines.push("")
-      }
-
-      const markdown = lines.join("\n")
+      const markdown = `# ${title}\n\n${bodyText}`
       return new NextResponse(markdown, {
         headers: {
           "Content-Type": "text/markdown; charset=utf-8",

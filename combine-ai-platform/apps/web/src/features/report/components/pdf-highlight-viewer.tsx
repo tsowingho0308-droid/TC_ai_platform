@@ -57,7 +57,6 @@ const EMPTY_HIGHLIGHTS: Highlight[] = []
 interface OverlayRect extends TextLayerBox {
   color: string
   label?: string
-  flash?: boolean
   zIndex?: number
 }
 
@@ -172,7 +171,6 @@ export default function PdfHighlightViewer({
             ...box,
             color: HIGHLIGHT_BLUE,
             label: focusHighlight.field,
-            flash: true,
             zIndex: 2,
           })
         }
@@ -498,7 +496,7 @@ export default function PdfHighlightViewer({
                         key={i}
                         className={cn(
                           "absolute rounded-[2px]",
-                          rect.flash && "animate-pulse ring-2 ring-primary/70"
+                          rect.color === HIGHLIGHT_BLUE && "ring-1 ring-primary/50"
                         )}
                         style={{
                           left: rect.left,

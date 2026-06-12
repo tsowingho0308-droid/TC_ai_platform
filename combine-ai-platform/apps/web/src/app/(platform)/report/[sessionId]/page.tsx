@@ -317,6 +317,55 @@ export default function ReportSessionPage() {
     }
   }
 
+  async function downloadExportBlob(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  async function exportWord() {
+    if (!reportSummary) return
+    try {
+      const res = await fetch("/api/report/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          format: "docx",
+          rows: extractedRows.length > 0 ? extractedRows : undefined,
+          summary: reportSummary.summary,
+          keyPoints: reportSummary.keyPoints,
+          kbReferences: reportSummary.kbReferences,
+          fileName: session?.title || fileName || undefined,
+        }),
+      })
+      if (!res.ok) throw new Error("Export failed")
+      await downloadExportBlob(await res.blob(), `report-summary-${Date.now()}.docx`)
+    } catch (err) {
+      console.error("Export Word error:", err)
+    }
+  }
+
+  async function exportExcel() {
+    if (extractedRows.length === 0) return
+    try {
+      const res = await fetch("/api/report/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          format: "xlsx",
+          rows: extractedRows,
+        }),
+      })
+      if (!res.ok) throw new Error("Export failed")
+      await downloadExportBlob(await res.blob(), `report-export-${Date.now()}.xlsx`)
+    } catch (err) {
+      console.error("Export Excel error:", err)
+    }
+  }
+
   // ── Loading state ──
   if (loading) {
     return (
@@ -363,6 +412,24 @@ export default function ReportSessionPage() {
         </div>
         <div className="flex items-center gap-2">
           <ModelSelector value={model} onChange={setModel} />
+          <button
+            type="button"
+            onClick={exportWord}
+            disabled={!reportSummary}
+            className="inline-flex items-center gap-2 rounded-md border bg-background px-3 py-1.5 text-sm font-medium disabled:opacity-50"
+          >
+            <Download className="h-4 w-4" />
+            Export Word (.docx)
+          </button>
+          <button
+            type="button"
+            onClick={exportExcel}
+            disabled={extractedRows.length === 0}
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-50"
+          >
+            <Download className="h-4 w-4" />
+            Export Excel (.xlsx)
+          </button>
         </div>
       </header>
 
