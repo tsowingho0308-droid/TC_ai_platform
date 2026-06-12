@@ -65,17 +65,24 @@ export async function chat(req: ChatRequest): Promise<ChatResponse> {
 
 // ── Streaming Chat ───────────────────────────────────────────────
 
+export interface StreamOptions {
+  signal?: AbortSignal
+}
+
 export async function chatStream(
   req: ChatRequest,
-  callbacks: StreamCallbacks
+  callbacks: StreamCallbacks,
+  options?: StreamOptions
 ): Promise<void> {
   const res = await fetch("/api/helpdesk/agent?action=chat-stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
+    signal: options?.signal,
   })
 
   if (!res.ok || !res.body) {
+    if (options?.signal?.aborted) return
     callbacks.onError?.(
       res.ok ? "No response body" : `Request failed: ${res.status}`
     )
@@ -87,6 +94,10 @@ export async function chatStream(
   let buffer = ""
 
   while (true) {
+    if (options?.signal?.aborted) {
+      reader.cancel()
+      return
+    }
     const { done, value } = await reader.read()
     if (done) break
 

@@ -598,12 +598,18 @@ export async function POST(request: NextRequest) {
         const streamEncoder = new TextEncoder()
         const stream = new ReadableStream({
           async start(controller) {
+            let clientDisconnected = false
             const sendSSE = (event: string, data: Record<string, unknown>) => {
-              controller.enqueue(
-                streamEncoder.encode(
-                  `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+              if (clientDisconnected) return
+              try {
+                controller.enqueue(
+                  streamEncoder.encode(
+                    `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+                  )
                 )
-              )
+              } catch {
+                clientDisconnected = true
+              }
             }
             try {
               sendSSE("trace", {
@@ -674,12 +680,12 @@ export async function POST(request: NextRequest) {
                 result: qaStreamResult,
                 thinkingProcess: fullThinking || undefined,
               })
-              controller.close()
+              if (!clientDisconnected) controller.close()
             } catch (err) {
               sendSSE("error", {
                 detail: err instanceof Error ? err.message : "Unknown error",
               })
-              controller.close()
+              if (!clientDisconnected) controller.close()
             }
           },
         })
@@ -978,12 +984,19 @@ ${suggestions.length > 1 ? `\n📄 **${suggestions[1]?.title || "[文件標題]"
         const streamEncoder = new TextEncoder()
         const stream = new ReadableStream({
           async start(controller) {
+            let clientDisconnected = false
+
             const sendSSE = (event: string, data: Record<string, unknown>) => {
-              controller.enqueue(
-                streamEncoder.encode(
-                  `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+              if (clientDisconnected) return
+              try {
+                controller.enqueue(
+                  streamEncoder.encode(
+                    `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+                  )
                 )
-              )
+              } catch {
+                clientDisconnected = true
+              }
             }
 
             try {
@@ -1141,9 +1154,8 @@ ${suggestions.map((s) => `[Doc] ${s.title} (${s.department}, ${Math.round((s.sim
 
                 // No tool calls → final answer
                 if (!result.toolCalls || result.toolCalls.length === 0) {
-                  const finalResult = parseJsonResult(
-                    accumulatedContent || result.messageContent
-                  )
+                  const answer = accumulatedContent || result.messageContent
+                  const finalResult = parseJsonResult(answer)
 
                   // Log AgentRun
                   await prisma.agentRun.create({
@@ -1165,6 +1177,35 @@ ${suggestions.map((s) => `[Doc] ${s.title} (${s.department}, ${Math.round((s.sim
                     },
                   })
 
+                  // Persist the AI response to the conversation's messages
+                  if (convId) {
+                    try {
+                      const conv = await prisma.helpdeskConversation.findUnique({
+                        where: { id: convId },
+                        select: { messages: true },
+                      })
+                      const existingMessages =
+                        (conv?.messages as Array<Record<string, unknown>>) || []
+                      const updatedMessages = [
+                        ...existingMessages,
+                        {
+                          role: "assistant",
+                          content: answer,
+                          thinking: accumulatedThinking || undefined,
+                          sources: finalResult.sources || undefined,
+                          needsEscalation: finalResult.needsEscalation || false,
+                          suggestedDepartment: finalResult.suggestedDepartment || undefined,
+                        },
+                      ]
+                      await prisma.helpdeskConversation.update({
+                        where: { id: convId },
+                        data: { messages: updatedMessages },
+                      })
+                    } catch (err) {
+                      console.error("Failed to persist AI response to conversation:", err)
+                    }
+                  }
+
                   sendSSE("result", {
                     result: {
                       conversationId: convId,
@@ -1178,7 +1219,9 @@ ${suggestions.map((s) => `[Doc] ${s.title} (${s.department}, ${Math.round((s.sim
                     },
                     thinkingProcess: accumulatedThinking || undefined,
                   })
-                  controller.close()
+                  if (!clientDisconnected) {
+                    controller.close()
+                  }
                   return
                 }
 
@@ -1245,12 +1288,12 @@ ${suggestions.map((s) => `[Doc] ${s.title} (${s.department}, ${Math.round((s.sim
                 detail:
                   "I could not find the information you need in our knowledge base. Please try rephrasing or contact a human agent for assistance.",
               })
-              controller.close()
+              if (!clientDisconnected) controller.close()
             } catch (err) {
               sendSSE("error", {
                 detail: err instanceof Error ? err.message : "Unknown error",
               })
-              controller.close()
+              if (!clientDisconnected) controller.close()
             }
           },
         })
