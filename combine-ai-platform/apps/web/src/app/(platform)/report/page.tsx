@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useRef, useEffect, Suspense } from "react"
+import { useState, useRef, useEffect, useCallback, useMemo, Suspense } from "react"
 import dynamic from "next/dynamic"
 import { useSearchParams } from "next/navigation"
 import Link from "next/link"
@@ -28,6 +28,17 @@ import {
   isAnalyzableEmailAttachment,
   parseAttachmentIdsFromSearchParams,
 } from "@/features/cross-agent/email-attachments"
+import {
+  ReportUploadQueue,
+  buildUploadFileId,
+  type PendingUploadFile,
+} from "@/features/report/components/report-upload-queue"
+import {
+  ReportExtractionPanel,
+} from "@/features/report/components/report-extraction-panel"
+import type { ExtractionRow } from "@/features/report/components/report-extraction-table"
+import type { PreviewDocument } from "@/features/report/components/pdf-highlight-viewer"
+import { buildReportDraftNote } from "@/features/report/lib/report-draft-note"
 const PdfHighlightViewer = dynamic(
   () => import("@/features/report/components/pdf-highlight-viewer"),
   {
@@ -40,7 +51,9 @@ const PdfHighlightViewer = dynamic(
   }
 )
 
-interface TableRow {
+interface TableRow extends ExtractionRow {}
+
+interface HighlightRow {
   field: string
   value: string
   page?: number
@@ -102,7 +115,22 @@ function ReportPageContent() {
   const [loadingEmailExtract, setLoadingEmailExtract] = useState(false)
   const [generatingReport, setGeneratingReport] = useState(false)
   const [extractedRows, setExtractedRows] = useState<TableRow[]>([])
+  const [extractionHighlights, setExtractionHighlights] = useState<HighlightRow[]>([])
   const [kbHighlightPhrases, setKbHighlightPhrases] = useState<string[]>([])
+  const [highlightEnabled, setHighlightEnabled] = useState(false)
+  const [showAllHighlights, setShowAllHighlights] = useState(false)
+  const [activePreviewId, setActivePreviewId] = useState<string | null>(null)
+  const [focusTarget, setFocusTarget] = useState<{
+    page?: number
+    field: string
+    value: string
+  } | null>(null)
+  const [selectedTableRowIndex, setSelectedTableRowIndex] = useState<number | null>(null)
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
+  const [pendingFiles, setPendingFiles] = useState<PendingUploadFile[]>([])
+  const [selectedUploadFileIds, setSelectedUploadFileIds] = useState<Set<string>>(new Set())
+  const [loadingBatchExtract, setLoadingBatchExtract] = useState(false)
+  const [savingRows, setSavingRows] = useState(false)
   const [reportSummary, setReportSummary] = useState<ReportSummary | null>(null)
   const [extracting, setExtracting] = useState(false)
   const [model, setModel] = useState(DEFAULT_MODELS.report)
@@ -128,7 +156,78 @@ function ReportPageContent() {
   const extractMergeRef = useRef<{ appendRows: boolean; sourceLabel?: string }>({
     appendRows: false,
   })
+  const rowsSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const traceSeqRef = useRef(0)
+
+  function buildSummaryDraftNote(summary: ReportSummary): string {
+    return buildReportDraftNote(summary)
+  }
+
+  const persistSessionRows = useCallback(async (rows: TableRow[]) => {
+    if (!activeSessionId) return
+    setSavingRows(true)
+    try {
+      await fetch("/api/report/sessions", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: activeSessionId, rows }),
+      })
+      window.dispatchEvent(new Event("report:sessions-updated"))
+    } catch (err) {
+      console.error("Failed to save rows:", err)
+    } finally {
+      setSavingRows(false)
+    }
+  }, [activeSessionId])
+
+  const persistSessionSummary = useCallback(async (summary: ReportSummary) => {
+    if (!activeSessionId) return
+    try {
+      await fetch("/api/report/sessions", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: activeSessionId,
+          draftNote: buildSummaryDraftNote(summary),
+        }),
+      })
+      window.dispatchEvent(new Event("report:sessions-updated"))
+    } catch (err) {
+      console.error("Failed to save summary:", err)
+    }
+  }, [activeSessionId])
+
+  const ensureSessionId = useCallback(async (titleHint?: string): Promise<string | null> => {
+    if (activeSessionId) return activeSessionId
+    const id = `report-${Date.now()}`
+    const title = titleHint || `Report ${new Date().toLocaleDateString()}`
+    try {
+      const res = await fetch("/api/report/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, title }),
+      })
+      if (res.ok) {
+        setActiveSessionId(id)
+        window.dispatchEvent(new Event("report:sessions-updated"))
+        return id
+      }
+    } catch (err) {
+      console.error("Failed to create session:", err)
+    }
+    return null
+  }, [activeSessionId])
+
+  useEffect(() => {
+    if (!activeSessionId || extractedRows.length === 0) return
+    if (rowsSaveTimerRef.current) clearTimeout(rowsSaveTimerRef.current)
+    rowsSaveTimerRef.current = setTimeout(() => {
+      void persistSessionRows(extractedRows)
+    }, 800)
+    return () => {
+      if (rowsSaveTimerRef.current) clearTimeout(rowsSaveTimerRef.current)
+    }
+  }, [extractedRows, activeSessionId, persistSessionRows])
 
   useEffect(() => {
     if (!fromEmailId) {
@@ -183,7 +282,10 @@ function ReportPageContent() {
     setConfidence(null)
     setReportSummary(null)
     setExtractedRows([])
+    setExtractionHighlights([])
     setKbHighlightPhrases([])
+    setFocusTarget(null)
+    setSelectedTableRowIndex(null)
   }
 
   function resetState() {
@@ -220,7 +322,7 @@ function ReportPageContent() {
       sourceLabel: att.fileName,
     }
 
-    await extractFromFile(file, note)
+    await extractFromFile(file, note, await ensureSessionId(att.fileName))
   }
 
   async function consumeExtractStream(response: Response) {
@@ -270,6 +372,7 @@ function ReportPageContent() {
 
     const controller = new AbortController()
     abortRef.current = controller
+    const sessionId = await ensureSessionId(emailSource.subject)
 
     try {
       setStreamingStatus("thinking")
@@ -282,6 +385,7 @@ function ReportPageContent() {
           fileName: `${emailSource.subject || "email"}.txt`,
           instructions: note || undefined,
           model,
+          sessionId: sessionId || undefined,
         }),
         signal: controller.signal,
       })
@@ -375,24 +479,200 @@ function ReportPageContent() {
   }
 
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (!file) return
+    const files = Array.from(e.target.files ?? [])
+    if (files.length === 0) return
+
+    const nextEntries = files.map((file) => ({
+      id: buildUploadFileId(file),
+      file,
+    }))
 
     resetAnalysisState()
-    if (previewUrl) URL.revokeObjectURL(previewUrl)
 
-    const url = URL.createObjectURL(file)
-    setPreviewUrl(url)
-    setPreviewFile(file)
+    setPendingFiles((prev) => {
+      const existingIds = new Set(prev.map((p) => p.id))
+      const merged = [...prev]
+      for (const entry of nextEntries) {
+        if (!existingIds.has(entry.id)) merged.push(entry)
+      }
+      return merged
+    })
+    setSelectedUploadFileIds((prev) => {
+      const next = new Set(prev)
+      for (const entry of nextEntries) next.add(entry.id)
+      return next
+    })
+
+    const firstFile = nextEntries[0].file
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    setPreviewUrl(URL.createObjectURL(firstFile))
+    setPreviewFile(firstFile)
+
+    if (fileInputRef.current) fileInputRef.current.value = ""
+  }
+
+  function clearUploadedFiles() {
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    setPreviewUrl(null)
+    setPreviewFile(null)
+    setPendingFiles([])
+    setSelectedUploadFileIds(new Set())
+    resetAnalysisState()
   }
 
   async function handleAnalyzeFile() {
     if (!previewFile) return
     resetAnalysisState()
-    await extractFromFile(previewFile, note)
+    const sessionId = await ensureSessionId(previewFile.name)
+    await extractFromFile(previewFile, note, sessionId)
   }
 
-  async function extractFromFile(file: File, instructions: string) {
+  function replaceExtractedRows(rows: TableRow[]) {
+    setExtractedRows(rows)
+  }
+
+  function toggleUploadFileSelection(fileId: string) {
+    setSelectedUploadFileIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(fileId)) next.delete(fileId)
+      else next.add(fileId)
+      return next
+    })
+  }
+
+  function selectAllUploadFiles() {
+    setSelectedUploadFileIds(new Set(pendingFiles.map((f) => f.id)))
+  }
+
+  function clearUploadFileSelection() {
+    setSelectedUploadFileIds(new Set())
+  }
+
+  function removeUploadFile(fileId: string) {
+    setPendingFiles((prev) => prev.filter((f) => f.id !== fileId))
+    setSelectedUploadFileIds((prev) => {
+      const next = new Set(prev)
+      next.delete(fileId)
+      return next
+    })
+  }
+
+  function removeSelectedUploadFiles() {
+    setPendingFiles((prev) => prev.filter((f) => !selectedUploadFileIds.has(f.id)))
+    setSelectedUploadFileIds(new Set())
+  }
+
+  async function handleBatchAnalyzeSelected() {
+    const selected = pendingFiles.filter((f) => selectedUploadFileIds.has(f.id))
+    if (selected.length === 0) return
+
+    resetAnalysisState()
+    setLoadingBatchExtract(true)
+    setError(null)
+
+    try {
+      const sessionId = await ensureSessionId(
+        selected.length === 1 ? selected[0].file.name : `Batch (${selected.length} files)`
+      )
+
+      for (let i = 0; i < selected.length; i++) {
+        const entry = selected[i]
+        if (i === 0) {
+          if (previewUrl) URL.revokeObjectURL(previewUrl)
+          setPreviewUrl(URL.createObjectURL(entry.file))
+          setPreviewFile(entry.file)
+        }
+        extractMergeRef.current = {
+          appendRows: i > 0,
+          sourceLabel: entry.file.name,
+        }
+        await extractFromFile(entry.file, note, sessionId)
+      }
+    } catch (err) {
+      console.error("Batch extract error:", err)
+      setError(err instanceof Error ? err.message : "Batch analysis failed")
+      setStreamingStatus("error")
+    } finally {
+      setLoadingBatchExtract(false)
+      extractMergeRef.current = { appendRows: false }
+    }
+  }
+
+  function updateExtractedRow(index: number, update: Partial<TableRow>) {
+    setExtractedRows((prev) =>
+      prev.map((row, i) => (i === index ? { ...row, ...update } : row))
+    )
+  }
+
+  function addExtractedRow() {
+    setExtractedRows((prev) => [...prev, { field: "New Field", value: "" }])
+  }
+
+  function deleteExtractedRow(index: number) {
+    setExtractedRows((prev) => prev.filter((_, i) => i !== index))
+    setSelectedTableRowIndex((prev) => (prev === index ? null : prev))
+  }
+
+  function handleTableRowClick(index: number, row: TableRow) {
+    setSelectedTableRowIndex(index)
+    setHighlightEnabled(true)
+    setShowAllHighlights(false)
+    setFocusTarget({
+      page: row.page,
+      field: row.field,
+      value: row.value,
+    })
+  }
+
+  const pdfPreviewDocuments = useMemo((): PreviewDocument[] => {
+    return pendingFiles
+      .filter((p) => p.file.type === "application/pdf")
+      .map((p) => ({
+        id: p.id,
+        name: p.file.name,
+        url: URL.createObjectURL(p.file),
+      }))
+  }, [pendingFiles])
+
+  useEffect(() => {
+    return () => {
+      pdfPreviewDocuments.forEach((d) => URL.revokeObjectURL(d.url))
+    }
+  }, [pdfPreviewDocuments])
+
+  useEffect(() => {
+    if (pdfPreviewDocuments.length === 0) {
+      setActivePreviewId(null)
+      return
+    }
+    if (!activePreviewId || !pdfPreviewDocuments.some((d) => d.id === activePreviewId)) {
+      setActivePreviewId(pdfPreviewDocuments[0].id)
+    }
+  }, [pdfPreviewDocuments, activePreviewId])
+
+  const activePdfDoc =
+    pdfPreviewDocuments.find((d) => d.id === activePreviewId) ?? pdfPreviewDocuments[0]
+
+  const viewerFileUrl =
+    activePdfDoc?.url ??
+    (previewFile?.type === "application/pdf" ? previewUrl : null)
+
+  const viewerFileName = activePdfDoc?.name ?? previewFile?.name ?? ""
+
+  const documentHighlights = useMemo(() => {
+    if (!viewerFileName) return extractionHighlights
+    return extractionHighlights.filter((h) => {
+      const sep = h.field.indexOf(" · ")
+      if (sep <= 0) return true
+      return h.field.slice(0, sep) === viewerFileName
+    })
+  }, [extractionHighlights, viewerFileName])
+
+  async function extractFromFile(
+    file: File,
+    instructions: string,
+    sessionId?: string | null
+  ) {
     setExtracting(true)
     setStreamingStatus("connecting")
 
@@ -420,6 +700,7 @@ function ReportPageContent() {
             fileName: file.name,
             instructions: instructions || undefined,
             model,
+            sessionId: sessionId || undefined,
           }),
           signal: controller.signal,
         })
@@ -428,6 +709,7 @@ function ReportPageContent() {
         formData.append("file", file)
         if (instructions) formData.append("instructions", instructions)
         formData.append("model", model)
+        if (sessionId) formData.append("sessionId", sessionId)
 
         response = await fetch("/api/report/agent?action=extract&stream=1", {
           method: "POST",
@@ -488,6 +770,7 @@ function ReportPageContent() {
           const result = parsed.result as {
             sessionId?: string
             rows?: TableRow[]
+            highlightRows?: HighlightRow[]
             documentType?: string
             confidence?: number
           } | undefined
@@ -503,6 +786,18 @@ function ReportPageContent() {
                 : result.rows
               setExtractedRows((prev) =>
                 extractMergeRef.current.appendRows ? [...prev, ...rows] : rows
+              )
+            }
+            if (result.highlightRows && result.highlightRows.length > 0) {
+              const sourceLabel = extractMergeRef.current.sourceLabel
+              const highlights = sourceLabel
+                ? result.highlightRows.map((row) => ({
+                    ...row,
+                    field: `${sourceLabel} · ${row.field}`,
+                  }))
+                : result.highlightRows
+              setExtractionHighlights((prev) =>
+                extractMergeRef.current.appendRows ? [...prev, ...highlights] : highlights
               )
             }
             if (result.documentType) setDocumentType(result.documentType)
@@ -523,6 +818,7 @@ function ReportPageContent() {
           if (summary) {
             setReportSummary(summary)
             setStreamingStatus("done")
+            void persistSessionSummary(summary)
           }
           break
         }
@@ -643,12 +939,18 @@ function ReportPageContent() {
         const errData = await res.json().catch(() => ({})) as { error?: string }
         throw new Error(errData.error || "Generate report failed")
       }
-      const data = (await res.json()) as { markdown: string; fileName: string }
-      const blob = new Blob([data.markdown], { type: "text/markdown;charset=utf-8" })
+      const data = (await res.json()) as { docxBase64?: string; fileName: string }
+      if (!data.docxBase64) throw new Error("No document returned")
+      const binary = atob(data.docxBase64)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+      const blob = new Blob([bytes], {
+        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      })
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = url
-      a.download = data.fileName || `report-${Date.now()}.md`
+      a.download = data.fileName || `report-${Date.now()}.docx`
       a.click()
       URL.revokeObjectURL(url)
     } catch (err) {
@@ -686,8 +988,9 @@ function ReportPageContent() {
     }
   }
 
-  const isPdfPreview =
-    previewUrl && previewFile && previewFile.type === "application/pdf"
+  const isPdfPreview = Boolean(viewerFileUrl)
+
+  const isAnalyzing = extracting || loadingBatchExtract || loadingEmailExtract
 
   return (
     <div className="flex h-full">
@@ -862,9 +1165,10 @@ function ReportPageContent() {
               </div>
             )}
 
+            {!fromEmailId && (
             <div
               className={cn(
-                "rounded-lg border-2 border-dashed p-8 text-center transition-colors",
+                "rounded-lg border-2 border-dashed p-6 text-center transition-colors",
                 "hover:border-primary/50 hover:bg-accent/50",
                 previewUrl ? "border-solid" : ""
               )}
@@ -873,6 +1177,7 @@ function ReportPageContent() {
                 ref={fileInputRef}
                 type="file"
                 accept="image/*,.pdf,.docx,.doc,.txt"
+                multiple
                 onChange={handleFileUpload}
                 className="hidden"
               />
@@ -898,32 +1203,33 @@ function ReportPageContent() {
                       </span>
                     </div>
                   )}
-                  <div className="flex flex-col items-center gap-2">
-                    <button
-                      onClick={handleAnalyzeFile}
-                      disabled={extracting || loadingEmailExtract}
-                      className="inline-flex w-full max-w-xs items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
-                    >
-                      {extracting ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Upload className="h-4 w-4" />
-                      )}
-                      {extracting ? "Analyzing..." : "Analyze File"}
-                    </button>
-                    <button
-                      onClick={() => {
-                        fileInputRef.current?.click()
-                        URL.revokeObjectURL(previewUrl)
-                        setPreviewUrl(null)
-                        setPreviewFile(null)
-                        resetAnalysisState()
-                      }}
-                      className="text-sm text-primary hover:underline"
-                    >
-                      Change file
-                    </button>
-                  </div>
+                  <ReportUploadQueue
+                    pendingFiles={pendingFiles}
+                    selectedFileIds={selectedUploadFileIds}
+                    extracting={isAnalyzing}
+                    onToggleFile={toggleUploadFileSelection}
+                    onSelectAll={selectAllUploadFiles}
+                    onClearSelection={clearUploadFileSelection}
+                    onRemoveSelected={removeSelectedUploadFiles}
+                    onRemoveFile={removeUploadFile}
+                    onAnalyzeSelected={handleBatchAnalyzeSelected}
+                    onAnalyzeSingle={handleAnalyzeFile}
+                    className="mt-0 text-left"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="text-sm text-primary hover:underline"
+                  >
+                    Add more files
+                  </button>
+                  <button
+                    type="button"
+                    onClick={clearUploadedFiles}
+                    className="block w-full text-sm text-muted-foreground hover:text-foreground"
+                  >
+                    Clear all
+                  </button>
                 </div>
               ) : (
                 <div
@@ -931,13 +1237,14 @@ function ReportPageContent() {
                   className="cursor-pointer space-y-3"
                 >
                   <Upload className="mx-auto h-10 w-10 text-muted-foreground" />
-                  <p className="text-sm font-medium">Upload document</p>
+                  <p className="text-sm font-medium">Upload document(s)</p>
                   <p className="text-xs text-muted-foreground">
-                    PNG, JPEG, PDF, DOCX, or TXT (max 10MB)
+                    PNG, JPEG, PDF, DOCX, or TXT — pick one or more to analyze
                   </p>
                 </div>
               )}
             </div>
+            )}
 
             {streamingStatus !== "idle" && (
               <div className="mt-4 space-y-3">
@@ -1308,23 +1615,47 @@ function ReportPageContent() {
                     className="inline-flex w-full items-center justify-center gap-2 rounded-md border bg-background px-4 py-2.5 text-sm font-medium hover:bg-accent disabled:opacity-50"
                   >
                     {generatingReport ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-                    {generatingReport ? "Generating Report..." : "Generate Report"}
+                    {generatingReport ? "Generating Report..." : "Generate Report (.docx)"}
                   </button>
                   <p className="text-center text-[10px] text-muted-foreground">
-                    Download a full structured report with knowledge base references
+                    Download a formal Word report ready to share with management
                   </p>
                 </div>
               )}
             </div>
+
+            {extractedRows.length > 0 && (
+              <div className="mt-6">
+                <ReportExtractionPanel
+                  rows={extractedRows}
+                  sessionId={activeSessionId}
+                  onUpdateRow={updateExtractedRow}
+                  onAddRow={addExtractedRow}
+                  onDeleteRow={deleteExtractedRow}
+                  onRowsReplace={replaceExtractedRows}
+                  onRowClick={isPdfPreview ? handleTableRowClick : undefined}
+                  selectedRowIndex={selectedTableRowIndex}
+                  saving={savingRows}
+                />
+              </div>
+            )}
           </div>
 
           {/* Right: PDF Preview — always full height */}
           <div className="flex w-1/2 flex-col overflow-hidden">
-            {isPdfPreview ? (
+            {isPdfPreview && viewerFileUrl ? (
               <PdfHighlightViewer
-                fileUrl={previewUrl}
-                fileName={previewFile.name}
-                kbPhrases={kbHighlightPhrases}
+                fileUrl={viewerFileUrl}
+                fileName={viewerFileName}
+                documents={pdfPreviewDocuments}
+                activeDocumentId={activePreviewId ?? undefined}
+                onDocumentChange={setActivePreviewId}
+                highlights={documentHighlights}
+                highlightEnabled={highlightEnabled}
+                onHighlightEnabledChange={setHighlightEnabled}
+                showAllHighlights={showAllHighlights}
+                onShowAllHighlightsChange={setShowAllHighlights}
+                focusTarget={focusTarget}
                 className="h-full"
               />
             ) : (

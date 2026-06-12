@@ -68,7 +68,13 @@ export default function ReportSessionPage() {
   const [error, setError] = useState<string | null>(null)
   const [extractedRows, setExtractedRows] = useState<TableRow[]>([])
   const [reportSummary, setReportSummary] = useState<ReportSummary | null>(null)
-  const [kbHighlightPhrases, setKbHighlightPhrases] = useState<string[]>([])
+  const [highlightEnabled, setHighlightEnabled] = useState(false)
+  const [showAllHighlights, setShowAllHighlights] = useState(false)
+  const [focusTarget, setFocusTarget] = useState<{
+    page?: number
+    field: string
+    value: string
+  } | null>(null)
   const [model, setModel] = useState(DEFAULT_MODELS.report)
   const [generatingReport, setGeneratingReport] = useState(false)
   const [summarizing, setSummarizing] = useState(false)
@@ -466,8 +472,18 @@ export default function ReportSessionPage() {
                           "border-t transition-colors",
                           editingRowIndex === i
                             ? "bg-primary/5"
-                            : "hover:bg-muted/30"
+                            : "hover:bg-muted/30 cursor-pointer"
                         )}
+                        onDoubleClick={() => {
+                          setHighlightEnabled(true)
+                          setShowAllHighlights(false)
+                          setFocusTarget({
+                            page: row.page,
+                            field: row.field,
+                            value: row.value,
+                          })
+                        }}
+                        title="Double-click to highlight in PDF"
                       >
                         <td className="px-2 py-1.5 text-[10px] text-muted-foreground">
                           {i + 1}
@@ -739,7 +755,16 @@ export default function ReportSessionPage() {
             <PdfHighlightViewer
               fileUrl={fileUrl}
               fileName={fileName || "Document"}
-              kbPhrases={kbHighlightPhrases}
+              highlights={extractedRows.map((r) => ({
+                field: r.field,
+                value: r.value,
+                page: r.page,
+              }))}
+              highlightEnabled={highlightEnabled}
+              onHighlightEnabledChange={setHighlightEnabled}
+              showAllHighlights={showAllHighlights}
+              onShowAllHighlightsChange={setShowAllHighlights}
+              focusTarget={focusTarget}
               className="h-full"
             />
           ) : fileAvailable && fileUrl ? (

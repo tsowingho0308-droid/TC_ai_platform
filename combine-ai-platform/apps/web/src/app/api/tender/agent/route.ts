@@ -3,6 +3,7 @@ import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
 import { extractTextFromDocument, validateDocumentText } from "@/lib/server/document-text"
 import { mockTenderResult, mockTenderCompare } from "@/lib/server/mock-extraction"
+import { parseAIJson } from "@/lib/server/parse-json"
 import type { Prisma } from "@prisma/client"
 import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
 
@@ -129,6 +130,7 @@ Extract the following categories of fields:
    - Department
 
 For each extracted value, be as specific as possible. Use the exact text from the document.
+Prefer standard field labels such as Services Included, Services Excluded, Estimated Budget, and Submission Deadline when applicable.
 Format dates as YYYY-MM-DD.
 Format monetary amounts with currency.
 If a field cannot be found, omit it — do not invent data.
@@ -176,7 +178,7 @@ Provide:
 1. Side-by-side field comparison (align common fields)
 2. Key differences (price, scope, timeline, requirements)
 3. Risk analysis for each
-4. Recommendation summary
+4. Recommendation summary — use each document's title field (not "A" or "B") when naming tenders in keyDifferences, risks, and recommendation.preferred
 
 Respond ONLY with valid JSON:
 {
@@ -193,8 +195,8 @@ Respond ONLY with valid JSON:
   "risksA": ["risk from tender A"],
   "risksB": ["risk from tender B"],
   "recommendation": {
-    "preferred": "A"|"B"|"neither",
-    "reason": "explanation"
+    "preferred": "exact document title from the chosen tender (use the title field from the tender JSON above), or neither",
+    "reason": "explanation referencing documents by their title, not A/B labels"
   }
 }`
 
@@ -644,6 +646,7 @@ async function handleStreamExtract(
         // ── Try AI, fallback to mock if no API key ──
         let extracted: ExtractedTender = {}
         let modelUsed = "unknown"
+        let usedMock = false
 
         try {
           const result = await callAI({
@@ -678,6 +681,7 @@ async function handleStreamExtract(
           }
         } catch (aiErr) {
           console.warn("AI tender stream extraction unavailable, using mock template:", (aiErr as Error).message)
+          usedMock = true
           const mock = mockTenderResult(fileName)
           extracted = {
             tenderTitle: mock.tenderTitle,
@@ -744,6 +748,9 @@ async function handleStreamExtract(
             keyRequirements: extracted.keyRequirements,
             deadlines: extracted.deadlines,
           },
+          ...(usedMock
+            ? { warning: "AI unavailable, using demo data" }
+            : {}),
         })
       } catch (error) {
         console.error("Stream extraction error:", error)
@@ -831,6 +838,7 @@ type AiComparisonResult = {
   risksA?: string[]
   risksB?: string[]
   recommendation?: { preferred?: string; reason?: string }
+  mockWarning?: string
 }
 
 function buildComparisonFields(tenderData: TenderCompareData[]) {
@@ -849,8 +857,79 @@ function buildComparisonFields(tenderData: TenderCompareData[]) {
   })
 }
 
+function isEmptyAiComparison(result: AiComparisonResult): boolean {
+  return !(
+    result.keyDifferences?.length ||
+    result.recommendation?.preferred ||
+    result.recommendation?.reason ||
+    result.risksA?.length ||
+    result.risksB?.length
+  )
+}
+
+function enrichFromParsedComparisonFields(
+  parsed: Record<string, unknown>,
+  result: AiComparisonResult
+): AiComparisonResult {
+  if (!isEmptyAiComparison(result)) return result
+
+  const comparisonFields = parsed.comparisonFields as Array<{
+    field?: string
+    difference?: string
+    match?: boolean
+  }> | undefined
+
+  if (!Array.isArray(comparisonFields)) return result
+
+  const keyDifferences = comparisonFields
+    .filter((f) => f.difference?.trim() || f.match === false)
+    .map((f) => f.difference?.trim() || `${f.field || "Field"}: values differ`)
+
+  if (keyDifferences.length === 0) return result
+  return { ...result, keyDifferences: keyDifferences.slice(0, 10) }
+}
+
+function deriveInsightsFromComparisonFields(
+  comparisonFields: Array<{
+    field: string
+    values: Array<{ value: string }>
+    match: boolean
+  }>,
+  tenderData: TenderCompareData[]
+): AiComparisonResult {
+  const keyDifferences = comparisonFields
+    .filter((f) => !f.match)
+    .map((f) => {
+      const v0 = f.values[0]?.value || "—"
+      const v1 = f.values[1]?.value || "—"
+      return `${f.field}: ${tenderData[0]?.title || "A"} = ${v0}; ${tenderData[1]?.title || "B"} = ${v1}`
+    })
+
+  if (keyDifferences.length === 0) return {}
+  return { keyDifferences: keyDifferences.slice(0, 10) }
+}
+
+function mockComparisonFallback(
+  tenderData: TenderCompareData[],
+  mockWarning: string
+): AiComparisonResult {
+  const mock = mockTenderCompare(tenderData.map((t) => t.title))
+  return normalizeAiComparisonResult(
+    {
+      keyDifferences: mock.keyDifferences,
+      risksA: mock.risksA,
+      risksB: mock.risksB,
+      recommendation: mock.recommendation,
+      mockWarning,
+    },
+    tenderData
+  )
+}
+
 async function runAiComparison(tenderData: TenderCompareData[]): Promise<AiComparisonResult> {
   if (tenderData.length !== 2) return {}
+
+  const comparisonFields = buildComparisonFields(tenderData)
 
   try {
     const prompt = TENDER_COMPARISON_PROMPT
@@ -864,21 +943,61 @@ async function runAiComparison(tenderData: TenderCompareData[]): Promise<AiCompa
       messages: [{ role: "system", content: prompt }],
     })
 
-    try {
-      const cleaned = result.messageContent.replace(/```json\s*|\s*```/g, "").trim()
-      return JSON.parse(cleaned) as AiComparisonResult
-    } catch {
-      return {}
+    const parsed = parseAIJson(result.messageContent)
+    if (parsed) {
+      let normalized = normalizeAiComparisonResult(parsed as AiComparisonResult, tenderData)
+      normalized = enrichFromParsedComparisonFields(parsed, normalized)
+      if (!isEmptyAiComparison(normalized)) {
+        return normalized
+      }
     }
+
+    const derived = deriveInsightsFromComparisonFields(comparisonFields, tenderData)
+    if (!isEmptyAiComparison(derived)) {
+      return {
+        ...derived,
+        mockWarning: parsed
+          ? "AI summary incomplete; showing field differences from comparison table"
+          : "AI response could not be parsed; showing field differences from comparison table",
+      }
+    }
+
+    return mockComparisonFallback(
+      tenderData,
+      parsed
+        ? "AI summary empty, using demo data"
+        : "AI response could not be parsed, using demo data"
+    )
   } catch (aiErr) {
     console.warn("AI comparison unavailable, using mock template:", (aiErr as Error).message)
-    const mock = mockTenderCompare(tenderData.map((t) => t.title))
-    return {
-      keyDifferences: mock.keyDifferences,
-      risksA: mock.risksA,
-      risksB: mock.risksB,
-      recommendation: mock.recommendation,
-    }
+    return mockComparisonFallback(tenderData, "AI unavailable, using demo data")
+  }
+}
+
+function resolveRecommendationPreferred(
+  preferred: string | undefined,
+  tenderData: TenderCompareData[]
+): string {
+  if (!preferred?.trim()) return "—"
+  const normalized = preferred.trim()
+  const lower = normalized.toLowerCase()
+  if (lower === "a" && tenderData[0]) return tenderData[0].title
+  if (lower === "b" && tenderData[1]) return tenderData[1].title
+  if (lower === "neither") return "Neither"
+  return normalized
+}
+
+function normalizeAiComparisonResult(
+  result: AiComparisonResult,
+  tenderData: TenderCompareData[]
+): AiComparisonResult {
+  if (!result.recommendation) return result
+  return {
+    ...result,
+    recommendation: {
+      ...result.recommendation,
+      preferred: resolveRecommendationPreferred(result.recommendation.preferred, tenderData),
+    },
   }
 }
 
@@ -981,6 +1100,7 @@ async function handleCompare(
     risksA: aiComparison.risksA || [],
     risksB: aiComparison.risksB || [],
     recommendation: aiComparison.recommendation || null,
+    mockWarning: aiComparison.mockWarning || null,
   })
 }
 

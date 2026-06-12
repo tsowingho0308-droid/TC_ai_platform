@@ -82,6 +82,11 @@ export interface IAiProvider {
 
 // ── Embedding & Chunking Utilities ──────────────────────────
 
+export function getEmbeddingDimensions(): number {
+  const parsed = Number(process.env.EMBEDDING_DIMENSIONS || 1536)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1536
+}
+
 /**
  * Generate an embedding vector for the given text using the configured embedding API.
  * Uses OpenAI-compatible /embeddings endpoint.
@@ -94,6 +99,7 @@ export async function generateEmbedding(text: string): Promise<number[]> {
     "https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1"
   const apiKey = process.env.DASHSCOPE_API_KEY || process.env.LLM_API_KEY || ""
   const model = process.env.EMBEDDING_MODEL || "text-embedding-v4"
+  const dimensions = getEmbeddingDimensions()
 
   if (!apiKey) {
     throw new Error("DASHSCOPE_API_KEY or LLM_API_KEY not configured. Cannot generate embeddings.")
@@ -105,7 +111,7 @@ export async function generateEmbedding(text: string): Promise<number[]> {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({ model, input: text }),
+    body: JSON.stringify({ model, input: text, dimensions }),
   })
 
   if (!response.ok) {
@@ -118,7 +124,16 @@ export async function generateEmbedding(text: string): Promise<number[]> {
   const data = (await response.json()) as {
     data: Array<{ embedding: number[] }>
   }
-  return data.data[0].embedding
+  const embedding = data.data[0]?.embedding
+  if (!embedding?.length) {
+    throw new Error("Embedding API returned an empty vector")
+  }
+  if (embedding.length !== dimensions) {
+    throw new Error(
+      `Embedding dimension mismatch: expected ${dimensions}, got ${embedding.length}. Check EMBEDDING_DIMENSIONS and EMBEDDING_MODEL.`
+    )
+  }
+  return embedding
 }
 
 /**
