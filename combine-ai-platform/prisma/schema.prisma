@@ -875,6 +875,7 @@ model HelpdeskConversation {
   status      HelpdeskConversationStatus   @default(ACTIVE)
   department  HelpdeskDepartment           @default(GENERAL)
   ticketId    String?
+  messages    Json?                        // Array<{role, content, thinking?, sources?, needsEscalation?, suggestedDepartment?}>
   createdAt   DateTime                     @default(now())
   updatedAt   DateTime                     @updatedAt
   workspace   Workspace                    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
