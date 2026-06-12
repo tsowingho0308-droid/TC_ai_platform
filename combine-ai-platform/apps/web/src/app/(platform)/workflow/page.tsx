@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
-import { GitBranch, UserPlus, ClipboardList, ArrowRight, CheckCircle, Clock, AlertTriangle } from "lucide-react"
+import { GitBranch, UserPlus, ClipboardList, ArrowRight, CheckCircle, Clock, AlertTriangle, Trash2 } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
 
 interface WorkflowRunSummary {
@@ -42,6 +42,22 @@ export default function WorkflowPage() {
     window.addEventListener("workflow:data-updated", handler)
     return () => window.removeEventListener("workflow:data-updated", handler)
   }, [])
+
+  async function deleteRun(id: string) {
+    try {
+      const res = await fetch("/api/workflow/runs", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id }),
+      })
+      if (res.ok) {
+        setRuns((prev) => prev.filter((r) => r.id !== id))
+        window.dispatchEvent(new Event("workflow:data-updated"))
+      }
+    } catch (err) {
+      console.error("Failed to delete run:", err)
+    }
+  }
 
   async function startOnboarding() {
     setStarting(true)
@@ -172,36 +188,51 @@ export default function WorkflowPage() {
                       ? Math.round((run.completedSteps / run.totalSteps) * 100)
                       : 0
                     return (
-                      <Link
+                      <div
                         key={run.id}
-                        href={`/workflow/runs/${run.id}`}
-                        className="group rounded-xl border bg-card p-5 transition-all hover:border-primary/50 hover:shadow-md"
+                        className="group relative rounded-xl border bg-card p-5 transition-all hover:border-primary/50 hover:shadow-md"
                       >
-                        <div className="flex items-center gap-3 mb-3">
-                          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10">
-                            <UserPlus className="h-5 w-5 text-primary" />
+                        <Link href={`/workflow/runs/${run.id}`}>
+                          <div className="flex items-center gap-3 mb-3">
+                            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10">
+                              <UserPlus className="h-5 w-5 text-primary" />
+                            </div>
+                            <div>
+                              <h3 className="font-semibold group-hover:text-primary">{run.title}</h3>
+                              <p className="text-xs text-muted-foreground">{run.category}</p>
+                            </div>
                           </div>
-                          <div>
-                            <h3 className="font-semibold group-hover:text-primary">{run.title}</h3>
-                            <p className="text-xs text-muted-foreground">{run.category}</p>
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between text-sm">
+                              <span className="text-muted-foreground">Progress</span>
+                              <span className="font-medium">{progress}%</span>
+                            </div>
+                            <div className="h-2 rounded-full bg-muted">
+                              <div
+                                className="h-full rounded-full bg-primary transition-all"
+                                style={{ width: `${progress}%` }}
+                              />
+                            </div>
+                            <p className="text-xs text-muted-foreground">
+                              {run.completedSteps} of {run.totalSteps} steps completed
+                            </p>
                           </div>
-                        </div>
-                        <div className="space-y-2">
-                          <div className="flex items-center justify-between text-sm">
-                            <span className="text-muted-foreground">Progress</span>
-                            <span className="font-medium">{progress}%</span>
-                          </div>
-                          <div className="h-2 rounded-full bg-muted">
-                            <div
-                              className="h-full rounded-full bg-primary transition-all"
-                              style={{ width: `${progress}%` }}
-                            />
-                          </div>
-                          <p className="text-xs text-muted-foreground">
-                            {run.completedSteps} of {run.totalSteps} steps completed
-                          </p>
-                        </div>
-                      </Link>
+                        </Link>
+                        {/* Delete button */}
+                        <button
+                          onClick={(e) => {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            if (confirm(`Delete workflow "${run.title}"?`)) {
+                              deleteRun(run.id)
+                            }
+                          }}
+                          className="absolute top-3 right-3 rounded-md p-1.5 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+                          title="Delete workflow run"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
                     )
                   })}
                 </div>
