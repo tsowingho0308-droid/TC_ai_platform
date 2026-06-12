@@ -9,11 +9,8 @@ import {
 } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
 import { toast } from "sonner"
-
-interface ExtractedRow {
-  field: string
-  value: string
-}
+import { getPolicyExportBlockers } from "@/features/finance/policy-export"
+import { normalizeExtractedRows, type ExtractedRow } from "@/features/finance/extracted-rows"
 
 interface PolicyResult {
   rule: string
@@ -54,10 +51,15 @@ export default function ExpenseReviewPage() {
       const res = await fetch(`/api/finance/sessions?id=${id}`)
       if (!res.ok) throw new Error("Session not found")
       const data = await res.json()
-      setSession(data.session)
-      if (data.session.extractedRows) {
-        setRows(data.session.extractedRows)
+      const financeSession = data.session as FinanceSession
+
+      if (financeSession.sessionType === "THREE_WAY_MATCH") {
+        router.replace(`/finance/three-way-match/${id}`)
+        return
       }
+
+      setSession(financeSession)
+      setRows(normalizeExtractedRows(financeSession.extractedRows))
     } catch (err) {
       toast.error("Failed to load session")
       router.push("/finance")
@@ -100,8 +102,9 @@ export default function ExpenseReviewPage() {
         })
         if (!res.ok) throw new Error("Extraction failed")
         const data = await res.json()
-        setRows(data.rows || [])
-        await saveRows(data.rows || [])
+        const extractedRows = normalizeExtractedRows(data.sessionRows || data.rows)
+        setRows(extractedRows)
+        await saveRows(extractedRows)
         toast.success(`Extracted ${data.rows?.length || 0} fields`)
         fetchSession()
       } catch (err) {
@@ -160,34 +163,19 @@ export default function ExpenseReviewPage() {
     saveRows(rows)
   }, [rows, saveRows])
 
-  const handleExport = useCallback(async () => {
-    try {
-      const res = await fetch("/api/finance/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId: id,
-          format: "xlsx",
-          includePolicyCheck: true,
-        }),
-      })
-      if (!res.ok) throw new Error("Export failed")
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = `expense-review-${id.slice(0, 8)}.xlsx`
-      a.click()
-      URL.revokeObjectURL(url)
-      toast.success("Report exported")
-    } catch (err) {
-      toast.error(`Export failed: ${err instanceof Error ? err.message : "Unknown error"}`)
-    }
-  }, [id])
-
   const policyResults = (session?.policyResults as PolicyResult[]) || []
   const passedCount = policyResults.filter((p: PolicyResult) => p.passed).length
   const failedCount = policyResults.filter((p: PolicyResult) => !p.passed).length
+
+  const handleExport = useCallback(() => {
+    const blockers = getPolicyExportBlockers(policyResults)
+    if (blockers.length > 0) {
+      toast.error(blockers.join(" "))
+      return
+    }
+
+    router.push(`/finance/expense-review/${id}/export`)
+  }, [id, policyResults, router])
 
   if (loading) {
     return (

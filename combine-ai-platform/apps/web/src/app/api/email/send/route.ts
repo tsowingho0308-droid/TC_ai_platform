@@ -135,10 +135,15 @@ export async function POST(request: NextRequest) {
         },
       })
       if (conversation) {
-        threadId = conversation.providerThreadId || undefined
-        const latestInbound = conversation.messages[0]
-        if (latestInbound?.providerMessageId) {
-          const messageId = `<${latestInbound.providerMessageId}@mail.gmail.com>`
+        const anchorMessage =
+          conversation.messages[0] ||
+          (await prisma.message.findFirst({
+            where: { conversationId: conversation.id },
+            orderBy: { createdAt: "desc" },
+          }))
+        threadId = anchorMessage?.providerThreadId || conversation.providerThreadId || undefined
+        if (anchorMessage?.providerMessageId) {
+          const messageId = `<${anchorMessage.providerMessageId}@mail.gmail.com>`
           inReplyTo = messageId
           references = messageId
         }
@@ -150,7 +155,7 @@ export async function POST(request: NextRequest) {
           inboxId,
           replyTo: to,
           sourceProvider: MailProvider.GMAIL,
-          providerThreadId: { not: null },
+          providerMessageId: { not: null },
         },
         orderBy: { updatedAt: "desc" },
         include: {
@@ -162,10 +167,10 @@ export async function POST(request: NextRequest) {
       })
       if (existingThread) {
         conversationId = existingThread.id
-        threadId = existingThread.providerThreadId || undefined
-        const latest = existingThread.messages[0]
-        if (latest?.providerMessageId) {
-          const messageId = `<${latest.providerMessageId}@mail.gmail.com>`
+        const anchorMessage = existingThread.messages[0]
+        threadId = anchorMessage?.providerThreadId || existingThread.providerThreadId || undefined
+        if (anchorMessage?.providerMessageId) {
+          const messageId = `<${anchorMessage.providerMessageId}@mail.gmail.com>`
           inReplyTo = messageId
           references = messageId
         }
@@ -230,6 +235,7 @@ export async function POST(request: NextRequest) {
         data: {
           preview: messageBody.replace(/\s+/g, " ").trim().slice(0, 220),
           folderId: "sent",
+          providerThreadId: sent.threadId,
           finalReplyDraft: messageBody,
           finalReplyStatus: "SENT",
           finalReplySentAt: new Date(),
@@ -251,6 +257,7 @@ export async function POST(request: NextRequest) {
           read: true,
           labels: [],
           sourceProvider: MailProvider.GMAIL,
+          providerMessageId: sent.id,
           providerThreadId: sent.threadId,
           messages: {
             create: {

@@ -22,6 +22,12 @@ import {
 import { cn } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import {
+  getInitialSelectedAttachmentIds,
+  getSelectedAnalyzableAttachments,
+  isAnalyzableEmailAttachment,
+  parseAttachmentIdsFromSearchParams,
+} from "@/features/cross-agent/email-attachments"
 const PdfHighlightViewer = dynamic(
   () => import("@/features/report/components/pdf-highlight-viewer"),
   {
@@ -76,38 +82,6 @@ interface EmailSource {
   attachments: EmailAttachment[]
 }
 
-function getPrimaryDocumentAttachment(
-  attachments: EmailAttachment[],
-  preferredId?: string | null
-): EmailAttachment | null {
-  if (preferredId) {
-    const found = attachments.find((a) => a.id === preferredId)
-    if (found) return found
-  }
-  return (
-    attachments.find(
-      (att) =>
-        att.mimeType === "application/pdf" ||
-        att.fileName.toLowerCase().endsWith(".pdf") ||
-        att.fileName.toLowerCase().endsWith(".docx") ||
-        att.fileName.toLowerCase().endsWith(".doc") ||
-        att.fileName.toLowerCase().endsWith(".txt")
-    ) || null
-  )
-}
-
-function isAnalyzableAttachment(att: EmailAttachment): boolean {
-  const name = att.fileName.toLowerCase()
-  return (
-    att.mimeType === "application/pdf" ||
-    att.mimeType.startsWith("image/") ||
-    name.endsWith(".pdf") ||
-    name.endsWith(".docx") ||
-    name.endsWith(".doc") ||
-    name.endsWith(".txt")
-  )
-}
-
 export default function ReportPage() {
   return (
     <Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-muted-foreground">Loading...</div>}>
@@ -121,9 +95,10 @@ function ReportPageContent() {
   const fromEmailId = searchParams.get("fromEmail")
   const emailSubjectParam = searchParams.get("emailSubject")
   const attachmentIdParam = searchParams.get("attachmentId")
+  const attachmentIdsParam = searchParams.get("attachmentIds")
   const [emailSource, setEmailSource] = useState<EmailSource | null>(null)
   const [loadingEmail, setLoadingEmail] = useState(false)
-  const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null)
+  const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<Set<string>>(new Set())
   const [loadingEmailExtract, setLoadingEmailExtract] = useState(false)
   const [generatingReport, setGeneratingReport] = useState(false)
   const [extractedRows, setExtractedRows] = useState<TableRow[]>([])
@@ -150,6 +125,10 @@ function ReportPageContent() {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const extractMergeRef = useRef<{ appendRows: boolean; sourceLabel?: string }>({
+    appendRows: false,
+  })
+  const traceSeqRef = useRef(0)
 
   useEffect(() => {
     if (!fromEmailId) {
@@ -169,8 +148,10 @@ function ReportPageContent() {
           .filter(Boolean)
           .join("\n\n")
         const attachments = conv.attachments || []
-        const primary = getPrimaryDocumentAttachment(attachments, attachmentIdParam)
-        setSelectedAttachmentId(primary?.id ?? null)
+        const preferredIds = parseAttachmentIdsFromSearchParams(attachmentIdsParam, attachmentIdParam)
+        setSelectedAttachmentIds(
+          getInitialSelectedAttachmentIds(attachments, preferredIds, { includeImages: true })
+        )
         setEmailSource({
           id: conv.id,
           subject: emailSubjectParam || conv.subject,
@@ -182,7 +163,7 @@ function ReportPageContent() {
       })
       .catch(console.error)
       .finally(() => setLoadingEmail(false))
-  }, [fromEmailId, emailSubjectParam])
+  }, [fromEmailId, emailSubjectParam, attachmentIdParam, attachmentIdsParam])
 
   useEffect(() => {
     return () => {
@@ -195,6 +176,7 @@ function ReportPageContent() {
     setExtracting(false)
     setStreamingStatus("idle")
     setTraceEvents([])
+    traceSeqRef.current = 0
     setThinkingText("")
     setError(null)
     setDocumentType(null)
@@ -208,40 +190,37 @@ function ReportPageContent() {
     resetAnalysisState()
   }
 
-  async function loadEmailAttachmentAndExtract(attachmentId: string) {
+  async function loadEmailAttachmentAndExtract(
+    attachmentId: string,
+    options?: { skipPreviewReset?: boolean }
+  ) {
     if (!emailSource) return
     const att = emailSource.attachments.find((a) => a.id === attachmentId)
     if (!att) return
 
-    setLoadingEmailExtract(true)
-    setError(null)
-    try {
-      const res = await fetch(
-        `/api/email/attachments?action=download&id=${encodeURIComponent(attachmentId)}`
-      )
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({})) as { error?: string }
-        throw new Error(errData.error || "Failed to download attachment")
-      }
-      const blob = await res.blob()
-      const mimeType = att.mimeType || blob.type || "application/octet-stream"
-      const file = new File([blob], att.fileName, { type: mimeType })
-
-      resetState()
-      if (previewUrl) URL.revokeObjectURL(previewUrl)
-      const url = URL.createObjectURL(file)
-      setPreviewUrl(url)
-      setPreviewFile(file)
-      setSelectedAttachmentId(attachmentId)
-
-      await extractFromFile(file, note)
-    } catch (err) {
-      console.error("Email attachment extract error:", err)
-      setError(err instanceof Error ? err.message : "Failed to analyze email attachment")
-      setStreamingStatus("error")
-    } finally {
-      setLoadingEmailExtract(false)
+    const res = await fetch(
+      `/api/email/attachments?action=download&id=${encodeURIComponent(attachmentId)}`
+    )
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({})) as { error?: string }
+      throw new Error(errData.error || "Failed to download attachment")
     }
+    const blob = await res.blob()
+    const mimeType = att.mimeType || blob.type || "application/octet-stream"
+    const file = new File([blob], att.fileName, { type: mimeType })
+
+    if (!options?.skipPreviewReset) {
+      if (previewUrl) URL.revokeObjectURL(previewUrl)
+      setPreviewUrl(URL.createObjectURL(file))
+      setPreviewFile(file)
+    }
+
+    extractMergeRef.current = {
+      appendRows: Boolean(options?.skipPreviewReset),
+      sourceLabel: att.fileName,
+    }
+
+    await extractFromFile(file, note)
   }
 
   async function consumeExtractStream(response: Response) {
@@ -320,35 +299,80 @@ function ReportPageContent() {
 
   async function handleAnalyzeEmail() {
     if (!emailSource) return
-    const att = getPrimaryDocumentAttachment(
+    const selected = getSelectedAnalyzableAttachments(
       emailSource.attachments,
-      selectedAttachmentId || attachmentIdParam
+      selectedAttachmentIds,
+      { includeImages: true }
     )
-    if (att) {
-      await loadEmailAttachmentAndExtract(att.id)
-    } else if (emailSource.body.trim()) {
+
+    if (selected.length > 0) {
+      resetAnalysisState()
+      setLoadingEmailExtract(true)
+      setError(null)
+      try {
+        for (let i = 0; i < selected.length; i++) {
+          await loadEmailAttachmentAndExtract(selected[i].id, {
+            skipPreviewReset: i > 0,
+          })
+        }
+      } catch (err) {
+        console.error("Email attachment extract error:", err)
+        setError(err instanceof Error ? err.message : "Failed to analyze email attachment")
+        setStreamingStatus("error")
+      } finally {
+        setLoadingEmailExtract(false)
+        extractMergeRef.current = { appendRows: false }
+      }
+      return
+    }
+
+    if (emailSource.body.trim()) {
       resetState()
       if (previewUrl) URL.revokeObjectURL(previewUrl)
       setPreviewUrl(null)
       setPreviewFile(null)
+      extractMergeRef.current = { appendRows: false }
       await extractFromEmailText()
     } else {
-      setError("Email has no content to analyze")
+      setError("Select at least one attachment to analyze")
       setStreamingStatus("error")
     }
   }
 
-  const emailAnalyzableAttachment = emailSource
-    ? getPrimaryDocumentAttachment(
-        emailSource.attachments,
-        selectedAttachmentId || attachmentIdParam
+  const selectedAnalyzableAttachments = emailSource
+    ? getSelectedAnalyzableAttachments(emailSource.attachments, selectedAttachmentIds, {
+        includeImages: true,
+      })
+    : []
+
+  const emailAnalyzableAttachments = emailSource
+    ? emailSource.attachments.filter((att) =>
+        isAnalyzableEmailAttachment(att, { includeImages: true })
       )
-    : null
+    : []
 
   const canAnalyzeEmail = Boolean(
     emailSource &&
-      (emailAnalyzableAttachment || emailSource.body.trim().length > 0)
+      (selectedAnalyzableAttachments.length > 0 || emailSource.body.trim().length > 0)
   )
+
+  function toggleAttachmentSelection(attachmentId: string) {
+    setSelectedAttachmentIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(attachmentId)) next.delete(attachmentId)
+      else next.add(attachmentId)
+      return next
+    })
+  }
+
+  function selectAllAnalyzableAttachments() {
+    if (!emailSource) return
+    setSelectedAttachmentIds(new Set(emailAnalyzableAttachments.map((att) => att.id)))
+  }
+
+  function clearAttachmentSelection() {
+    setSelectedAttachmentIds(new Set())
+  }
 
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
@@ -446,7 +470,12 @@ function ReportPageContent() {
         case "trace": {
           const trace = parsed.trace as TraceEvent | undefined
           if (trace) {
-            setTraceEvents((prev) => [...prev, trace])
+            const label = extractMergeRef.current.sourceLabel || previewFile?.name || "doc"
+            const seq = traceSeqRef.current++
+            setTraceEvents((prev) => [
+              ...prev,
+              { ...trace, id: `${trace.id}-${label}-${seq}` },
+            ])
           }
           break
         }
@@ -465,7 +494,16 @@ function ReportPageContent() {
           if (result) {
             if (result.sessionId) setSessionId(result.sessionId)
             if (result.rows && result.rows.length > 0) {
-              setExtractedRows(result.rows)
+              const sourceLabel = extractMergeRef.current.sourceLabel
+              const rows = sourceLabel
+                ? result.rows.map((row) => ({
+                    ...row,
+                    field: `${sourceLabel} · ${row.field}`,
+                  }))
+                : result.rows
+              setExtractedRows((prev) =>
+                extractMergeRef.current.appendRows ? [...prev, ...rows] : rows
+              )
             }
             if (result.documentType) setDocumentType(result.documentType)
             if (result.confidence !== undefined) setConfidence(result.confidence)
@@ -736,50 +774,78 @@ function ReportPageContent() {
                       )}
                       {loadingEmailExtract || extracting
                         ? "Analyzing..."
-                        : "Analyze Email"}
+                        : selectedAnalyzableAttachments.length > 1
+                          ? `Analyze ${selectedAnalyzableAttachments.length} Documents`
+                          : "Analyze Email"}
                     </button>
                     {emailSource.attachments.length > 0 && (
                       <div className="mt-3 space-y-2">
-                        <p className="text-xs font-medium text-muted-foreground">
-                          Attachments — click to select for analysis
-                        </p>
-                        {emailSource.attachments.map((att) => (
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-xs font-medium text-muted-foreground">
+                            Attachments — select one or more
+                          </p>
+                          {emailAnalyzableAttachments.length > 0 && (
+                            <div className="flex items-center gap-2 text-[10px]">
+                              <button
+                                type="button"
+                                onClick={selectAllAnalyzableAttachments}
+                                className="text-primary hover:underline"
+                              >
+                                All
+                              </button>
+                              <button
+                                type="button"
+                                onClick={clearAttachmentSelection}
+                                className="text-muted-foreground hover:underline"
+                              >
+                                Clear
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                        {emailSource.attachments.map((att) => {
+                          const analyzable = isAnalyzableEmailAttachment(att, { includeImages: true })
+                          const selected = selectedAttachmentIds.has(att.id)
+                          return (
                           <div
                             key={att.id}
-                            role="button"
-                            tabIndex={0}
-                            onClick={() => {
-                              if (isAnalyzableAttachment(att)) setSelectedAttachmentId(att.id)
-                            }}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" && isAnalyzableAttachment(att)) {
-                                setSelectedAttachmentId(att.id)
-                              }
-                            }}
                             className={cn(
                               "flex items-start gap-2 rounded-md border p-2",
-                              isAnalyzableAttachment(att) && "cursor-pointer hover:bg-accent/50",
-                              (selectedAttachmentId || attachmentIdParam) === att.id &&
-                                "border-primary bg-primary/5"
+                              analyzable && "hover:bg-accent/50",
+                              selected && "border-primary bg-primary/5"
                             )}
                           >
-                            <Paperclip className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                            <input
+                              type="checkbox"
+                              checked={selected}
+                              disabled={!analyzable}
+                              onChange={() => {
+                                if (analyzable) toggleAttachmentSelection(att.id)
+                              }}
+                              className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary disabled:opacity-40"
+                              aria-label={`Select ${att.fileName}`}
+                            />
                             <div className="min-w-0 flex-1">
                               <p className="truncate text-xs font-medium">{att.fileName}</p>
                               <p className="text-[10px] text-muted-foreground">
                                 {Math.max(1, Math.round(att.sizeBytes / 1024))} KB
-                                {!isAnalyzableAttachment(att) && " — not analyzable"}
+                                {!analyzable && " — not analyzable"}
                               </p>
                             </div>
                             <a
                               href={`/api/email/attachments?action=download&id=${encodeURIComponent(att.id)}`}
-                              onClick={(e) => e.stopPropagation()}
                               className="shrink-0 text-[10px] text-primary hover:underline"
                             >
                               Download
                             </a>
                           </div>
-                        ))}
+                          )
+                        })}
+                        {selectedAnalyzableAttachments.length > 0 && (
+                          <p className="text-[10px] text-muted-foreground">
+                            {selectedAnalyzableAttachments.length} selected for analysis
+                          </p>
+                        )}
                       </div>
                     )}
                   </>

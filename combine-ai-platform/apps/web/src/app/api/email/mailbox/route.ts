@@ -58,6 +58,7 @@ export async function GET(request: NextRequest) {
             mimeType: true,
             sizeBytes: true,
             messageId: true,
+            contentId: true,
             createdAt: true,
           },
         })

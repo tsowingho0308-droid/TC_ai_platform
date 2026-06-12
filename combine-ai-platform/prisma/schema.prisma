@@ -276,6 +276,7 @@ model Conversation {
   labels       String[]
   replyTo      String
   sourceProvider MailProvider?
+  providerMessageId String?
   providerThreadId String?
   aiTriagedAt   DateTime?
   aiRouteConfidence Float?
@@ -311,7 +312,7 @@ model Conversation {
   @@index([workspaceId, parentConversationId, createdAt])
   @@index([workspaceId, parentConversationId, departmentReviewStatus])
   @@index([workspaceId, departmentSubmittedById])
-  @@unique([inboxId, sourceProvider, providerThreadId])
+  @@unique([inboxId, sourceProvider, providerMessageId])
 }
 
 model InboxMembership {
@@ -365,12 +366,13 @@ model MessageAttachment {
   sourceProvider       MailProvider?
   providerMessageId    String?
   providerAttachmentId String?
+  contentId            String?
   createdAt            DateTime @default(now())
   workspace            Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   conversation         Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   message              Message      @relation(fields: [messageId], references: [id], onDelete: Cascade)
 
-  @@unique([workspaceId, messageId, providerAttachmentId, fileName])
+  @@unique([workspaceId, messageId, providerAttachmentId])
   @@index([workspaceId, conversationId])
   @@index([workspaceId, messageId])
 }
