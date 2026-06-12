@@ -18,9 +18,10 @@ import "react-pdf/dist/Page/TextLayer.css"
 import "react-pdf/dist/Page/AnnotationLayer.css"
 import { cn } from "@combine-ai/shared-ui"
 import {
-  findFieldValueMatch,
+  findValueMatch,
   findSearchTermMatches,
   highlightTargetsMatch,
+  readTextLayerSpans,
   HIGHLIGHT_BLUE,
   SEARCH_COLORS,
   type TextLayerBox,
@@ -43,11 +44,10 @@ interface PdfHighlightViewerProps {
   documents?: PreviewDocument[]
   activeDocumentId?: string
   onDocumentChange?: (id: string) => void
+  /** @deprecated Kept for row-focus fallback only */
   highlights?: Highlight[]
   highlightEnabled?: boolean
   onHighlightEnabledChange?: (enabled: boolean) => void
-  showAllHighlights?: boolean
-  onShowAllHighlightsChange?: (show: boolean) => void
   focusTarget?: { page?: number; field: string; value: string } | null
   className?: string
 }
@@ -58,9 +58,8 @@ interface OverlayRect extends TextLayerBox {
   color: string
   label?: string
   flash?: boolean
+  zIndex?: number
 }
-
-const SHOW_ALL_CAP = 12
 
 function shouldShowHighlightOnPage(
   hl: HighlightTarget,
@@ -72,13 +71,6 @@ function shouldShowHighlightOnPage(
   return hl.page === page
 }
 
-function highlightMatchScore(hl: HighlightTarget): number {
-  let score = 0
-  if (hl.page && hl.page >= 1) score += 100
-  score -= Math.min(hl.value.trim().length, 80)
-  return score
-}
-
 export default function PdfHighlightViewer({
   fileUrl,
   fileName,
@@ -88,23 +80,15 @@ export default function PdfHighlightViewer({
   highlights = EMPTY_HIGHLIGHTS,
   highlightEnabled: highlightEnabledProp,
   onHighlightEnabledChange,
-  showAllHighlights: showAllHighlightsProp,
-  onShowAllHighlightsChange,
   focusTarget,
   className,
 }: PdfHighlightViewerProps) {
   const [internalHighlightEnabled, setInternalHighlightEnabled] = useState(false)
-  const [internalShowAll, setInternalShowAll] = useState(false)
   const highlightEnabled = highlightEnabledProp ?? internalHighlightEnabled
-  const showAllHighlights = showAllHighlightsProp ?? internalShowAll
 
   const setHighlightEnabled = (enabled: boolean) => {
     if (onHighlightEnabledChange) onHighlightEnabledChange(enabled)
     else setInternalHighlightEnabled(enabled)
-  }
-  const setShowAllHighlights = (show: boolean) => {
-    if (onShowAllHighlightsChange) onShowAllHighlightsChange(show)
-    else setInternalShowAll(show)
   }
 
   const [numPages, setNumPages] = useState(0)
@@ -119,23 +103,52 @@ export default function PdfHighlightViewer({
   const [layerSize, setLayerSize] = useState<{ width: number; height: number } | null>(null)
 
   const pageWrapperRef = useRef<HTMLDivElement>(null)
+  const recomputeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const matchCacheRef = useRef<Map<string, TextLayerBox[]>>(new Map())
+  const textLayerReadyRef = useRef(false)
 
-  const activeHighlights = useMemo(() => {
-    if (!highlightEnabled || showAllHighlights) return []
-    if (!focusTarget) return []
+  const focusHighlight = useMemo(() => {
+    if (!highlightEnabled || !focusTarget) return null
     const matched = highlights.filter((h) => highlightTargetsMatch(h, focusTarget))
-    if (matched.length > 0) return matched
-    return [{ field: focusTarget.field, value: focusTarget.value, page: focusTarget.page }]
-  }, [highlightEnabled, showAllHighlights, highlights, focusTarget])
+    if (matched.length > 0) return matched[0]
+    return {
+      field: focusTarget.field,
+      value: focusTarget.value,
+      page: focusTarget.page,
+    }
+  }, [highlightEnabled, highlights, focusTarget])
 
-  const isFocusedHighlight = useCallback(
-    (hl: HighlightTarget) => Boolean(focusTarget && highlightTargetsMatch(hl, focusTarget)),
-    [focusTarget]
+  const getCachedMatch = useCallback(
+    (
+      wrapper: HTMLElement,
+      spanEls: HTMLSpanElement[],
+      value: string,
+      opts?: { allowAmbiguous?: boolean; allMatches?: boolean }
+    ): TextLayerBox[] => {
+      if (spanEls.length === 0) return []
+
+      const cacheKey = `${pageNumber}|${scale}|${value}|${opts?.allMatches ? "all" : "one"}`
+      const cached = matchCacheRef.current.get(cacheKey)
+      if (cached) return cached
+
+      const boxes = findValueMatch(wrapper, value, { ...opts, spanEls })
+      if (boxes.length > 0 && textLayerReadyRef.current) {
+        matchCacheRef.current.set(cacheKey, boxes)
+      }
+      return boxes
+    },
+    [pageNumber, scale]
   )
 
   const recomputeOverlays = useCallback(() => {
     const wrapper = pageWrapperRef.current
     if (!wrapper || pdfLoading) {
+      setOverlayRects([])
+      return
+    }
+
+    const spanEls = readTextLayerSpans(wrapper)
+    if (spanEls.length === 0) {
       setOverlayRects([])
       return
     }
@@ -148,82 +161,105 @@ export default function PdfHighlightViewer({
 
     const rects: OverlayRect[] = []
 
-    if (highlightEnabled) {
-      if (showAllHighlights) {
-        const matched: Array<{ hl: HighlightTarget; boxes: TextLayerBox[] }> = []
-        for (const hl of highlights) {
-          if (!shouldShowHighlightOnPage(hl, pageNumber, numPages)) continue
-          const boxes = findFieldValueMatch(wrapper, hl.field, hl.value, {
-            allowAmbiguous: true,
+    if (highlightEnabled && focusHighlight) {
+      if (shouldShowHighlightOnPage(focusHighlight, pageNumber, numPages)) {
+        const boxes = getCachedMatch(wrapper, spanEls, focusHighlight.value, {
+          allowAmbiguous: true,
+          allMatches: true,
+        })
+        for (const box of boxes) {
+          rects.push({
+            ...box,
+            color: HIGHLIGHT_BLUE,
+            label: focusHighlight.field,
+            flash: true,
+            zIndex: 2,
           })
-          if (boxes.length > 0) matched.push({ hl, boxes })
-        }
-        matched.sort((a, b) => highlightMatchScore(b.hl) - highlightMatchScore(a.hl))
-        for (const { hl, boxes } of matched.slice(0, SHOW_ALL_CAP)) {
-          for (const box of boxes) {
-            rects.push({
-              ...box,
-              color: HIGHLIGHT_BLUE,
-              label: hl.field,
-              flash: false,
-            })
-          }
-        }
-      } else {
-        for (const hl of activeHighlights) {
-          if (!shouldShowHighlightOnPage(hl, pageNumber, numPages)) continue
-          const focused = isFocusedHighlight(hl)
-          const boxes = findFieldValueMatch(wrapper, hl.field, hl.value, {
-            allowAmbiguous: focused,
-          })
-          for (const box of boxes) {
-            rects.push({
-              ...box,
-              color: HIGHLIGHT_BLUE,
-              label: hl.field,
-              flash: focused,
-            })
-          }
         }
       }
     }
 
     searchTerms.forEach((term, i) => {
-      const boxes = findSearchTermMatches(wrapper, term)
+      const boxes = findSearchTermMatches(wrapper, term, { spanEls })
       for (const box of boxes) {
         rects.push({
           ...box,
           color: SEARCH_COLORS[i % SEARCH_COLORS.length],
           label: term,
+          zIndex: 3,
         })
       }
     })
 
     setOverlayRects(rects)
   }, [
-    activeHighlights,
-    highlights,
-    isFocusedHighlight,
+    focusHighlight,
+    getCachedMatch,
     highlightEnabled,
-    showAllHighlights,
     numPages,
     pageNumber,
     pdfLoading,
     searchTerms,
   ])
 
+  const scheduleRecomputeOverlays = useCallback(
+    (debounceMs = 0) => {
+      if (recomputeTimerRef.current != null) {
+        clearTimeout(recomputeTimerRef.current)
+        recomputeTimerRef.current = null
+      }
+
+      const run = (retriesLeft: number) => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            recomputeOverlays()
+            if (retriesLeft > 0) {
+              recomputeTimerRef.current = setTimeout(() => run(retriesLeft - 1), 50)
+            }
+          })
+        })
+      }
+
+      if (debounceMs > 0) {
+        recomputeTimerRef.current = setTimeout(() => run(2), debounceMs)
+      } else {
+        run(2)
+      }
+    },
+    [recomputeOverlays]
+  )
+
   useEffect(() => {
-    const id = requestAnimationFrame(() => {
-      requestAnimationFrame(recomputeOverlays)
-    })
-    return () => cancelAnimationFrame(id)
-  }, [recomputeOverlays, scale, pageNumber, fileUrl])
+    textLayerReadyRef.current = false
+    matchCacheRef.current.clear()
+  }, [fileUrl, pageNumber, scale])
+
+  useEffect(() => {
+    scheduleRecomputeOverlays()
+    return () => {
+      if (recomputeTimerRef.current != null) {
+        clearTimeout(recomputeTimerRef.current)
+      }
+    }
+  }, [scheduleRecomputeOverlays, scale, pageNumber, fileUrl, focusTarget, highlightEnabled])
+
+  useEffect(() => {
+    return () => {
+      if (recomputeTimerRef.current != null) {
+        clearTimeout(recomputeTimerRef.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     if (focusTarget?.page && focusTarget.page >= 1) {
       setPageNumber(focusTarget.page)
     }
   }, [focusTarget?.page, focusTarget?.value])
+
+  useEffect(() => {
+    scheduleRecomputeOverlays(100)
+  }, [focusTarget, scheduleRecomputeOverlays])
 
   useEffect(() => {
     setPdfLoading(true)
@@ -234,6 +270,8 @@ export default function PdfHighlightViewer({
     setSearchTerms([])
     setSearchInput("")
     setLayerSize(null)
+    textLayerReadyRef.current = false
+    matchCacheRef.current.clear()
   }, [fileUrl])
 
   function handleDocumentLoadSuccess(doc: { numPages: number }) {
@@ -248,7 +286,13 @@ export default function PdfHighlightViewer({
   }
 
   function handlePageRenderSuccess() {
-    requestAnimationFrame(recomputeOverlays)
+    scheduleRecomputeOverlays()
+  }
+
+  function handleTextLayerRenderSuccess() {
+    textLayerReadyRef.current = true
+    matchCacheRef.current.clear()
+    scheduleRecomputeOverlays()
   }
 
   const goToPrev = useCallback(() => setPageNumber((p) => Math.max(1, p - 1)), [])
@@ -268,6 +312,18 @@ export default function PdfHighlightViewer({
   }
 
   const showDocPicker = documents.length > 1
+  const blueCount = overlayRects.filter((r) => r.color === HIGHLIGHT_BLUE).length
+
+  function footerStatusText(): string {
+    if (!highlightEnabled) {
+      return searchTerms.length > 0 ? "Search active" : "Highlights off"
+    }
+    if (blueCount > 0) return "Row highlighted"
+    if (focusTarget && blueCount === 0) {
+      return "Value not found on this page — try search"
+    }
+    return "Click a field row to highlight"
+  }
 
   return (
     <div className={cn("flex flex-col h-full", className)}>
@@ -343,17 +399,6 @@ export default function PdfHighlightViewer({
               Highlights
             </button>
           </div>
-          {highlightEnabled && highlights.length > 0 && (
-            <label className="flex shrink-0 items-center gap-1.5 text-[10px] text-muted-foreground">
-              <input
-                type="checkbox"
-                checked={showAllHighlights}
-                onChange={(e) => setShowAllHighlights(e.target.checked)}
-                className="h-3 w-3 accent-primary"
-              />
-              Show all (max 12)
-            </label>
-          )}
           <div className="flex flex-1 items-center gap-1 rounded-md border bg-background px-2 py-1 min-w-0">
             <Search className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
             <input
@@ -438,6 +483,7 @@ export default function PdfHighlightViewer({
                   pageNumber={pageNumber}
                   scale={scale}
                   onRenderSuccess={handlePageRenderSuccess}
+                  onRenderTextLayerSuccess={handleTextLayerRenderSuccess}
                   renderTextLayer={true}
                   renderAnnotationLayer={false}
                   className="shadow-sm"
@@ -445,7 +491,7 @@ export default function PdfHighlightViewer({
                 {layerSize && overlayRects.length > 0 && (
                   <div
                     className="absolute top-0 left-0 pointer-events-none"
-                    style={{ width: layerSize.width, height: layerSize.height }}
+                    style={{ width: layerSize.width, height: layerSize.height, zIndex: 10 }}
                   >
                     {overlayRects.map((rect, i) => (
                       <div
@@ -460,6 +506,7 @@ export default function PdfHighlightViewer({
                           width: Math.max(rect.width, 4),
                           height: Math.max(rect.height, 4),
                           backgroundColor: rect.color,
+                          zIndex: rect.zIndex ?? 1,
                         }}
                         title={rect.label}
                       />
@@ -474,13 +521,7 @@ export default function PdfHighlightViewer({
 
       <div className="flex items-center justify-between px-3 py-1.5 border-t bg-muted/20 rounded-b-lg text-xs text-muted-foreground">
         <span>{numPages > 0 && `${numPages} page${numPages > 1 ? "s" : ""}`}</span>
-        <span>
-          {highlightEnabled
-            ? `${overlayRects.filter((r) => r.color === HIGHLIGHT_BLUE).length > 0 ? "Highlighted" : "Click a field row to highlight"}`
-            : searchTerms.length > 0
-              ? "Search active"
-              : "Highlights off"}
-        </span>
+        <span>{footerStatusText()}</span>
       </div>
     </div>
   )

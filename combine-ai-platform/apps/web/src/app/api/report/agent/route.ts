@@ -180,32 +180,6 @@ function sseEvent(event: string, data: Record<string, unknown>): string {
 
 type ExtractRow = { field: string; value: string; page?: number }
 
-function highlightRowScore(row: ExtractRow): number {
-  let score = 0
-  if (row.page && row.page >= 1) score += 100
-  const v = row.value?.trim() || ""
-  if (v.length >= 4 && v.length <= 40) score += 30
-  else if (v.length >= 2 && v.length <= 80) score += 10
-  if (/\d/.test(v)) score += 10
-  if (/[$¥€£]|HKD|USD|CNY/i.test(v)) score += 15
-  if (/\d{4}[-/]\d{1,2}/.test(v)) score += 10
-  score -= Math.min(v.length, 100)
-  return score
-}
-
-const HIGHLIGHT_SOFT_CAP = 12
-
-function selectHighlightRows(rows: ExtractRow[], limit = HIGHLIGHT_SOFT_CAP): ExtractRow[] {
-  const filtered = [...rows].filter((r) => {
-    const v = r.value?.trim() || ""
-    return v.length >= 3 && v.length <= 80
-  })
-  if (filtered.length <= limit) return filtered
-  return filtered
-    .sort((a, b) => highlightRowScore(b) - highlightRowScore(a))
-    .slice(0, limit)
-}
-
 async function saveStreamExtraction(
   session: { workspaceId: string },
   sessionId: string,
@@ -1121,7 +1095,6 @@ async function handleStreamExtract(
         }
 
         const rows = (extracted.rows || []) as ExtractRow[]
-        const highlightRows = selectHighlightRows(rows)
 
         send("trace", {
           trace: {
@@ -1139,7 +1112,6 @@ async function handleStreamExtract(
           result: {
             sessionId: effectiveSessionId,
             rows,
-            highlightRows,
             documentType: extracted.documentType,
             title: extracted.title,
             metadata: extracted.metadata,

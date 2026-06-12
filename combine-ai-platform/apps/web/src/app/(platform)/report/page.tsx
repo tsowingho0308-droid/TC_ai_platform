@@ -104,11 +104,9 @@ function ReportPageContent() {
   const [loadingEmail, setLoadingEmail] = useState(false)
   const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<Set<string>>(new Set())
   const [loadingEmailExtract, setLoadingEmailExtract] = useState(false)
-  const [generatingReport, setGeneratingReport] = useState(false)
   const [extractedRows, setExtractedRows] = useState<TableRow[]>([])
   const [kbHighlightPhrases, setKbHighlightPhrases] = useState<string[]>([])
   const [highlightEnabled, setHighlightEnabled] = useState(false)
-  const [showAllHighlights, setShowAllHighlights] = useState(false)
   const [activePreviewId, setActivePreviewId] = useState<string | null>(null)
   const [focusTarget, setFocusTarget] = useState<{
     page?: number
@@ -140,6 +138,8 @@ function ReportPageContent() {
   const [editingValue, setEditingValue] = useState("")
   const [refineInstruction, setRefineInstruction] = useState("")
   const [refining, setRefining] = useState(false)
+  const [rowsManuallyEdited, setRowsManuallyEdited] = useState(false)
+  const [refreshingSummary, setRefreshingSummary] = useState(false)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -178,6 +178,7 @@ function ReportPageContent() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           id: activeSessionId,
+          summary,
           draftNote: buildSummaryDraftNote(summary),
         }),
       })
@@ -276,6 +277,7 @@ function ReportPageContent() {
     setKbHighlightPhrases([])
     setFocusTarget(null)
     setSelectedTableRowIndex(null)
+    setRowsManuallyEdited(false)
   }
 
   function resetState() {
@@ -519,17 +521,6 @@ function ReportPageContent() {
 
   function handleHighlightEnabledChange(enabled: boolean) {
     setHighlightEnabled(enabled)
-    if (enabled && !focusTarget) {
-      setShowAllHighlights(true)
-    }
-  }
-
-  function handleShowAllHighlightsChange(show: boolean) {
-    setShowAllHighlights(show)
-    if (show) {
-      setFocusTarget(null)
-      setSelectedTableRowIndex(null)
-    }
   }
 
   function toggleUploadFileSelection(fileId: string) {
@@ -600,16 +591,15 @@ function ReportPageContent() {
     }
   }
 
-  function handleTableRowClick(index: number, row: TableRow) {
+  const handleTableRowClick = useCallback((index: number, row: TableRow) => {
     setSelectedTableRowIndex(index)
     setHighlightEnabled(true)
-    setShowAllHighlights(false)
     setFocusTarget({
       page: row.page,
       field: row.field,
       value: row.value,
     })
-  }
+  }, [])
 
   const pdfPreviewDocuments = useMemo((): PreviewDocument[] => {
     return pendingFiles
@@ -645,15 +635,6 @@ function ReportPageContent() {
     (previewFile?.type === "application/pdf" ? previewUrl : null)
 
   const viewerFileName = activePdfDoc?.name ?? previewFile?.name ?? ""
-
-  const documentHighlights = useMemo(() => {
-    if (!viewerFileName) return extractedRows
-    return extractedRows.filter((h) => {
-      const sep = h.field.indexOf(" · ")
-      if (sep <= 0) return true
-      return h.field.slice(0, sep) === viewerFileName
-    })
-  }, [extractedRows, viewerFileName])
 
   async function extractFromFile(file: File, sessionId?: string | null) {
     setExtracting(true)
@@ -764,8 +745,8 @@ function ReportPageContent() {
               setMockWarning(null)
             }
             if (result.sessionId) setSessionId(result.sessionId)
+            const sourceLabel = extractMergeRef.current.sourceLabel
             if (result.rows && result.rows.length > 0) {
-              const sourceLabel = extractMergeRef.current.sourceLabel
               const rows = sourceLabel
                 ? result.rows.map((row) => ({
                     ...row,
@@ -775,10 +756,16 @@ function ReportPageContent() {
               setExtractedRows((prev) =>
                 extractMergeRef.current.appendRows ? [...prev, ...rows] : rows
               )
+              if (!extractMergeRef.current.appendRows) {
+                setRowsManuallyEdited(false)
+              }
             }
             if (result.documentType) setDocumentType(result.documentType)
             if (result.confidence !== undefined) setConfidence(result.confidence)
             setStreamingStatus("highlighting")
+            if (!extractMergeRef.current.appendRows) {
+              setHighlightEnabled(true)
+            }
           }
           break
         }
@@ -793,6 +780,7 @@ function ReportPageContent() {
           const summary = parsed.summary as ReportSummary | undefined
           if (summary) {
             setReportSummary(summary)
+            setRowsManuallyEdited(false)
             setStreamingStatus("done")
             void persistSessionSummary(summary)
           }
@@ -830,6 +818,7 @@ function ReportPageContent() {
     setEditingRowIndex(null)
     setEditingField("")
     setEditingValue("")
+    setRowsManuallyEdited(true)
   }
 
   function cancelEditRow() {
@@ -841,10 +830,12 @@ function ReportPageContent() {
   function deleteRow(index: number) {
     setExtractedRows((prev) => prev.filter((_, i) => i !== index))
     if (editingRowIndex === index) cancelEditRow()
+    setRowsManuallyEdited(true)
   }
 
   function addRow() {
     setExtractedRows((prev) => [...prev, { field: "New Field", value: "" }])
+    setRowsManuallyEdited(true)
     // Start editing the new row immediately
     setEditingRowIndex(extractedRows.length)
     setEditingField("New Field")
@@ -859,6 +850,36 @@ function ReportPageContent() {
     setExtractedRows(updated)
     if (editingRowIndex === from) setEditingRowIndex(to)
     else if (editingRowIndex === to) setEditingRowIndex(from)
+    setRowsManuallyEdited(true)
+  }
+
+  async function refreshSummaryFromRows(rows: TableRow[]) {
+    if (rows.length === 0) return
+    setRefreshingSummary(true)
+    try {
+      const res = await fetch("/api/report/agent?action=summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rows,
+          fileName: previewFile?.name || emailSource?.subject,
+          documentType: documentType || undefined,
+        }),
+      })
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({})) as { error?: string }
+        throw new Error(errData.error || "Summary refresh failed")
+      }
+      const summary = (await res.json()) as ReportSummary
+      setReportSummary(summary)
+      await persistSessionSummary(summary)
+      setRowsManuallyEdited(false)
+    } catch (err) {
+      console.error("Refresh summary error:", err)
+      setError(err instanceof Error ? err.message : "Failed to refresh summary")
+    } finally {
+      setRefreshingSummary(false)
+    }
   }
 
   async function handleRefine() {
@@ -880,6 +901,7 @@ function ReportPageContent() {
       const data = (await res.json()) as { rows?: TableRow[]; changes?: string; applied?: boolean }
       if (data.rows && data.rows.length > 0) {
         setExtractedRows(data.rows)
+        setRowsManuallyEdited(false)
       }
       setRefineInstruction("")
     } catch (err) {
@@ -887,53 +909,6 @@ function ReportPageContent() {
       setError(err instanceof Error ? err.message : "Failed to refine extraction")
     } finally {
       setRefining(false)
-    }
-  }
-
-  async function generateFullReport() {
-    if (!reportSummary && extractedRows.length === 0) return
-    setGeneratingReport(true)
-    try {
-      const res = await fetch("/api/report/agent?action=generateReport", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          rows: extractedRows.length > 0 ? extractedRows : undefined,
-          reportSummary: reportSummary || undefined,
-          fileName: previewFile?.name || emailSource?.subject,
-          documentType: documentType || undefined,
-          emailContext: emailSource
-            ? {
-                subject: emailSource.subject,
-                sender: `${emailSource.senderName} <${emailSource.senderEmail}>`,
-                body: emailSource.body,
-              }
-            : undefined,
-        }),
-      })
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({})) as { error?: string }
-        throw new Error(errData.error || "Generate report failed")
-      }
-      const data = (await res.json()) as { docxBase64?: string; fileName: string }
-      if (!data.docxBase64) throw new Error("No document returned")
-      const binary = atob(data.docxBase64)
-      const bytes = new Uint8Array(binary.length)
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-      const blob = new Blob([bytes], {
-        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = data.fileName || `report-${Date.now()}.docx`
-      a.click()
-      URL.revokeObjectURL(url)
-    } catch (err) {
-      console.error("Generate report error:", err)
-      setError(err instanceof Error ? err.message : "Failed to generate report")
-    } finally {
-      setGeneratingReport(false)
     }
   }
 
@@ -945,10 +920,11 @@ function ReportPageContent() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           format: "md",
+          rows: extractedRows.length > 0 ? extractedRows : undefined,
           summary: reportSummary.summary,
           keyPoints: reportSummary.keyPoints,
           kbReferences: reportSummary.kbReferences,
-          fileName: previewFile?.name,
+          fileName: previewFile?.name || emailSource?.subject,
         }),
       })
       if (!res.ok) throw new Error("Export failed")
@@ -1001,6 +977,11 @@ function ReportPageContent() {
           </div>
           <div className="flex items-center gap-2">
             <ModelSelector value={model} onChange={setModel} />
+            {rowsManuallyEdited && (
+              <span className="text-[10px] text-amber-600" title="Row data changed — refresh summary to update narrative text">
+                Rows edited
+              </span>
+            )}
             <button
               onClick={exportSummary}
               disabled={!reportSummary}
@@ -1324,13 +1305,18 @@ function ReportPageContent() {
                       {extractedRows.length} fields
                     </span>
                   </div>
-                  <button
-                    onClick={addRow}
-                    className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
-                  >
-                    <Plus className="h-3 w-3" />
-                    Add Row
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={addRow}
+                      className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                    >
+                      <Plus className="h-3 w-3" />
+                      Add Row
+                    </button>
+                    {rowsManuallyEdited && (
+                      <span className="text-[10px] text-amber-600">(edited)</span>
+                    )}
+                  </div>
                 </div>
 
                 <div className="max-h-80 overflow-y-auto rounded-lg border">
@@ -1536,15 +1522,37 @@ function ReportPageContent() {
 
             {/* Report Summary — lives in the left panel */}
             <div className="mt-6">
-              <div className="mb-3 flex items-center gap-2">
-                <Sparkles className="h-4 w-4 text-primary" />
-                <h2 className="text-sm font-semibold">Report Summary</h2>
-                {reportSummary && reportSummary.searchType !== "none" && (
-                  <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] text-primary">
-                    KB {reportSummary.searchType === "semantic" ? "語意搜尋" : "關鍵字搜尋"}
-                  </span>
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="h-4 w-4 text-primary" />
+                  <h2 className="text-sm font-semibold">Report Summary</h2>
+                  {reportSummary && reportSummary.searchType !== "none" && (
+                    <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] text-primary">
+                      KB {reportSummary.searchType === "semantic" ? "語意搜尋" : "關鍵字搜尋"}
+                    </span>
+                  )}
+                </div>
+                {rowsManuallyEdited && reportSummary && (
+                  <button
+                    type="button"
+                    onClick={() => refreshSummaryFromRows(extractedRows)}
+                    disabled={refreshingSummary || extractedRows.length === 0}
+                    className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1 text-xs font-medium hover:bg-accent disabled:opacity-50"
+                  >
+                    {refreshingSummary ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Sparkles className="h-3.5 w-3.5" />
+                    )}
+                    Refresh summary
+                  </button>
                 )}
               </div>
+              {rowsManuallyEdited && reportSummary && (
+                <p className="mb-3 text-[10px] text-amber-600">
+                  Row data changed — refresh to update summary text
+                </p>
+              )}
 
               {!reportSummary &&
               streamingStatus !== "thinking" &&
@@ -1602,18 +1610,6 @@ function ReportPageContent() {
                       </div>
                     </div>
                   )}
-
-                  <button
-                    onClick={generateFullReport}
-                    disabled={generatingReport}
-                    className="inline-flex w-full items-center justify-center gap-2 rounded-md border bg-background px-4 py-2.5 text-sm font-medium hover:bg-accent disabled:opacity-50"
-                  >
-                    {generatingReport ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-                    {generatingReport ? "Generating Report..." : "Generate Report (.docx)"}
-                  </button>
-                  <p className="text-center text-[10px] text-muted-foreground">
-                    Download a formal Word report ready to share with management
-                  </p>
                 </div>
               )}
             </div>
@@ -1629,11 +1625,9 @@ function ReportPageContent() {
                 documents={pdfPreviewDocuments}
                 activeDocumentId={activePreviewId ?? undefined}
                 onDocumentChange={setActivePreviewId}
-                highlights={documentHighlights}
+                highlights={[]}
                 highlightEnabled={highlightEnabled}
                 onHighlightEnabledChange={handleHighlightEnabledChange}
-                showAllHighlights={showAllHighlights}
-                onShowAllHighlightsChange={handleShowAllHighlightsChange}
                 focusTarget={focusTarget}
                 className="h-full"
               />
@@ -1645,7 +1639,7 @@ function ReportPageContent() {
                   <p className="mt-1 text-xs text-muted-foreground/60">
                     Upload a PDF on the left to preview it here.
                     <br />
-                    AI-highlighted key phrases will appear after analysis.
+                    AI key highlights (yellow) appear after analysis; click a row for blue focus.
                   </p>
                 </div>
               </div>

@@ -100,10 +100,21 @@ export async function POST(request: Request) {
       const lines = [
         `# Report Summary — ${fileName || "document"}`,
         "",
-        "## 總述",
-        summary,
-        "",
       ]
+
+      if (rows && rows.length > 0) {
+        lines.push("## 抽取欄位", "")
+        lines.push("| Field | Value |")
+        lines.push("| --- | --- |")
+        for (const row of rows) {
+          const field = (row.field || "").replace(/\|/g, "\\|")
+          const value = (row.value || "").replace(/\|/g, "\\|")
+          lines.push(`| ${field} | ${value} |`)
+        }
+        lines.push("")
+      }
+
+      lines.push("## 總述", summary, "")
 
       if (keyPoints && keyPoints.length > 0) {
         lines.push("## 知識庫相關要點", "")

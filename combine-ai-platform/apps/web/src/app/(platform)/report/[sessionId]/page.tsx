@@ -19,7 +19,6 @@ import {
 import { cn } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
-
 const PdfHighlightViewer = dynamic(
   () => import("@/features/report/components/pdf-highlight-viewer"),
   {
@@ -69,15 +68,14 @@ export default function ReportSessionPage() {
   const [extractedRows, setExtractedRows] = useState<TableRow[]>([])
   const [reportSummary, setReportSummary] = useState<ReportSummary | null>(null)
   const [highlightEnabled, setHighlightEnabled] = useState(false)
-  const [showAllHighlights, setShowAllHighlights] = useState(false)
   const [focusTarget, setFocusTarget] = useState<{
     page?: number
     field: string
     value: string
   } | null>(null)
   const [model, setModel] = useState(DEFAULT_MODELS.report)
-  const [generatingReport, setGeneratingReport] = useState(false)
   const [summarizing, setSummarizing] = useState(false)
+  const [rowsManuallyEdited, setRowsManuallyEdited] = useState(false)
   const [editingRowIndex, setEditingRowIndex] = useState<number | null>(null)
   const [editingField, setEditingField] = useState("")
   const [editingValue, setEditingValue] = useState("")
@@ -195,6 +193,7 @@ export default function ReportSessionPage() {
       if (res.ok) {
         const summary = (await res.json()) as ReportSummary
         setReportSummary(summary)
+        setRowsManuallyEdited(false)
         // Persist to DB so it's available on subsequent page loads
         await fetch("/api/report/sessions", {
           method: "PATCH",
@@ -230,8 +229,8 @@ export default function ReportSessionPage() {
     setEditingRowIndex(null)
     setEditingField("")
     setEditingValue("")
-    // Persist to session
     persistRows(updated)
+    setRowsManuallyEdited(true)
   }
 
   function cancelEditRow() {
@@ -245,11 +244,13 @@ export default function ReportSessionPage() {
     setExtractedRows(updated)
     if (editingRowIndex === index) cancelEditRow()
     persistRows(updated)
+    setRowsManuallyEdited(true)
   }
 
   function addRow() {
     const updated = [...extractedRows, { field: "New Field", value: "" }]
     setExtractedRows(updated)
+    setRowsManuallyEdited(true)
     setEditingRowIndex(extractedRows.length)
     setEditingField("New Field")
     setEditingValue("")
@@ -264,6 +265,7 @@ export default function ReportSessionPage() {
     if (editingRowIndex === from) setEditingRowIndex(to)
     else if (editingRowIndex === to) setEditingRowIndex(from)
     persistRows(updated)
+    setRowsManuallyEdited(true)
   }
 
   async function persistRows(rows: TableRow[]) {
@@ -301,6 +303,7 @@ export default function ReportSessionPage() {
       if (data.rows && data.rows.length > 0) {
         setExtractedRows(data.rows)
         persistRows(data.rows)
+        setRowsManuallyEdited(false)
         // Re-generate summary with refined data
         summaryFetchedRef.current = false
         setReportSummary(null)
@@ -311,40 +314,6 @@ export default function ReportSessionPage() {
       setError(err instanceof Error ? err.message : "Failed to refine extraction")
     } finally {
       setRefining(false)
-    }
-  }
-
-  // ── Generate Report ──
-  async function generateFullReport() {
-    if (!reportSummary && extractedRows.length === 0) return
-    setGeneratingReport(true)
-    try {
-      const res = await fetch("/api/report/agent?action=generateReport", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          rows: extractedRows.length > 0 ? extractedRows : undefined,
-          reportSummary: reportSummary || undefined,
-          fileName: session?.title,
-        }),
-      })
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({})) as { error?: string }
-        throw new Error(errData.error || "Generate report failed")
-      }
-      const data = (await res.json()) as { markdown: string; fileName: string }
-      const blob = new Blob([data.markdown], { type: "text/markdown;charset=utf-8" })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = data.fileName || `report-${Date.now()}.md`
-      a.click()
-      URL.revokeObjectURL(url)
-    } catch (err) {
-      console.error("Generate report error:", err)
-      setError(err instanceof Error ? err.message : "Failed to generate report")
-    } finally {
-      setGeneratingReport(false)
     }
   }
 
@@ -441,13 +410,18 @@ export default function ReportSessionPage() {
                     {extractedRows.length} fields
                   </span>
                 </div>
-                <button
-                  onClick={addRow}
-                  className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
-                >
-                  <Plus className="h-3 w-3" />
-                  Add Row
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={addRow}
+                    className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                  >
+                    <Plus className="h-3 w-3" />
+                    Add Row
+                  </button>
+                  {rowsManuallyEdited && (
+                    <span className="text-[10px] text-amber-600">(edited)</span>
+                  )}
+                </div>
               </div>
 
               <div className="max-h-80 overflow-y-auto rounded-lg border">
@@ -483,7 +457,6 @@ export default function ReportSessionPage() {
                         )}
                         onDoubleClick={() => {
                           setHighlightEnabled(true)
-                          setShowAllHighlights(false)
                           setFocusTarget({
                             page: row.page,
                             field: row.field,
@@ -655,15 +628,37 @@ export default function ReportSessionPage() {
 
           {/* ── Report Summary ── */}
           <div>
-            <div className="mb-3 flex items-center gap-2">
-              <Sparkles className="h-4 w-4 text-primary" />
-              <h2 className="text-sm font-semibold">Report Summary</h2>
-              {reportSummary && reportSummary.searchType !== "none" && (
-                <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] text-primary">
-                  KB {reportSummary.searchType === "semantic" ? "語意搜尋" : "關鍵字搜尋"}
-                </span>
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Sparkles className="h-4 w-4 text-primary" />
+                <h2 className="text-sm font-semibold">Report Summary</h2>
+                {reportSummary && reportSummary.searchType !== "none" && (
+                  <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] text-primary">
+                    KB {reportSummary.searchType === "semantic" ? "語意搜尋" : "關鍵字搜尋"}
+                  </span>
+                )}
+              </div>
+              {rowsManuallyEdited && reportSummary && (
+                <button
+                  type="button"
+                  onClick={() => fetchSummary(extractedRows)}
+                  disabled={summarizing || extractedRows.length === 0}
+                  className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1 text-xs font-medium hover:bg-accent disabled:opacity-50"
+                >
+                  {summarizing ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="h-3.5 w-3.5" />
+                  )}
+                  Refresh summary
+                </button>
               )}
             </div>
+            {rowsManuallyEdited && reportSummary && (
+              <p className="mb-3 text-[10px] text-amber-600">
+                Row data changed — refresh to update summary text
+              </p>
+            )}
 
             {summarizing || isProcessing ? (
               <div className="flex h-32 flex-col items-center justify-center rounded-lg border bg-muted/20 text-center">
@@ -736,17 +731,6 @@ export default function ReportSessionPage() {
                   </div>
                 )}
 
-                <button
-                  onClick={generateFullReport}
-                  disabled={generatingReport}
-                  className="inline-flex w-full items-center justify-center gap-2 rounded-md border bg-background px-4 py-2.5 text-sm font-medium hover:bg-accent disabled:opacity-50"
-                >
-                  {generatingReport ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-                  {generatingReport ? "Generating Report..." : "Generate Report"}
-                </button>
-                <p className="text-center text-[10px] text-muted-foreground">
-                  Download a full structured report with knowledge base references
-                </p>
               </div>
             )}
           </div>
@@ -762,15 +746,9 @@ export default function ReportSessionPage() {
             <PdfHighlightViewer
               fileUrl={fileUrl}
               fileName={fileName || "Document"}
-              highlights={extractedRows.map((r) => ({
-                field: r.field,
-                value: r.value,
-                page: r.page,
-              }))}
+              highlights={[]}
               highlightEnabled={highlightEnabled}
               onHighlightEnabledChange={setHighlightEnabled}
-              showAllHighlights={showAllHighlights}
-              onShowAllHighlightsChange={setShowAllHighlights}
               focusTarget={focusTarget}
               className="h-full"
             />
