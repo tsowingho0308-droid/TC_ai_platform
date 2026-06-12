@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/server/prisma"
 import { generateEmbedding } from "@combine-ai/ai-provider"
+import { COL, KB_JOIN_CHAIN } from "@/lib/server/db-columns"
 
 export interface KnowledgeChunkResult {
   chunkId: string | null
@@ -52,43 +53,38 @@ export async function searchKnowledgeChunks(
     try {
       const embedding = await generateEmbedding(q.slice(0, 2000))
 
-      const rawResults = await prisma.$queryRaw<
-        Array<{
-          chunk_id: string
-          content: string
-          chunk_index: number
-          article_id: string
-          article_title: string
-          knowledge_base_id: string
-          knowledge_base_name: string
-          knowledge_base_slug: string
-          department: string
-          similarity: number
-        }>
-      >`
+      const hasDept = department && department !== "GENERAL"
+      const embLiteral = `'[${embedding.join(",")}]'`
+      const C_COL = COL.KnowledgeChunk
+      const A_COL = COL.KnowledgeArticle
+      const K_COL = COL.KnowledgeBase
+
+      const deptSQL = hasDept
+        ? ` AND kb."${K_COL.department}" = '${department}'::text`
+        : ""
+
+      const sql = `
         SELECT
-          kc.id as chunk_id,
-          kc.content,
-          kc.chunk_index as chunk_index,
-          ka.id as article_id,
-          ka.title as article_title,
-          kb.id as knowledge_base_id,
-          kb.name as knowledge_base_name,
-          kb.slug as knowledge_base_slug,
-          kb.department,
-          1 - (kc.embedding <=> ${embedding}::vector) as similarity
-        FROM "KnowledgeChunk" kc
-        JOIN "KnowledgeArticle" ka ON ka.id = kc.article_id
-        JOIN "KnowledgeBase" kb ON kb.id = ka.knowledge_base_id
-        WHERE kb.workspace_id = ${workspaceId}
-          ${
-            department && department !== "GENERAL"
-              ? prisma.$queryRaw`AND kb.department = ${department}::text`
-              : prisma.$queryRaw`AND 1=1`
-          }
-        ORDER BY kc.embedding <=> ${embedding}::vector
+          kc."${C_COL.id}" as chunk_id, kc."${C_COL.content}" as content,
+          kc."${C_COL.chunkIndex}" as chunk_index,
+          ka."${A_COL.id}" as article_id, ka."${A_COL.title}" as article_title,
+          kb."${K_COL.id}" as knowledge_base_id, kb."${K_COL.name}" as knowledge_base_name,
+          kb."${K_COL.slug}" as knowledge_base_slug, kb."${K_COL.department}" as department,
+          1 - (kc."${C_COL.embedding}" <=> ${embLiteral}::vector) as similarity
+        ${KB_JOIN_CHAIN}
+        WHERE kb."${K_COL.workspaceId}" = '${workspaceId}'${deptSQL}
+        ORDER BY kc."${C_COL.embedding}" <=> ${embLiteral}::vector
         LIMIT ${limit}
       `
+
+      const rawResults = await prisma.$queryRawUnsafe<
+        Array<{
+          chunk_id: string; content: string; chunk_index: number
+          article_id: string; article_title: string
+          knowledge_base_id: string; knowledge_base_name: string
+          knowledge_base_slug: string; department: string; similarity: number
+        }>
+      >(sql)
 
       const chunks = rawResults.map((r) => ({
         chunkId: r.chunk_id,

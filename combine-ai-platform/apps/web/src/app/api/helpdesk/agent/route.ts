@@ -7,6 +7,7 @@ import {
   searchKnowledgeBase,
   checkPgVector,
   formatSourcesText,
+  extractDateFromQuery,
   type SearchResult,
 } from "@/features/helpdesk/api/helpdesk-search"
 import { parseAIJson } from "@/lib/server/parse-json"
@@ -223,7 +224,7 @@ async function executeToolCall(
           workspaceId: session.workspaceId,
           department: args.department as string | undefined,
           topK: 5,
-          minSimilarity: 0.6,
+          minSimilarity: 0.42,
         }
       )
 
@@ -796,12 +797,14 @@ export async function POST(request: NextRequest) {
         const userQuestion =
           typeof lastUserMsg?.content === "string" ? lastUserMsg.content : ""
 
+        const dateFilter = extractDateFromQuery(userQuestion)
         const searchResult = userQuestion
           ? await searchKnowledgeBase(userQuestion, {
               workspaceId: session.workspaceId,
               department: department as string | undefined,
               topK: 5,
-              minSimilarity: 0.6,
+              minSimilarity: 0.42,
+              dateFilter: dateFilter.type ? dateFilter as { type: "exact" | "recent"; date?: Date } : undefined,
             })
           : { articles: [] as SearchResult[], suggestions: [] as SearchResult[], maxScore: 0, tier: "none" as const, searchMethod: "none" as const }
 
@@ -811,21 +814,27 @@ export async function POST(request: NextRequest) {
         let sourcesText: string
         if (searchTier === "suggestions" && suggestions.length > 0) {
           const sugTitles = suggestions.map((s) => `"${s.title}" (${s.department}, ${Math.round((s.similarity ?? 0) * 100)}% match)`).join(", ")
-          sourcesText = `⚠️ SUGGESTIONS FALLBACK — No strong matches found (best score: ${Math.round(maxScore * 100)}%).
+          sourcesText = `⚠️ SUGGESTIONS FALLBACK — These documents are the CLOSEST matches found (best score: ${Math.round(maxScore * 100)}%).
 
-The following documents are PARTIALLY relevant but below the confidence threshold:
-${suggestions.map((s, i) => `[Suggestion ${i + 1}] Title: ${s.title}\nDepartment: ${s.department}\nContent: ${s.content.slice(0, 1000)}\nRelevance: ${Math.round((s.similarity ?? 0) * 100)}%\n`).join("\n")}
+You MUST follow these IRON RULES:
+1. You MUST NOT say "找不到相關資料" / "未找到" / "I cannot find" / "not found" — these phrases are FORBIDDEN.
+2. You MUST acknowledge the closest match and present it helpfully.
+3. You MUST respond in this EXACT format (adapt language to match the user):
 
-INSTRUCTIONS: You MUST respond in this format:
-"找不到與您提問完全相符的內容 😢，或許您是指以下相關規定？
+"沒有找到完全100%匹配的文件，但為您找到最接近的相關文件如下：
 
-- **${suggestions[0]?.title || "[文件標題]"}**（${suggestions[0]?.department || ""}）
-${suggestions.length > 1 ? `- **${suggestions[1]?.title || "[文件標題]"}**（${suggestions[1]?.department || ""}）` : ""}
+📄 **${suggestions[0]?.title || "[文件標題]"}**（${suggestions[0]?.department || ""}，相關度 ${Math.round((suggestions[0]?.similarity ?? 0) * 100)}%）
+> ${suggestions[0]?.content.slice(0, 200) || ""}...
+${suggestions.length > 1 ? `\n📄 **${suggestions[1]?.title || "[文件標題]"}**（${suggestions[1]?.department || ""}，相關度 ${Math.round((suggestions[1]?.similarity ?? 0) * 100)}%）\n> ${suggestions[1]?.content.slice(0, 200) || ""}...` : ""}
 
-請問您想查詢以上哪一份文件的詳細內容？如果都不是您要找的，我可以為您建立工單轉交相關部門跟進。"
+這份就是目前知識庫中最接近您需求的內容。請問需要我為您：
+- 📖 提供這份文件的完整摘要？
+- 🎫 建立工單請相關部門提供更精確的文件？
+- 🔍 用其他關鍵字重新搜尋？"
 
-Do NOT call search_knowledge_base. Do NOT create a ticket unless the user confirms.
-Respond in the SAME LANGUAGE as the user.`
+4. Do NOT call search_knowledge_base. Do NOT call create_ticket unless user explicitly requests it.
+5. Do NOT answer the user's original question — you don't have enough info. Focus on presenting the closest match.
+6. Respond in the SAME LANGUAGE as the user.`
         } else {
           sourcesText = formatSourcesText(articles)
         }
@@ -1028,12 +1037,14 @@ Respond in the SAME LANGUAGE as the user.`
                   ? lastUserMsg.content
                   : ""
 
+              const streamDateFilter = extractDateFromQuery(userQuestion)
               const searchResult = userQuestion
                 ? await searchKnowledgeBase(userQuestion, {
                     workspaceId: session.workspaceId,
                     department: streamDept as string | undefined,
                     topK: 5,
-                    minSimilarity: 0.6,
+                    minSimilarity: 0.42,
+                    dateFilter: streamDateFilter.type ? streamDateFilter as { type: "exact" | "recent"; date?: Date } : undefined,
                   })
                 : { articles: [] as SearchResult[], suggestions: [] as SearchResult[], maxScore: 0, tier: "none" as const, searchMethod: "none" as const }
 
@@ -1042,14 +1053,21 @@ Respond in the SAME LANGUAGE as the user.`
               // Build sources text with suggestions fallback
               let sourcesText: string
               if (searchTier === "suggestions" && suggestions.length > 0) {
-                const sugTitles = suggestions.map((s) => `"${s.title}"`).join(", ")
-                sourcesText = `⚠️ SUGGESTIONS FALLBACK — No strong matches (best: ${Math.round(maxScore * 100)}%).
+                sourcesText = `⚠️ SUGGESTIONS FALLBACK — CLOSEST matches (best: ${Math.round(maxScore * 100)}%).
 
-Suggestions: ${sugTitles}
+IRON RULES:
+1. NEVER say "找不到" / "not found" / "沒有相關資料"
+2. MUST present the closest match with title and preview
+3. MUST use this format:
+"沒有找到完全100%匹配的文件，但為您找到最接近的相關文件：
 
-INSTRUCTIONS: Respond with "找不到與您提問完全相符的內容 😢，或許您是指以下相關規定？" and list the suggestion titles. Do NOT call search_knowledge_base. Ask user to confirm before creating ticket.
+📄 **${suggestions[0]?.title || ""}**（${suggestions[0]?.department || ""}，相關度 ${Math.round((suggestions[0]?.similarity ?? 0) * 100)}%）
+> ${suggestions[0]?.content.slice(0, 200) || ""}...
 
-${suggestions.map((s) => `[Suggestion] ${s.title} (${s.department}, ${Math.round((s.similarity ?? 0) * 100)}%)\n${s.content.slice(0, 500)}`).join("\n\n")}`
+這份就是目前知識庫中最接近您需求的內容。請問需要我提供更多資訊，還是為您建立工單？"
+4. Do NOT call tools unless user requests.
+
+${suggestions.map((s) => `[Doc] ${s.title} (${s.department}, ${Math.round((s.similarity ?? 0) * 100)}%)\n${s.content.slice(0, 500)}`).join("\n\n")}`
               } else {
                 sourcesText = formatSourcesText(articles)
               }

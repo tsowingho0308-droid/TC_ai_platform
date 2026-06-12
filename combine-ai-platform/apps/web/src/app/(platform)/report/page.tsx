@@ -16,6 +16,8 @@ import {
   FileText,
   BookOpen,
   Sparkles,
+  Plus,
+  Trash2,
 } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
@@ -140,6 +142,12 @@ function ReportPageContent() {
   const [streamingStatus, setStreamingStatus] = useState<
     "idle" | "connecting" | "thinking" | "highlighting" | "done" | "error"
   >("idle")
+  const [editingRowIndex, setEditingRowIndex] = useState<number | null>(null)
+  const [editingField, setEditingField] = useState("")
+  const [editingValue, setEditingValue] = useState("")
+  const [refineInstruction, setRefineInstruction] = useState("")
+  const [refining, setRefining] = useState(false)
+  const [sessionId, setSessionId] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
 
@@ -449,11 +457,13 @@ function ReportPageContent() {
         }
         case "result": {
           const result = parsed.result as {
+            sessionId?: string
             rows?: TableRow[]
             documentType?: string
             confidence?: number
           } | undefined
           if (result) {
+            if (result.sessionId) setSessionId(result.sessionId)
             if (result.rows && result.rows.length > 0) {
               setExtractedRows(result.rows)
             }
@@ -487,6 +497,86 @@ function ReportPageContent() {
       }
     } catch {
       // Skip unparseable records
+    }
+  }
+
+  function startEditRow(index: number) {
+    const row = extractedRows[index]
+    if (!row) return
+    setEditingRowIndex(index)
+    setEditingField(row.field)
+    setEditingValue(row.value)
+  }
+
+  function saveEditRow() {
+    if (editingRowIndex === null) return
+    const updated = [...extractedRows]
+    updated[editingRowIndex] = {
+      ...updated[editingRowIndex],
+      field: editingField.trim() || updated[editingRowIndex].field,
+      value: editingValue.trim(),
+    }
+    setExtractedRows(updated)
+    setEditingRowIndex(null)
+    setEditingField("")
+    setEditingValue("")
+  }
+
+  function cancelEditRow() {
+    setEditingRowIndex(null)
+    setEditingField("")
+    setEditingValue("")
+  }
+
+  function deleteRow(index: number) {
+    setExtractedRows((prev) => prev.filter((_, i) => i !== index))
+    if (editingRowIndex === index) cancelEditRow()
+  }
+
+  function addRow() {
+    setExtractedRows((prev) => [...prev, { field: "New Field", value: "" }])
+    // Start editing the new row immediately
+    setEditingRowIndex(extractedRows.length)
+    setEditingField("New Field")
+    setEditingValue("")
+  }
+
+  function moveRow(from: number, to: number) {
+    if (to < 0 || to >= extractedRows.length) return
+    const updated = [...extractedRows]
+    const [moved] = updated.splice(from, 1)
+    updated.splice(to, 0, moved)
+    setExtractedRows(updated)
+    if (editingRowIndex === from) setEditingRowIndex(to)
+    else if (editingRowIndex === to) setEditingRowIndex(from)
+  }
+
+  async function handleRefine() {
+    if (!refineInstruction.trim() || extractedRows.length === 0) return
+    setRefining(true)
+    try {
+      const res = await fetch("/api/report/agent?action=refine", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          currentRows: extractedRows,
+          instructions: refineInstruction,
+        }),
+      })
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({})) as { error?: string }
+        throw new Error(errData.error || "Refinement failed")
+      }
+      const data = (await res.json()) as { rows?: TableRow[]; changes?: string; applied?: boolean }
+      if (data.rows && data.rows.length > 0) {
+        setExtractedRows(data.rows)
+      }
+      setRefineInstruction("")
+    } catch (err) {
+      console.error("Refine error:", err)
+      setError(err instanceof Error ? err.message : "Failed to refine extraction")
+    } finally {
+      setRefining(false)
     }
   }
 
@@ -581,6 +671,15 @@ function ReportPageContent() {
               <span className="text-xs text-muted-foreground">
                 Confidence: {(confidence * 100).toFixed(0)}%
               </span>
+            )}
+            {sessionId && (
+              <Link
+                href={`/report/${sessionId}`}
+                className="inline-flex items-center gap-1 rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700 hover:bg-green-200"
+              >
+                <BookOpen className="h-3 w-3" />
+                Session saved — view
+              </Link>
             )}
           </div>
           <div className="flex items-center gap-2">
@@ -870,6 +969,201 @@ function ReportPageContent() {
                   placeholder="Add specific instructions for AI (e.g., focus on compliance items)..."
                   disabled={extracting || loadingEmailExtract}
                 />
+              </div>
+            )}
+
+            {/* ── Extracted Data Table ── */}
+            {extractedRows.length > 0 && (
+              <div className="mt-6">
+                <div className="mb-3 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <BarChart3 className="h-4 w-4 text-primary" />
+                    <h2 className="text-sm font-semibold">Extracted Data</h2>
+                    <span className="rounded-full bg-muted px-1.5 py-0 text-[10px] text-muted-foreground">
+                      {extractedRows.length} fields
+                    </span>
+                  </div>
+                  <button
+                    onClick={addRow}
+                    className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                  >
+                    <Plus className="h-3 w-3" />
+                    Add Row
+                  </button>
+                </div>
+
+                <div className="max-h-80 overflow-y-auto rounded-lg border">
+                  <table className="w-full text-sm">
+                    <thead className="sticky top-0 bg-muted/80 backdrop-blur-sm">
+                      <tr>
+                        <th className="w-12 px-2 py-2 text-left text-[10px] font-semibold uppercase text-muted-foreground">
+                          #
+                        </th>
+                        <th className="px-2 py-2 text-left text-[10px] font-semibold uppercase text-muted-foreground">
+                          Field
+                        </th>
+                        <th className="px-2 py-2 text-left text-[10px] font-semibold uppercase text-muted-foreground">
+                          Value
+                        </th>
+                        <th className="w-12 px-2 py-2 text-left text-[10px] font-semibold uppercase text-muted-foreground">
+                          Pg
+                        </th>
+                        <th className="w-20 px-2 py-2 text-[10px] font-semibold uppercase text-muted-foreground">
+                          Actions
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {extractedRows.map((row, i) => (
+                        <tr
+                          key={i}
+                          className={cn(
+                            "border-t transition-colors",
+                            editingRowIndex === i
+                              ? "bg-primary/5"
+                              : "hover:bg-muted/30"
+                          )}
+                        >
+                          <td className="px-2 py-1.5 text-[10px] text-muted-foreground">
+                            {i + 1}
+                          </td>
+                          {editingRowIndex === i ? (
+                            <>
+                              <td className="px-1 py-1">
+                                <input
+                                  value={editingField}
+                                  onChange={(e) => setEditingField(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") saveEditRow()
+                                    if (e.key === "Escape") cancelEditRow()
+                                  }}
+                                  className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
+                                  autoFocus
+                                />
+                              </td>
+                              <td className="px-1 py-1">
+                                <input
+                                  value={editingValue}
+                                  onChange={(e) => setEditingValue(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") saveEditRow()
+                                    if (e.key === "Escape") cancelEditRow()
+                                  }}
+                                  className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
+                                />
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              <td
+                                className="cursor-pointer px-2 py-1.5 text-xs font-medium"
+                                onClick={() => startEditRow(i)}
+                                title="Click to edit"
+                              >
+                                {row.field}
+                              </td>
+                              <td
+                                className="cursor-pointer px-2 py-1.5 text-xs"
+                                onClick={() => startEditRow(i)}
+                                title="Click to edit"
+                              >
+                                {row.value || (
+                                  <span className="italic text-muted-foreground/50">
+                                    empty
+                                  </span>
+                                )}
+                              </td>
+                            </>
+                          )}
+                          <td className="px-2 py-1.5 text-[10px] text-muted-foreground">
+                            {row.page || "—"}
+                          </td>
+                          <td className="px-1 py-1 text-center">
+                            <div className="flex items-center justify-center gap-0.5">
+                              {editingRowIndex === i ? (
+                                <>
+                                  <button
+                                    onClick={saveEditRow}
+                                    className="rounded p-0.5 text-green-600 hover:bg-green-50"
+                                    title="Save"
+                                  >
+                                    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                                  </button>
+                                  <button
+                                    onClick={cancelEditRow}
+                                    className="rounded p-0.5 text-muted-foreground hover:bg-muted"
+                                    title="Cancel"
+                                  >
+                                    <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                  </button>
+                                </>
+                              ) : (
+                                <>
+                                  <button
+                                    onClick={() => startEditRow(i)}
+                                    className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                                    title="Edit"
+                                  >
+                                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                                  </button>
+                                  <button
+                                    onClick={() => moveRow(i, i - 1)}
+                                    disabled={i === 0}
+                                    className="rounded p-0.5 text-muted-foreground hover:bg-muted disabled:opacity-20"
+                                    title="Move up"
+                                  >
+                                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="18 15 12 9 6 15"/></svg>
+                                  </button>
+                                  <button
+                                    onClick={() => deleteRow(i)}
+                                    className="rounded p-0.5 text-muted-foreground hover:bg-red-50 hover:text-red-600"
+                                    title="Delete"
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Refine with AI */}
+                <div className="mt-3 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <input
+                      value={refineInstruction}
+                      onChange={(e) => setRefineInstruction(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault()
+                          handleRefine()
+                        }
+                      }}
+                      placeholder="Ask AI to refine the extraction (e.g., combine duplicate fields, fix dates)..."
+                      className="flex-1 rounded-md border bg-background px-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
+                      disabled={refining}
+                    />
+                    <button
+                      onClick={handleRefine}
+                      disabled={refining || !refineInstruction.trim()}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
+                    >
+                      {refining ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Sparkles className="h-3.5 w-3.5" />
+                      )}
+                      {refining ? "Refining..." : "Refine with AI"}
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-muted-foreground">
+                    AI will modify, add, or remove fields based on your instruction. You can also edit fields directly by clicking them.
+                  </p>
+                </div>
               </div>
             )}
 

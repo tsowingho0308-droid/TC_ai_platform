@@ -566,6 +566,7 @@ model ReportSession {
   title       String
   status      String   @default("active") // active, completed, archived
   rows        Json?    // Array<{field: string, value: string}>
+  summary     Json?    // ReportSummary { summary, keyPoints, kbReferences, searchType }
   draftNote   String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

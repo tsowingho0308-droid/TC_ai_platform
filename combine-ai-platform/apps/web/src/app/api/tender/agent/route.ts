@@ -468,6 +468,16 @@ async function performExtraction(
 
   const userPrompt = buildExtractionPrompt(documentText!, fileName, instructions)
 
+  // ── Set session status to PROCESSING ─────────────────────────
+  if (sessionId) {
+    try {
+      await prisma.tenderSession.update({
+        where: { id: sessionId },
+        data: { status: "processing" },
+      })
+    } catch { /* best-effort */ }
+  }
+
   // ── Try AI extraction, fallback to mock template if no API key ──
   let extracted: ExtractedTender = {}
   let modelUsed = "unknown"
@@ -536,12 +546,16 @@ async function performExtraction(
           data: {
             fieldInputs: fieldInputs as Prisma.InputJsonValue,
             tenderType: extracted.tenderType || existing.tenderType,
-            status: "active",
+            status: "completed",
           },
         })
       }
     } catch (dbErr) {
       console.error("Failed to save tender extraction:", dbErr)
+      // Mark as failed on save error
+      if (sessionId) {
+        try { await prisma.tenderSession.update({ where: { id: sessionId }, data: { status: "failed" } }) } catch { /* best-effort */ }
+      }
     }
   }
 
@@ -603,6 +617,11 @@ async function handleStreamExtract(
             code: "TEXT_EXTRACTION_FAILED",
           })
           return
+        }
+
+        // Set session to processing
+        if (sessionId) {
+          try { await prisma.tenderSession.update({ where: { id: sessionId }, data: { status: "processing" } }) } catch { /* best-effort */ }
         }
 
         const userPrompt = buildExtractionPrompt(documentText!, fileName, instructions)
@@ -700,7 +719,7 @@ async function handleStreamExtract(
                 data: {
                   fieldInputs: fieldInputs as Prisma.InputJsonValue,
                   tenderType: extracted.tenderType || existing.tenderType,
-                  status: "active",
+                  status: "completed",
                 },
               })
             }

@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server"
+import type { Prisma } from "@prisma/client"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
 import { mockReportExtraction } from "@/lib/server/mock-extraction"
@@ -6,9 +7,43 @@ import { extractTextFromDocument, validateDocumentText } from "@/lib/server/docu
 import { searchKnowledgeChunks, type KnowledgeSearchResult } from "@/lib/server/knowledge-search"
 import { extractKbHighlightPhrases } from "@/lib/server/kb-highlight-phrases"
 import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import path from "path"
+import fs from "fs"
 
 export const dynamic = "force-dynamic"
-export const maxDuration = 120
+export const maxDuration = 300
+
+// ── File Storage ───────────────────────────────────────────────
+
+const REPORTS_DATA_DIR = path.resolve(process.cwd(), "data", "reports")
+
+function ensureSessionDir(sessionId: string): string {
+  const dir = path.join(REPORTS_DATA_DIR, sessionId)
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+function saveUploadedFile(sessionId: string, buffer: Buffer, fileName: string): string {
+  const dir = ensureSessionDir(sessionId)
+  // Sanitize filename and keep extension
+  const ext = path.extname(fileName) || ".bin"
+  const safeFileName = `file${ext}`
+  const filePath = path.join(dir, safeFileName)
+  fs.writeFileSync(filePath, buffer)
+  return filePath
+}
+
+function getStoredFilePath(sessionId: string): string | null {
+  const dir = path.join(REPORTS_DATA_DIR, sessionId)
+  if (!fs.existsSync(dir)) return null
+  const entries = fs.readdirSync(dir)
+  // Return first file found (there should be only one: "file.pdf" etc.)
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry)
+    if (fs.statSync(fullPath).isFile()) return fullPath
+  }
+  return null
+}
 
 // ── AI Provider ───────────────────────────────────────────────
 
@@ -182,7 +217,7 @@ async function saveStreamExtraction(
       await prisma.reportSession.update({
         where: { id: sessionId },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        data: { rows: rows as any, status: "active" },
+        data: { rows: rows as any, status: "completed" },
       })
       await prisma.reportConversationTurn.createMany({
         data: [
@@ -347,6 +382,18 @@ async function performReportSummary(
   }
 }
 
+// ── Background Job Runner ──────────────────────────────────────
+
+/**
+ * Run an extraction task in the background, detached from the HTTP request lifecycle.
+ * The caller immediately returns to the client; this continues in-process.
+ */
+function runBackgroundJob(fn: () => Promise<void>, label: string) {
+  setImmediate(() => {
+    fn().catch((err) => console.error(`[Background Job] ${label} failed:`, err))
+  })
+}
+
 // ── POST Handler ──────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
@@ -360,10 +407,11 @@ export async function POST(request: NextRequest) {
     const contentType = request.headers.get("content-type") || ""
 
     // ── Multipart file upload ──
+    // stream=1 → SSE real-time extraction; otherwise → background job
     if (contentType.includes("multipart/form-data")) {
       return stream
         ? handleStreamMultipartExtract(request, session)
-        : handleMultipartExtract(request, session)
+        : handleMultipartExtractBackground(request, session)
     }
 
     const body = (await request.json()) as Record<string, unknown>
@@ -372,7 +420,7 @@ export async function POST(request: NextRequest) {
       case "extract":
         return stream
           ? handleStreamExtract(session, body)
-          : handleExtract(session, body)
+          : handleExtractBackground(session, body)
 
       case "refine":
         return handleRefine(session, body)
@@ -407,7 +455,7 @@ async function handleStreamMultipartExtract(
   try {
     const formData = await request.formData()
     const file = formData.get("file") as File | null
-    const sessionId = formData.get("sessionId") as string | null
+    const sessionId = (formData.get("sessionId") as string) || `report-${Date.now()}`
     const instructions = formData.get("instructions") as string | null
     const model = formData.get("model") as string | null
 
@@ -416,17 +464,31 @@ async function handleStreamMultipartExtract(
     }
 
     const arrayBuffer = await file.arrayBuffer()
-    const base64 = Buffer.from(arrayBuffer).toString("base64")
+    const buffer = Buffer.from(arrayBuffer)
+    const base64 = buffer.toString("base64")
     const mimeType = file.type || "application/octet-stream"
     const dataUrl = `data:${mimeType};base64,${base64}`
 
+    // Save file to disk for later session viewing
+    try { saveUploadedFile(sessionId, buffer, file.name) } catch (err) {
+      console.error("Failed to save uploaded file:", err)
+    }
+
+    // Ensure session exists
+    await prisma.reportSession.upsert({
+      where: { id: sessionId },
+      create: {
+        id: sessionId,
+        workspaceId: session.workspaceId,
+        title: file.name || "New Report",
+        status: "processing",
+      },
+      update: { status: "processing", title: file.name || undefined },
+    })
+
     let documentText: string | undefined
     try {
-      documentText = await extractTextFromDocument(
-        Buffer.from(arrayBuffer),
-        file.name,
-        mimeType
-      )
+      documentText = await extractTextFromDocument(buffer, file.name, mimeType)
     } catch (err) {
       console.error("Stream multipart document extraction failed:", file.name, err)
       documentText = undefined
@@ -435,7 +497,7 @@ async function handleStreamMultipartExtract(
     return handleStreamExtract(session, {
       fileBase64: dataUrl,
       fileName: file.name,
-      sessionId: sessionId || undefined,
+      sessionId,
       instructions: instructions || undefined,
       documentText,
       model: model || undefined,
@@ -452,7 +514,7 @@ async function handleStreamMultipartExtract(
   }
 }
 
-async function handleMultipartExtract(request: NextRequest, session: { sub: string; workspaceId: string }) {
+async function handleMultipartExtractBackground(request: NextRequest, session: { sub: string; workspaceId: string }) {
   try {
     const formData = await request.formData()
     const file = formData.get("file") as File | null
@@ -463,31 +525,162 @@ async function handleMultipartExtract(request: NextRequest, session: { sub: stri
       return NextResponse.json({ error: "file is required" }, { status: 400 })
     }
 
-    // Convert file to base64
     const arrayBuffer = await file.arrayBuffer()
-    const base64 = Buffer.from(arrayBuffer).toString("base64")
+    const buffer = Buffer.from(arrayBuffer)
     const mimeType = file.type || "application/octet-stream"
-    const dataUrl = `data:${mimeType};base64,${base64}`
+    const effectiveSessionId = sessionId || `report-${Date.now()}`
+    const fileName = file.name
 
-    return performExtraction(session, {
-      fileBase64: dataUrl,
-      fileName: file.name,
-      sessionId: sessionId || undefined,
-      instructions: instructions || undefined,
+    // Save file to disk for session viewing
+    try { saveUploadedFile(effectiveSessionId, buffer, fileName) } catch (err) {
+      console.error("Failed to save uploaded file for background extraction:", err)
+    }
+
+    // Extract text from the document BEFORE starting background job
+    let documentText: string | undefined
+    let fileBase64: string | undefined
+    const isImage = mimeType.startsWith("image/")
+
+    if (isImage) {
+      // Images: pass as base64 for AI vision
+      const base64 = buffer.toString("base64")
+      fileBase64 = `data:${mimeType};base64,${base64}`
+    } else {
+      // PDF/DOCX/TXT: extract text now
+      try {
+        documentText = await extractTextFromDocument(buffer, fileName, mimeType)
+      } catch (err) {
+        console.error("Text extraction failed:", err)
+        return NextResponse.json({
+          error: "Failed to extract text from document",
+          detail: err instanceof Error ? err.message : "Unknown error",
+        }, { status: 422 })
+      }
+      if (!documentText || documentText.trim().length < 50) {
+        return NextResponse.json({
+          error: "Document contains insufficient readable text",
+          detail: `Extracted ${documentText?.length || 0} characters (minimum 50 required)`,
+        }, { status: 422 })
+      }
+    }
+
+    // Ensure session exists with processing status
+    await prisma.reportSession.upsert({
+      where: { id: effectiveSessionId },
+      create: {
+        id: effectiveSessionId,
+        workspaceId: session.workspaceId,
+        title: fileName || "New Report",
+        status: "processing",
+      },
+      update: { status: "processing", title: fileName || undefined },
+    })
+
+    // Return IMMEDIATELY — AI runs in background
+    runBackgroundJob(async () => {
+      try {
+        await performExtraction(session, {
+          fileBase64,
+          fileName,
+          sessionId: effectiveSessionId,
+          instructions: instructions || undefined,
+          documentText,
+        })
+      } catch (err) {
+        console.error("Background extraction failed:", err)
+        await prisma.reportSession.update({
+          where: { id: effectiveSessionId },
+          data: { status: "failed" },
+        }).catch(() => {})
+      }
+    }, `report-extract:${effectiveSessionId}`)
+
+    return NextResponse.json({
+      success: true,
+      sessionId: effectiveSessionId,
+      status: "processing",
+      message: `Extraction started (${documentText ? documentText.length + " chars" : "image analysis"}). Poll GET /api/report/sessions for status.`,
     })
   } catch (error) {
-    console.error("Multipart extraction error:", error)
+    console.error("Multipart extraction setup error:", error)
     return NextResponse.json(
-      {
-        error: "File processing failed",
-        detail: error instanceof Error ? error.message : "Unknown error",
-      },
+      { error: "File processing failed", detail: error instanceof Error ? error.message : "Unknown error" },
       { status: 500 }
     )
   }
 }
 
 // ── Standard Extraction ───────────────────────────────────────
+
+// Background version — creates session, returns immediately, runs AI in background
+async function handleExtractBackground(
+  session: { sub: string; workspaceId: string },
+  body: Record<string, unknown>
+) {
+  const sessionId = (body.sessionId as string) || `report-${Date.now()}`
+  const fileBase64 = body.fileBase64 as string | undefined
+  const fileName = (body.fileName as string) || "Report Document"
+  const instructions = body.instructions as string | undefined
+  const documentText = body.documentText as string | undefined
+  const model = body.model as string | undefined
+
+  if (!fileBase64 && !documentText) {
+    return NextResponse.json({ error: "fileBase64 or documentText required" }, { status: 400 })
+  }
+
+  // Save file to disk for session viewing (if base64 provided)
+  if (fileBase64) {
+    try {
+      const match = fileBase64.match(/^data:([^;]+);base64,([\s\S]+)$/)
+      if (match) {
+        const ext = match[1].split("/")[1] || "bin"
+        saveUploadedFile(sessionId, Buffer.from(match[2], "base64"), `${fileName}.${ext}`)
+      }
+    } catch (err) {
+      console.error("Failed to save file for background extraction:", err)
+    }
+  }
+
+  // Create/update session with processing status
+  await prisma.reportSession.upsert({
+    where: { id: sessionId },
+    create: {
+      id: sessionId,
+      workspaceId: session.workspaceId,
+      userId: session.sub,
+      title: fileName,
+      status: "processing",
+    },
+    update: { status: "processing", title: fileName },
+  })
+
+  // Run AI in background
+  runBackgroundJob(async () => {
+    try {
+      await performExtraction(session, {
+        fileBase64,
+        fileName,
+        sessionId,
+        instructions,
+        documentText,
+        model,
+      })
+    } catch (err) {
+      console.error("Background extraction failed:", err)
+      await prisma.reportSession.update({
+        where: { id: sessionId },
+        data: { status: "failed" },
+      }).catch(() => {})
+    }
+  }, `report-extract:${sessionId}`)
+
+  return NextResponse.json({
+    success: true,
+    sessionId,
+    status: "processing",
+    message: "Extraction started. Poll GET /api/report/sessions for status.",
+  })
+}
 
 async function handleExtract(
   session: { sub: string; workspaceId: string },
@@ -528,6 +721,11 @@ async function performExtraction(
   params: ExtractionParams
 ) {
   const { fileBase64, fileName, sessionId, instructions, documentText, model } = params
+
+  // Set session to processing
+  if (sessionId) {
+    try { await prisma.reportSession.update({ where: { id: sessionId }, data: { status: "processing" } }) } catch { /* best-effort */ }
+  }
 
   // Build messages
   const messages: Array<{ role: string; content: Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }> }> = [
@@ -637,7 +835,7 @@ async function performExtraction(
         await prisma.reportSession.update({
           where: { id: sessionId },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          data: { rows: rows as any, status: "active" },
+          data: { rows: rows as any, status: "completed" },
         })
 
         // Create conversation turns
@@ -681,6 +879,25 @@ async function performExtraction(
     console.error("Failed to create AgentRun:", dbErr)
   }
 
+  // Generate summary in background (don't block the response)
+  runBackgroundJob(async () => {
+    try {
+      const summaryResult = await performReportSummary(session, {
+        documentText: documentText as string | undefined,
+        fileName: fileName as string | undefined,
+        documentType: extracted.documentType,
+        title: extracted.title,
+        rows: rows as Array<{ field: string; value: string }>,
+      })
+      await prisma.reportSession.update({
+        where: { id: sessionId },
+        data: { summary: summaryResult as unknown as Prisma.InputJsonValue },
+      })
+    } catch (err) {
+      console.error("Background summary generation failed:", err)
+    }
+  }, `report-summary:${sessionId}`)
+
   return NextResponse.json({
     rows,
     documentType: extracted.documentType,
@@ -697,7 +914,7 @@ async function handleStreamExtract(
   session: { sub: string; workspaceId: string },
   body: Record<string, unknown>
 ) {
-  const sessionId = body.sessionId as string | undefined
+  const effectiveSessionId = (body.sessionId as string) || `report-${Date.now()}`
   const fileBase64 = body.fileBase64 as string | undefined
   const fileName = body.fileName as string | undefined
   const instructions = body.instructions as string | undefined
@@ -707,6 +924,33 @@ async function handleStreamExtract(
   if (!fileBase64 && !documentText) {
     return NextResponse.json({ error: "fileBase64 or documentText required" }, { status: 400 })
   }
+
+  // Save file to disk for session viewing (if base64 provided and not already saved by multipart handler)
+  if (fileBase64) {
+    try {
+      const match = fileBase64.match(/^data:([^;]+);base64,([\s\S]+)$/)
+      if (match && !getStoredFilePath(effectiveSessionId)) {
+        const ext = match[1].split("/")[1] || "bin"
+        saveUploadedFile(effectiveSessionId, Buffer.from(match[2], "base64"), `${fileName || "file"}.${ext}`)
+      }
+    } catch (err) {
+      console.error("Failed to save file in stream extract:", err)
+    }
+  }
+
+  // Ensure session exists
+  try {
+    await prisma.reportSession.upsert({
+      where: { id: effectiveSessionId },
+      create: {
+        id: effectiveSessionId,
+        workspaceId: session.workspaceId,
+        title: fileName || "New Report",
+        status: "processing",
+      },
+      update: { status: "processing", title: fileName || undefined },
+    })
+  } catch { /* best-effort */ }
 
   const encoder = new TextEncoder()
 
@@ -757,7 +1001,7 @@ async function handleStreamExtract(
           ? searchKnowledgeChunks(session.workspaceId, kbSearchQuery, { limit: 5 })
           : Promise.resolve({ chunks: [], searchType: "keyword" })
 
-        // Step 1: Sending to AI
+        // Set session to processing (session was already upserted above)
         send("trace", {
           trace: {
             id: "report-extract-start",
@@ -889,6 +1133,7 @@ async function handleStreamExtract(
         // Send extraction result immediately so PDF highlights can start
         send("result", {
           result: {
+            sessionId: effectiveSessionId,
             rows,
             highlightRows,
             documentType: extracted.documentType,
@@ -901,16 +1146,14 @@ async function handleStreamExtract(
           },
         })
 
-        // Persist to DB without blocking summary / highlight
-        if (sessionId) {
-          void saveStreamExtraction(
-            session,
-            sessionId,
-            fileName as string | undefined,
-            rows,
-            extracted as Record<string, unknown>
-          )
-        }
+        // Persist to DB — await to ensure it completes
+        await saveStreamExtraction(
+          session,
+          effectiveSessionId,
+          fileName as string | undefined,
+          rows,
+          extracted as Record<string, unknown>
+        ).catch((err) => console.error("Failed to save stream extraction:", err))
 
         // Step 2: KB-aware summary (KB search already in flight)
         send("trace", {
@@ -955,6 +1198,16 @@ async function handleStreamExtract(
         })
 
         send("summary", { summary: summaryResult })
+
+        // Persist summary to DB so it's available on subsequent page loads
+        try {
+          await prisma.reportSession.update({
+            where: { id: effectiveSessionId },
+            data: { summary: summaryResult as unknown as Prisma.InputJsonValue },
+          })
+        } catch (err) {
+          console.error("Failed to persist summary to session:", err)
+        }
       } catch (error) {
         console.error("Stream extraction error:", error)
         send("error", {

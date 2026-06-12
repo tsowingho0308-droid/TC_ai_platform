@@ -22,6 +22,21 @@ interface TenderTemplate {
   scenario: string | null
 }
 
+function StatusBadge({ status }: { status: string }) {
+  const config: Record<string, { label: string; className: string }> = {
+    processing: { label: "Processing", className: "bg-blue-100 text-blue-700" },
+    completed: { label: "Done", className: "bg-green-100 text-green-700" },
+    failed: { label: "Failed", className: "bg-red-100 text-red-700" },
+    active: { label: "Ready", className: "bg-muted text-muted-foreground" },
+  }
+  const cfg = config[status] || { label: status, className: "bg-muted text-muted-foreground" }
+  return (
+    <span className={`rounded-full px-1.5 py-0 text-[10px] font-medium ${cfg.className}`}>
+      {cfg.label}
+    </span>
+  )
+}
+
 export function TenderSidebarContent() {
   const pathname = usePathname()
   const router = useRouter()
@@ -185,6 +200,8 @@ export function TenderSidebarContent() {
                       <div className="flex items-center gap-2 text-xs text-muted-foreground">
                         <span>{formatDate(session.updatedAt)}</span>
                         {typeLabel && <span>· {typeLabel}</span>}
+                        <span>·</span>
+                        <StatusBadge status={session.status} />
                       </div>
                     </div>
                   </Link>
