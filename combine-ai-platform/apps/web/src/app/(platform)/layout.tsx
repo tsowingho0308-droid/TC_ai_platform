@@ -2,6 +2,7 @@
 
 import { AuthProvider, useAuth } from "@/features/auth/auth-context"
 import { AppSidebar } from "@/components/app-sidebar"
+import { GlobalSearchBar } from "@/features/search/components/global-search-bar"
 import { redirect } from "next/navigation"
 import { useEffect } from "react"
 
@@ -30,11 +31,24 @@ function PlatformLayoutInner({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      <AppSidebar />
-      <main className="flex-1 overflow-y-auto bg-background">
-        {children}
-      </main>
+    <div className="flex h-screen flex-col overflow-hidden">
+      {/* Top Navigation Bar with Global Search */}
+      <header className="flex h-12 shrink-0 items-center justify-between border-b bg-background px-4">
+        <div className="flex items-center gap-3">
+          <span className="text-sm font-semibold">Combine AI</span>
+        </div>
+        <div className="flex items-center gap-3">
+          <GlobalSearchBar />
+        </div>
+      </header>
+
+      {/* Main Content Area */}
+      <div className="flex flex-1 overflow-hidden">
+        <AppSidebar />
+        <main className="flex-1 overflow-y-auto bg-background">
+          {children}
+        </main>
+      </div>
     </div>
   )
 }
