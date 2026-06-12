@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic"
 
 function resolveComposeModel(model: unknown) {
   if (typeof model !== "string" || !model.trim()) return DEFAULT_MODELS.email
-  const allowed = new Set(ALL_MODELS.map((m) => m.value))
+  const allowed = new Set<string>(ALL_MODELS.map((m) => m.value))
   return allowed.has(model) ? model : DEFAULT_MODELS.email
 }
 

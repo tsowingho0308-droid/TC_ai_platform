@@ -26,7 +26,24 @@ import {
   parseAttachmentIdsFromSearchParams,
 } from "@/features/cross-agent/email-attachments"
 import { getPolicyExportBlockers } from "@/features/finance/policy-export"
-import { normalizeExtractedRows } from "@/features/finance/extracted-rows"
+import {
+  groupExtractedRows,
+  normalizeExtractedRows,
+} from "@/features/finance/extracted-rows"
+import {
+  GroupedExtractedFields,
+  getExtractedSummary,
+} from "@/features/finance/components/grouped-extracted-fields"
+import { getActiveFinanceSessionId } from "@/features/finance/finance-analysis-tracker"
+import { useFinanceAnalysisSync } from "@/features/finance/hooks/use-finance-analysis-sync"
+import { runFinanceBackgroundExtract } from "@/features/finance/run-finance-extract"
+import { FINANCE_NO_RECEIPT_MESSAGE, isFinanceNoReceiptError } from "@/features/finance/extraction-messages"
+import {
+  FinanceUploadQueue,
+  buildFinanceUploadId,
+  fileToDataUrl,
+  type PendingFinanceUpload,
+} from "@/features/finance/components/finance-upload-queue"
 
 interface TableRow {
   field: string
@@ -81,10 +98,13 @@ function FinancePageContent() {
   const attachmentIdsParam = searchParams.get("attachmentIds")
 
   const [model, setModel] = useState(DEFAULT_MODELS.finance)
-  const [extracting, setExtracting] = useState(false)
   const [loadingEmailExtract, setLoadingEmailExtract] = useState(false)
+  const [loadingExtract, setLoadingExtract] = useState(false)
   const [checkingPolicy, setCheckingPolicy] = useState(false)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [previewFile, setPreviewFile] = useState<File | null>(null)
+  const [pendingFiles, setPendingFiles] = useState<PendingFinanceUpload[]>([])
+  const [selectedUploadFileIds, setSelectedUploadFileIds] = useState<Set<string>>(new Set())
   const [rows, setRows] = useState<TableRow[]>([])
   const [policyResults, setPolicyResults] = useState<PolicyResult[]>([])
   const [sessionId, setSessionId] = useState<string | null>(null)
@@ -93,6 +113,23 @@ function FinancePageContent() {
   const [loadingEmail, setLoadingEmail] = useState(false)
   const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<Set<string>>(new Set())
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const { isAnalyzing } = useFinanceAnalysisSync({
+    sessionId,
+    onSessionId: setSessionId,
+    onRows: setRows,
+    onPolicyReset: () => setPolicyResults([]),
+    onError: setError,
+  })
+
+  useEffect(() => {
+    const activeSessionId = getActiveFinanceSessionId()
+    if (activeSessionId && !sessionId) {
+      setSessionId(activeSessionId)
+    }
+  }, [sessionId])
+
+  const extracting = isAnalyzing(sessionId) || loadingExtract
 
   useEffect(() => {
     if (!fromEmailId) {
@@ -129,8 +166,15 @@ function FinancePageContent() {
       .finally(() => setLoadingEmail(false))
   }, [fromEmailId, emailSubjectParam, attachmentIdParam, attachmentIdsParam])
 
-  async function ensureFinanceSession(title: string) {
-    if (sessionId) return sessionId
+  async function ensureFinanceSession(title: string, options?: { forceNew?: boolean }) {
+    if (sessionId && !options?.forceNew) {
+      const checkRes = await fetch(`/api/finance/sessions?id=${encodeURIComponent(sessionId)}`)
+      if (checkRes.ok) return sessionId
+      setSessionId(null)
+      setRows([])
+      setPolicyResults([])
+    }
+
     const sessionRes = await fetch("/api/finance/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -150,56 +194,154 @@ function FinancePageContent() {
     appendRows: boolean
     sourceLabel?: string
   }) {
-    const extractRes = await fetch("/api/finance/agent?action=extract", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sessionId: params.activeSessionId,
-        fileBase64: params.fileBase64,
-        fileName: params.fileName,
-        appendRows: params.appendRows,
-        sourceLabel: params.sourceLabel,
-        model,
-      }),
+    const result = await runFinanceBackgroundExtract({
+      sessionId: params.activeSessionId,
+      fileBase64: params.fileBase64,
+      fileName: params.fileName,
+      appendRows: params.appendRows,
+      sourceLabel: params.sourceLabel,
+      model,
     })
-    if (!extractRes.ok) {
-      const errData = await extractRes.json().catch(() => ({})) as { error?: string; detail?: string }
-      throw new Error(errData.detail || errData.error || "Extraction failed")
-    }
-    const data = await extractRes.json()
-    setRows(normalizeExtractedRows(data.sessionRows || data.rows))
+    setRows(result.rows)
     setPolicyResults([])
   }
 
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (!file) return
+    const files = Array.from(e.target.files ?? [])
+    if (files.length === 0) return
 
-    const url = URL.createObjectURL(file)
-    setPreviewUrl(url)
-    setExtracting(true)
+    const nextEntries = files.map((file) => ({
+      id: buildFinanceUploadId(file),
+      file,
+    }))
+
+    setPendingFiles((prev) => {
+      const existingIds = new Set(prev.map((entry) => entry.id))
+      const merged = [...prev]
+      for (const entry of nextEntries) {
+        if (!existingIds.has(entry.id)) merged.push(entry)
+      }
+      return merged
+    })
+    setSelectedUploadFileIds((prev) => {
+      const next = new Set(prev)
+      for (const entry of nextEntries) next.add(entry.id)
+      return next
+    })
+
+    const firstFile = nextEntries[0].file
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    setPreviewUrl(URL.createObjectURL(firstFile))
+    setPreviewFile(firstFile)
     setError(null)
 
-    const reader = new FileReader()
-    reader.onload = async () => {
-      try {
-        const base64 = reader.result as string
-        const activeSessionId = await ensureFinanceSession(file.name)
+    if (fileInputRef.current) fileInputRef.current.value = ""
+  }
+
+  function toggleUploadFileSelection(fileId: string) {
+    setSelectedUploadFileIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(fileId)) next.delete(fileId)
+      else next.add(fileId)
+      return next
+    })
+  }
+
+  function selectAllUploadFiles() {
+    setSelectedUploadFileIds(new Set(pendingFiles.map((entry) => entry.id)))
+  }
+
+  function clearUploadFileSelection() {
+    setSelectedUploadFileIds(new Set())
+  }
+
+  function removeUploadFile(fileId: string) {
+    setPendingFiles((prev) => prev.filter((entry) => entry.id !== fileId))
+    setSelectedUploadFileIds((prev) => {
+      const next = new Set(prev)
+      next.delete(fileId)
+      return next
+    })
+  }
+
+  function removeSelectedUploadFiles() {
+    setPendingFiles((prev) => prev.filter((entry) => !selectedUploadFileIds.has(entry.id)))
+    setSelectedUploadFileIds(new Set())
+  }
+
+  function previewUploadFile(fileId: string) {
+    const entry = pendingFiles.find((item) => item.id === fileId)
+    if (!entry) return
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    setPreviewUrl(URL.createObjectURL(entry.file))
+    setPreviewFile(entry.file)
+  }
+
+  async function analyzeSelectedUploadFiles(selected: PendingFinanceUpload[]) {
+    if (selected.length === 0) {
+      setError("Select at least one file to analyze")
+      return
+    }
+
+    setLoadingExtract(true)
+    setError(null)
+
+    try {
+      const hasExistingRows = rows.length > 0
+      let activeSessionId = sessionId
+
+      if (!hasExistingRows) {
+        activeSessionId = await ensureFinanceSession(
+          selected.length === 1 ? selected[0].file.name : `Expense review (${selected.length} files)`,
+          { forceNew: true }
+        )
+        setSessionId(activeSessionId)
+        setRows([])
+        setPolicyResults([])
+      } else {
+        activeSessionId = await ensureFinanceSession(selected[0].file.name)
+      }
+
+      if (!activeSessionId) throw new Error("Failed to prepare finance session")
+
+      for (let i = 0; i < selected.length; i++) {
+        const entry = selected[i]
+        const appendRows = hasExistingRows || i > 0
+
+        if (i === 0) {
+          previewUploadFile(entry.id)
+        }
+
+        const fileBase64 = await fileToDataUrl(entry.file)
         await extractFromBase64({
           activeSessionId,
-          fileBase64: base64,
-          fileName: file.name,
-          appendRows: false,
-          sourceLabel: file.name,
+          fileBase64,
+          fileName: entry.file.name,
+          appendRows,
+          sourceLabel: undefined,
         })
-      } catch (err) {
-        console.error("Extraction error:", err)
-        setError(err instanceof Error ? err.message : "Extraction failed")
-      } finally {
-        setExtracting(false)
       }
+
+      setPendingFiles((prev) => prev.filter((entry) => !selected.some((item) => item.id === entry.id)))
+      setSelectedUploadFileIds(new Set())
+    } catch (err) {
+      if (!isFinanceNoReceiptError(err)) {
+        console.error("Extraction error:", err)
+      }
+      setError(err instanceof Error ? err.message : "Extraction failed")
+    } finally {
+      setLoadingExtract(false)
     }
-    reader.readAsDataURL(file)
+  }
+
+  async function handleAnalyzeSelectedUploads() {
+    const selected = pendingFiles.filter((entry) => selectedUploadFileIds.has(entry.id))
+    await analyzeSelectedUploadFiles(selected)
+  }
+
+  async function handleAnalyzeSingleUpload() {
+    if (pendingFiles.length !== 1) return
+    await analyzeSelectedUploadFiles(pendingFiles)
   }
 
   async function loadEmailAttachmentAndExtract(attachmentId: string, options?: { skipPreviewReset?: boolean }) {
@@ -224,6 +366,7 @@ function FinancePageContent() {
     }
 
     const activeSessionId = await ensureFinanceSession(emailSource.subject || "Email expense review")
+    setSessionId(activeSessionId)
     await extractFromBase64({
       activeSessionId,
       fileBase64,
@@ -252,6 +395,9 @@ function FinancePageContent() {
     try {
       for (let i = 0; i < selected.length; i++) {
         await loadEmailAttachmentAndExtract(selected[i].id, { skipPreviewReset: i > 0 })
+        if (i < selected.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 500))
+        }
       }
     } catch (err) {
       console.error("Email attachment extract error:", err)
@@ -544,56 +690,89 @@ function FinancePageContent() {
           <div
             className={cn(
               "rounded-lg border-2 border-dashed p-8 text-center transition-colors",
-              "hover:border-primary/50 hover:bg-accent/50 cursor-pointer",
-              previewUrl ? "border-solid" : ""
+              "hover:border-primary/50 hover:bg-accent/50 cursor-pointer"
             )}
             onClick={() => fileInputRef.current?.click()}
           >
             <input
               ref={fileInputRef}
               type="file"
-              accept="image/*,.pdf"
+              multiple
+              accept="image/*,.pdf,.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
               onChange={handleFileUpload}
               className="hidden"
             />
-            {previewUrl ? (
-              <div className="space-y-4">
-                <img src={previewUrl} alt="Receipt preview" className="mx-auto max-h-48 rounded-lg object-contain" />
-                <p className="text-sm text-muted-foreground">Click to change file</p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                <Upload className="mx-auto h-10 w-10 text-muted-foreground" />
-                <p className="text-sm font-medium">Upload Receipt or Invoice</p>
-                <p className="text-xs text-muted-foreground">
-                  PNG, JPEG, or PDF — AI will extract all fields automatically
-                </p>
-              </div>
-            )}
+            <div className="space-y-3">
+              <Upload className="mx-auto h-10 w-10 text-muted-foreground" />
+              <p className="text-sm font-medium">
+                {pendingFiles.length > 0 ? "Add More Files" : "Upload Receipt or Invoice"}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                PNG, JPEG, PDF, DOC, or DOCX — upload one or more files, select them, then click Analyze
+              </p>
+            </div>
           </div>
 
+          {previewUrl && previewFile?.type.startsWith("image/") && (
+            <div className="mt-4 rounded-lg border bg-card p-3">
+              <img src={previewUrl} alt="Document preview" className="mx-auto max-h-48 rounded-lg object-contain" />
+            </div>
+          )}
+
+          {previewFile && !previewFile.type.startsWith("image/") && (
+            <div className="mt-4 rounded-lg border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+              Document ready for analysis
+            </div>
+          )}
+
+          <FinanceUploadQueue
+            pendingFiles={pendingFiles}
+            selectedFileIds={selectedUploadFileIds}
+            analyzing={extracting}
+            onToggleFile={toggleUploadFileSelection}
+            onSelectAll={selectAllUploadFiles}
+            onClearSelection={clearUploadFileSelection}
+            onRemoveSelected={removeSelectedUploadFiles}
+            onRemoveFile={removeUploadFile}
+            onPreviewFile={previewUploadFile}
+            onAnalyzeSelected={handleAnalyzeSelectedUploads}
+            onAnalyzeSingle={handleAnalyzeSingleUpload}
+          />
+
           {(extracting || loadingEmailExtract) && (
-            <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              AI is analyzing the document...
+            <div className="mt-4 space-y-1 text-sm text-muted-foreground">
+              <div className="flex items-center gap-2">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                AI is analyzing the document...
+              </div>
+              <p className="text-xs">
+                Scanned PDFs with multiple receipts may take up to 1 minute. You can switch to another agent — analysis continues in the background.
+              </p>
             </div>
           )}
 
           {error && (
-            <p className="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-              {error}
-            </p>
+            error === FINANCE_NO_RECEIPT_MESSAGE ? (
+              <div className="mt-3 rounded-md border border-amber-300/60 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-100">
+                <p className="font-medium">No receipt detected</p>
+                <p className="mt-1 text-xs leading-relaxed opacity-90">{error}</p>
+              </div>
+            ) : (
+              <p className="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                {error}
+              </p>
+            )
           )}
         </div>
 
-        <div className="w-1/2 p-6">
+        <div className="w-1/2 overflow-y-auto p-6">
           {rows.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center text-center">
               <Receipt className="h-12 w-12 text-muted-foreground/50" />
               <h3 className="mt-4 text-lg font-semibold">Expense Review</h3>
               <p className="mt-1 max-w-md text-sm text-muted-foreground">
-                Upload a receipt or invoice, or forward from Email Agent to automatically extract vendor details,
-                amounts, tax info, and line items.
+                Upload receipts or invoices, select the files you want, then click Analyze. You can also forward
+                attachments from Email Agent.
               </p>
               <div className="mt-6 grid w-full max-w-lg gap-3 text-left sm:grid-cols-2">
                 <div className="rounded-lg border p-3">
@@ -613,7 +792,7 @@ function FinancePageContent() {
           ) : (
             <div className="space-y-2">
               <div className="mb-3 flex items-center justify-between">
-                <h2 className="text-sm font-semibold">Extracted Data ({rows.length} fields)</h2>
+                <h2 className="text-sm font-semibold">Extracted Data ({getExtractedSummary(rows)})</h2>
                 <div className="flex items-center gap-2">
                   <button
                     onClick={handleCheckPolicy}
@@ -680,12 +859,7 @@ function FinancePageContent() {
                   </div>
                 </div>
               )}
-              {rows.map((row, i) => (
-                <div key={i} className="flex items-center gap-2 rounded-md border bg-card px-3 py-2">
-                  <span className="min-w-[120px] text-sm font-medium">{row.field}</span>
-                  <span className="flex-1 text-sm">{row.value}</span>
-                </div>
-              ))}
+              <GroupedExtractedFields rows={rows} />
             </div>
           )}
         </div>

@@ -1,8 +1,10 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
+import Link from "next/link"
 import { useParams, useRouter } from "next/navigation"
-import { ArrowLeft, Download, Loader2 } from "lucide-react"
+import { ArrowLeft, Database, Download, ExternalLink, Loader2 } from "lucide-react"
+import { cn } from "@combine-ai/shared-ui"
 import { toast } from "sonner"
 import {
   getPolicyExportBlockers,
@@ -10,6 +12,11 @@ import {
   type ExpenseExportSubmitterInfo,
   type PolicyResult,
 } from "@/features/finance/policy-export"
+import {
+  listKnowledgeBases,
+  uploadDocument,
+  type KnowledgeBase,
+} from "@/features/context/api/context-client"
 
 interface FinanceSession {
   id: string
@@ -25,6 +32,11 @@ export default function ExpenseReviewExportPage() {
   const [loading, setLoading] = useState(true)
   const [exporting, setExporting] = useState(false)
   const [sessionTitle, setSessionTitle] = useState("Expense Review")
+  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([])
+  const [loadingKnowledgeBases, setLoadingKnowledgeBases] = useState(true)
+  const [saveToContext, setSaveToContext] = useState(false)
+  const [knowledgeBaseId, setKnowledgeBaseId] = useState("")
+  const [contextTitle, setContextTitle] = useState("")
   const [form, setForm] = useState<ExpenseExportSubmitterInfo>({
     fullName: "",
     email: "",
@@ -40,7 +52,9 @@ export default function ExpenseReviewExportPage() {
         if (!res.ok) throw new Error("Session not found")
         const data = await res.json()
         const session = data.session as FinanceSession
-        setSessionTitle(session.title || "Expense Review")
+        const title = session.title || "Expense Review"
+        setSessionTitle(title)
+        setContextTitle(`${title} — Expense Report`)
 
         const blockers = getPolicyExportBlockers(session.policyResults)
         if (blockers.length > 0) {
@@ -59,6 +73,22 @@ export default function ExpenseReviewExportPage() {
     loadSession()
   }, [id, router])
 
+  useEffect(() => {
+    listKnowledgeBases()
+      .then((data) => {
+        setKnowledgeBases(data.knowledgeBases)
+        if (data.knowledgeBases.length > 0) {
+          setKnowledgeBaseId(data.knowledgeBases[0].id)
+        }
+      })
+      .catch(() => {
+        toast.error("Failed to load knowledge bases")
+      })
+      .finally(() => {
+        setLoadingKnowledgeBases(false)
+      })
+  }, [])
+
   const updateField = useCallback(
     (field: keyof ExpenseExportSubmitterInfo, value: string) => {
       setForm((current) => ({ ...current, [field]: value }))
@@ -71,6 +101,21 @@ export default function ExpenseReviewExportPage() {
     if (validationErrors.length > 0) {
       toast.error(validationErrors[0])
       return
+    }
+
+    if (saveToContext) {
+      if (knowledgeBases.length === 0) {
+        toast.error("No knowledge base found. Create one in Context Management first.")
+        return
+      }
+      if (!knowledgeBaseId) {
+        toast.error("Please select a knowledge base for Context storage.")
+        return
+      }
+      if (!contextTitle.trim()) {
+        toast.error("Please enter a title for the Context document.")
+        return
+      }
     }
 
     setExporting(true)
@@ -104,20 +149,43 @@ export default function ExpenseReviewExportPage() {
       }
 
       const blob = await res.blob()
+      const fileName = `expense-review-${id.slice(0, 8)}.xlsx`
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = url
-      a.download = `expense-review-${id.slice(0, 8)}.xlsx`
+      a.download = fileName
       a.click()
       URL.revokeObjectURL(url)
-      toast.success("Report exported")
+
+      if (saveToContext) {
+        const file = new File([blob], fileName, {
+          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        })
+        await uploadDocument(file, knowledgeBaseId, contextTitle.trim(), {
+          targetAudience: "ALL_EMPLOYEES",
+          businessProcesses: ["Finance", "Expense Review"],
+          documentType: "STANDARD",
+        })
+        toast.success("Report exported and saved to Context Management")
+      } else {
+        toast.success("Report exported")
+      }
+
       router.push(`/finance/expense-review/${id}`)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Export failed")
     } finally {
       setExporting(false)
     }
-  }, [form, id, router])
+  }, [
+    contextTitle,
+    form,
+    id,
+    knowledgeBaseId,
+    knowledgeBases.length,
+    router,
+    saveToContext,
+  ])
 
   if (loading) {
     return (
@@ -211,6 +279,82 @@ export default function ExpenseReviewExportPage() {
               </label>
             </div>
 
+            <div className="mt-8 rounded-lg border bg-muted/20 p-4">
+              <label className="flex cursor-pointer items-start gap-3">
+                <input
+                  type="checkbox"
+                  checked={saveToContext}
+                  onChange={(e) => setSaveToContext(e.target.checked)}
+                  className="mt-1 h-4 w-4 rounded border"
+                />
+                <div className="space-y-1">
+                  <span className="flex items-center gap-2 text-sm font-medium">
+                    <Database className="h-4 w-4 text-primary" />
+                    Save to Context Management
+                  </span>
+                  <p className="text-xs text-muted-foreground">
+                    Store this expense report in the company knowledge base so other agents can
+                    search and reference it later.
+                  </p>
+                </div>
+              </label>
+
+              {saveToContext && (
+                <div className="mt-4 space-y-4 border-t pt-4">
+                  {loadingKnowledgeBases ? (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Loading knowledge bases...
+                    </div>
+                  ) : knowledgeBases.length === 0 ? (
+                    <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                      No knowledge base found.{" "}
+                      <Link href="/context" className="font-medium underline">
+                        Create one in Context Management
+                      </Link>{" "}
+                      before saving.
+                    </div>
+                  ) : (
+                    <>
+                      <label className="block space-y-1.5">
+                        <span className="text-sm font-medium">Knowledge Base *</span>
+                        <select
+                          value={knowledgeBaseId}
+                          onChange={(e) => setKnowledgeBaseId(e.target.value)}
+                          className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                        >
+                          {knowledgeBases.map((kb) => (
+                            <option key={kb.id} value={kb.id}>
+                              {kb.name} ({kb.department})
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label className="block space-y-1.5">
+                        <span className="text-sm font-medium">Context Document Title *</span>
+                        <input
+                          type="text"
+                          value={contextTitle}
+                          onChange={(e) => setContextTitle(e.target.value)}
+                          placeholder="Title shown in Context Management"
+                          className="w-full rounded-md border px-3 py-2 text-sm"
+                        />
+                      </label>
+                    </>
+                  )}
+
+                  <Link
+                    href="/context"
+                    className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                  >
+                    Open Context Management
+                    <ExternalLink className="h-3 w-3" />
+                  </Link>
+                </div>
+              )}
+            </div>
+
             <div className="mt-6 flex items-center justify-end gap-3">
               <button
                 onClick={() => router.push(`/finance/expense-review/${id}`)}
@@ -220,15 +364,23 @@ export default function ExpenseReviewExportPage() {
               </button>
               <button
                 onClick={handleExport}
-                disabled={exporting}
-                className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                disabled={exporting || (saveToContext && knowledgeBases.length === 0)}
+                className={cn(
+                  "inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                )}
               >
                 {exporting ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
                 ) : (
                   <Download className="h-4 w-4" />
                 )}
-                {exporting ? "Exporting..." : "Export XLSX"}
+                {exporting
+                  ? saveToContext
+                    ? "Exporting & saving..."
+                    : "Exporting..."
+                  : saveToContext
+                    ? "Export XLSX & Save to Context"
+                    : "Export XLSX"}
               </button>
             </div>
           </div>

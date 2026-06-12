@@ -1399,7 +1399,8 @@ ${suggestions.map((s) => `[Doc] ${s.title} (${s.department}, ${Math.round((s.sim
                       ]
                       await prisma.helpdeskConversation.update({
                         where: { id: convId },
-                        data: { messages: updatedMessages },
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                        data: { messages: updatedMessages as any },
                       })
                     } catch (err) {
                       console.error("Failed to persist AI response to conversation:", err)

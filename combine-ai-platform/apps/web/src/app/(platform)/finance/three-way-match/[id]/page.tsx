@@ -231,7 +231,7 @@ export default function ThreeWayMatchPage() {
                 >
                   <input
                     type="file"
-                    accept="image/*,.pdf"
+                    accept="image/*,.pdf,.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     onChange={(e) => handleFileChange(e, setPoDoc)}
                     className="hidden"
                   />
@@ -256,7 +256,7 @@ export default function ThreeWayMatchPage() {
                 >
                   <input
                     type="file"
-                    accept="image/*,.pdf"
+                    accept="image/*,.pdf,.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     onChange={(e) => handleFileChange(e, setGrnDoc)}
                     className="hidden"
                   />
@@ -281,7 +281,7 @@ export default function ThreeWayMatchPage() {
                 >
                   <input
                     type="file"
-                    accept="image/*,.pdf"
+                    accept="image/*,.pdf,.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     onChange={(e) => handleFileChange(e, setInvDoc)}
                     className="hidden"
                   />

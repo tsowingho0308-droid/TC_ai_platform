@@ -10,7 +10,17 @@ import {
 import { cn } from "@combine-ai/shared-ui"
 import { toast } from "sonner"
 import { getPolicyExportBlockers } from "@/features/finance/policy-export"
-import { normalizeExtractedRows, type ExtractedRow } from "@/features/finance/extracted-rows"
+import {
+  groupExtractedRows,
+  normalizeExtractedRows,
+  getFinanceDocumentDisplayName,
+  type ExtractedRow,
+} from "@/features/finance/extracted-rows"
+import { getExtractedSummary } from "@/features/finance/components/grouped-extracted-fields"
+import { setActiveFinanceSessionId } from "@/features/finance/finance-analysis-tracker"
+import { useFinanceAnalysisSync } from "@/features/finance/hooks/use-finance-analysis-sync"
+import { runFinanceBackgroundExtract } from "@/features/finance/run-finance-extract"
+import { FINANCE_NO_RECEIPT_MESSAGE } from "@/features/finance/extraction-messages"
 
 interface PolicyResult {
   rule: string
@@ -26,7 +36,7 @@ interface FinanceSession {
   extractedRows: ExtractedRow[] | null
   policyResults: PolicyResult[] | null
   draftNote: string | null
-  documents: Array<{ id: string; docType: string; fileName: string }>
+  documents: Array<{ id: string; docType: string; fileName: string; extractedData?: unknown }>
   turns: Array<{ id: string; role: string; content: string; assistantReply: string | null }>
 }
 
@@ -37,7 +47,6 @@ export default function ExpenseReviewPage() {
 
   const [session, setSession] = useState<FinanceSession | null>(null)
   const [loading, setLoading] = useState(true)
-  const [extracting, setExtracting] = useState(false)
   const [checkingPolicy, setCheckingPolicy] = useState(false)
   const [rows, setRows] = useState<ExtractedRow[]>([])
   const [editingIndex, setEditingIndex] = useState<number | null>(null)
@@ -60,15 +69,13 @@ export default function ExpenseReviewPage() {
 
       setSession(financeSession)
       setRows(normalizeExtractedRows(financeSession.extractedRows))
-    } catch (err) {
+    } catch {
       toast.error("Failed to load session")
       router.push("/finance")
     } finally {
       setLoading(false)
     }
   }, [id, router])
-
-  useEffect(() => { fetchSession() }, [fetchSession])
 
   const saveRows = useCallback(async (updatedRows: ExtractedRow[]) => {
     try {
@@ -82,39 +89,74 @@ export default function ExpenseReviewPage() {
     }
   }, [id])
 
+  const { isAnalyzing } = useFinanceAnalysisSync({
+    sessionId: id,
+    onRows: (updatedRows) => {
+      setRows(updatedRows)
+      void saveRows(updatedRows)
+      void fetchSession()
+    },
+    onError: (message) => {
+      if (!message) return
+      if (message === FINANCE_NO_RECEIPT_MESSAGE) {
+        toast.warning(message)
+      } else {
+        toast.error(message)
+      }
+    },
+  })
+
+  useEffect(() => {
+    setActiveFinanceSessionId(id)
+  }, [id])
+
+  useEffect(() => {
+    void fetchSession()
+  }, [fetchSession])
+
+  const extracting = isAnalyzing(id) || session?.status === "analyzing"
+
   const handleFileUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
 
-    setExtracting(true)
+    const shouldAppend =
+      rows.length > 0 || (session?.documents?.length ?? 0) > 0
+
     const reader = new FileReader()
-    reader.onload = async () => {
-      try {
-        const base64 = reader.result as string
-        const res = await fetch("/api/finance/agent?action=extract", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+    reader.onload = () => {
+      void (async () => {
+        try {
+          const base64 = reader.result as string
+          const result = await runFinanceBackgroundExtract({
             sessionId: id,
             fileBase64: base64,
             fileName: file.name,
-          }),
-        })
-        if (!res.ok) throw new Error("Extraction failed")
-        const data = await res.json()
-        const extractedRows = normalizeExtractedRows(data.sessionRows || data.rows)
-        setRows(extractedRows)
-        await saveRows(extractedRows)
-        toast.success(`Extracted ${data.rows?.length || 0} fields`)
-        fetchSession()
-      } catch (err) {
-        toast.error(`Extraction failed: ${err instanceof Error ? err.message : "Unknown error"}`)
-      } finally {
-        setExtracting(false)
-      }
+            appendRows: shouldAppend,
+            sourceLabel: undefined,
+          })
+          setRows(result.rows)
+          await saveRows(result.rows)
+          const newFieldCount = result.raw.rows?.length || 0
+          toast.success(
+            shouldAppend
+              ? `Added ${newFieldCount} fields from ${file.name} (receipts continue from previous uploads)`
+              : `Extracted ${newFieldCount} fields`
+          )
+          await fetchSession()
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Unknown error"
+          if (message === FINANCE_NO_RECEIPT_MESSAGE) {
+            toast.warning(message)
+          } else {
+            toast.error(`Extraction failed: ${message}`)
+          }
+        }
+      })()
     }
     reader.readAsDataURL(file)
-  }, [id, saveRows, fetchSession])
+    if (fileInputRef.current) fileInputRef.current.value = ""
+  }, [id, rows.length, saveRows, fetchSession, session?.documents?.length])
 
   const handleCheckPolicy = useCallback(async () => {
     setCheckingPolicy(true)
@@ -177,6 +219,8 @@ export default function ExpenseReviewPage() {
     router.push(`/finance/expense-review/${id}/export`)
   }, [id, policyResults, router])
 
+  const rowGroups = groupExtractedRows(rows)
+
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -220,8 +264,8 @@ export default function ExpenseReviewPage() {
 
       <div className="flex flex-1 overflow-hidden">
         {/* Left: Upload & Preview */}
-        <div className="w-1/3 border-r flex flex-col">
-          <div className="p-4 border-b">
+        <div className="flex w-1/3 min-h-0 flex-col border-r">
+          <div className="flex-shrink-0 border-b p-4">
             <h2 className="text-sm font-semibold mb-3">Upload Document</h2>
             <div
               className={cn(
@@ -233,7 +277,7 @@ export default function ExpenseReviewPage() {
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/*,.pdf"
+                accept="image/*,.pdf,.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 onChange={handleFileUpload}
                 className="hidden"
                 disabled={extracting}
@@ -242,14 +286,20 @@ export default function ExpenseReviewPage() {
                 <div className="space-y-2">
                   <Loader2 className="mx-auto h-8 w-8 animate-spin text-primary" />
                   <p className="text-sm font-medium">Analyzing document...</p>
-                  <p className="text-xs text-muted-foreground">AI is extracting fields</p>
+                  <p className="text-xs text-muted-foreground">
+                    AI is extracting fields. You can switch pages — analysis continues in the background.
+                  </p>
                 </div>
               ) : (
                 <div className="space-y-2">
                   <Upload className="mx-auto h-8 w-8 text-muted-foreground" />
-                  <p className="text-sm font-medium">Upload Receipt or Invoice</p>
+                  <p className="text-sm font-medium">
+                    {session?.documents?.length ? "Upload Another Document" : "Upload Receipt or Invoice"}
+                  </p>
                   <p className="text-xs text-muted-foreground">
-                    PNG, JPEG, or PDF - AI extracts automatically
+                    {session?.documents?.length
+                      ? "New receipts are added to the list above (Receipt 1, 2, 3… continues numbering)."
+                      : "PNG, JPEG, PDF, DOC, or DOCX - AI extracts automatically"}
                   </p>
                 </div>
               )}
@@ -258,10 +308,12 @@ export default function ExpenseReviewPage() {
             {session?.documents && session.documents.length > 0 && (
               <div className="mt-4 space-y-1">
                 <p className="text-xs font-semibold text-muted-foreground uppercase">Uploaded Files</p>
-                {session.documents.map((doc) => (
+                {session.documents.map((doc, docIndex) => (
                   <div key={doc.id} className="flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm">
                     <Receipt className="h-4 w-4 text-muted-foreground" />
-                    <span className="flex-1 truncate">{doc.fileName}</span>
+                    <span className="flex-1 truncate" title={doc.fileName}>
+                      {getFinanceDocumentDisplayName(doc)}
+                    </span>
                     <span className="text-xs text-muted-foreground">{doc.docType}</span>
                   </div>
                 ))}
@@ -271,12 +323,17 @@ export default function ExpenseReviewPage() {
 
           {/* Policy Results Summary */}
           {policyResults.length > 0 && (
-            <div className="p-4">
-              <h2 className="text-sm font-semibold mb-3 flex items-center gap-2">
-                <Shield className="h-4 w-4" />
-                Policy Check Results
-              </h2>
-              <div className="flex gap-2 mb-3">
+            <div className="flex min-h-0 flex-1 flex-col p-4">
+              <div className="mb-3 flex flex-shrink-0 items-center justify-between gap-2">
+                <h2 className="flex items-center gap-2 text-sm font-semibold">
+                  <Shield className="h-4 w-4" />
+                  Policy Check Results
+                </h2>
+                <span className="text-xs text-muted-foreground">
+                  {policyResults.length} policies
+                </span>
+              </div>
+              <div className="mb-3 flex flex-shrink-0 gap-2">
                 <span className="inline-flex items-center gap-1 rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-800">
                   <CheckCircle className="h-3 w-3" /> {passedCount} passed
                 </span>
@@ -286,7 +343,7 @@ export default function ExpenseReviewPage() {
                   </span>
                 )}
               </div>
-              <div className="space-y-2">
+              <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
                 {policyResults.map((p: PolicyResult, i: number) => (
                   <div
                     key={i}
@@ -297,13 +354,13 @@ export default function ExpenseReviewPage() {
                   >
                     <div className="flex items-center gap-2">
                       {p.passed ? (
-                        <CheckCircle className="h-4 w-4 text-green-600" />
+                        <CheckCircle className="h-4 w-4 shrink-0 text-green-600" />
                       ) : (
-                        <AlertTriangle className="h-4 w-4 text-red-600" />
+                        <AlertTriangle className="h-4 w-4 shrink-0 text-red-600" />
                       )}
                       <span className="text-sm font-medium">{p.rule}</span>
                     </div>
-                    <p className="mt-1 text-xs text-muted-foreground">{p.detail}</p>
+                    <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{p.detail}</p>
                   </div>
                 ))}
               </div>
@@ -312,12 +369,12 @@ export default function ExpenseReviewPage() {
         </div>
 
         {/* Right: Extracted Data Table */}
-        <div className="flex-1 flex flex-col">
+        <div className="flex min-h-0 flex-1 flex-col">
           <div className="flex items-center justify-between border-b px-6 py-3">
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-semibold">Extracted Fields</h2>
               <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
-                {rows.length} fields
+                {getExtractedSummary(rows)}
               </span>
             </div>
             <button
@@ -339,72 +396,92 @@ export default function ExpenseReviewPage() {
                 </p>
               </div>
             ) : (
-              <table className="w-full">
-                <thead>
-                  <tr className="border-b bg-muted/50">
-                    <th className="px-6 py-2 text-left text-xs font-semibold text-muted-foreground uppercase w-[40%]">
-                      Field
-                    </th>
-                    <th className="px-6 py-2 text-left text-xs font-semibold text-muted-foreground uppercase">
-                      Value
-                    </th>
-                    <th className="px-6 py-2 text-right text-xs font-semibold text-muted-foreground uppercase w-20">
-                      Actions
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((row, i) => (
-                    <tr key={i} className="border-b hover:bg-accent/30 transition-colors">
-                      <td className="px-6 py-2.5">
-                        {editingIndex === i ? (
-                          <input
-                            type="text"
-                            value={row.field}
-                            onChange={(e) => handleUpdateRow(i, e.target.value, row.value)}
-                            onBlur={handleBlurRowEdit}
-                            autoFocus
-                            className="w-full rounded border px-2 py-1 text-sm"
-                          />
-                        ) : (
-                          <span className="text-sm font-medium">{row.field}</span>
+              <div className="space-y-6 p-4">
+                {rowGroups.map((group) => (
+                  <section key={group.id} className="overflow-hidden rounded-xl border bg-card">
+                    <div className="flex items-center justify-between border-b bg-muted/40 px-4 py-3">
+                      <div>
+                        <h3 className="text-sm font-semibold">{group.title}</h3>
+                        {group.subtitle && (
+                          <p className="text-xs text-muted-foreground">{group.subtitle}</p>
                         )}
-                      </td>
-                      <td className="px-6 py-2.5">
-                        {editingIndex === i ? (
-                          <input
-                            type="text"
-                            value={row.value}
-                            onChange={(e) => handleUpdateRow(i, row.field, e.target.value)}
-                            onBlur={handleBlurRowEdit}
-                            className="w-full rounded border px-2 py-1 text-sm"
-                          />
-                        ) : (
-                          <span className="text-sm">{row.value}</span>
-                        )}
-                      </td>
-                      <td className="px-6 py-2.5 text-right">
-                        <div className="flex items-center justify-end gap-1">
-                          <button
-                            onClick={() => setEditingIndex(i)}
-                            className="rounded p-1 hover:bg-muted"
-                            title="Edit row"
-                          >
-                            <Pencil className="h-3.5 w-3.5 text-muted-foreground" />
-                          </button>
-                          <button
-                            onClick={() => handleDeleteRow(i)}
-                            className="rounded p-1 hover:bg-destructive/10 hover:text-destructive"
-                            title="Delete row"
-                          >
-                            <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                      </div>
+                      <span className="rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">
+                        {group.rows.length} fields
+                      </span>
+                    </div>
+                    <table className="w-full">
+                      <thead>
+                        <tr className="border-b bg-muted/20">
+                          <th className="px-4 py-2 text-left text-xs font-semibold text-muted-foreground uppercase w-[38%]">
+                            Field
+                          </th>
+                          <th className="px-4 py-2 text-left text-xs font-semibold text-muted-foreground uppercase">
+                            Value
+                          </th>
+                          <th className="px-4 py-2 text-right text-xs font-semibold text-muted-foreground uppercase w-20">
+                            Actions
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {group.rows.map((row) => {
+                          const i = row.originalIndex
+                          return (
+                            <tr key={i} className="border-b hover:bg-accent/30 transition-colors">
+                              <td className="px-4 py-2.5">
+                                {editingIndex === i ? (
+                                  <input
+                                    type="text"
+                                    value={row.field}
+                                    onChange={(e) => handleUpdateRow(i, e.target.value, row.value)}
+                                    onBlur={handleBlurRowEdit}
+                                    autoFocus
+                                    className="w-full rounded border px-2 py-1 text-sm"
+                                  />
+                                ) : (
+                                  <span className="text-sm font-medium">{row.displayField}</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-2.5">
+                                {editingIndex === i ? (
+                                  <input
+                                    type="text"
+                                    value={row.value}
+                                    onChange={(e) => handleUpdateRow(i, row.field, e.target.value)}
+                                    onBlur={handleBlurRowEdit}
+                                    className="w-full rounded border px-2 py-1 text-sm"
+                                  />
+                                ) : (
+                                  <span className="text-sm">{row.value}</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-2.5 text-right">
+                                <div className="flex items-center justify-end gap-1">
+                                  <button
+                                    onClick={() => setEditingIndex(i)}
+                                    className="rounded p-1 hover:bg-muted"
+                                    title="Edit row"
+                                  >
+                                    <Pencil className="h-3.5 w-3.5 text-muted-foreground" />
+                                  </button>
+                                  <button
+                                    onClick={() => handleDeleteRow(i)}
+                                    className="rounded p-1 hover:bg-destructive/10 hover:text-destructive"
+                                    title="Delete row"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </section>
+                ))}
+              </div>
             )}
           </div>
 

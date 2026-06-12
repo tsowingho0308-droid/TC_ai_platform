@@ -1,7 +1,8 @@
 "use client"
 
-import { AuthProvider, useAuth } from "@/features/auth/auth-context"
+import { FinanceBackgroundAnalysis } from "@/features/finance/components/finance-background-analysis"
 import { AppSidebar } from "@/components/app-sidebar"
+import { AuthProvider, useAuth } from "@/features/auth/auth-context"
 import { redirect } from "next/navigation"
 import { useEffect } from "react"
 
@@ -31,6 +32,7 @@ function PlatformLayoutInner({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex h-screen overflow-hidden">
+      <FinanceBackgroundAnalysis />
       <AppSidebar />
       <main className="flex-1 overflow-y-auto bg-background">
         {children}

@@ -7,7 +7,11 @@ import {
   type ExpenseExportSubmitterInfo,
   type PolicyResult,
 } from "@/features/finance/policy-export"
-import { normalizeExtractedRows } from "@/features/finance/extracted-rows"
+import {
+  groupExtractedRows,
+  normalizeExtractedRows,
+  type ExtractedRowGroup,
+} from "@/features/finance/extracted-rows"
 import * as XLSX from "xlsx-js-style"
 
 export const dynamic = "force-dynamic"
@@ -88,19 +92,27 @@ function sortSummaryFields(a: string, b: string) {
 }
 
 function buildLineItemsTable(parsedRows: ParsedRow[]) {
+  return buildLineItemsTableFromDisplayFields(
+    parsedRows.map((row) => ({ displayField: row.field, value: row.value, source: row.source }))
+  )
+}
+
+function buildLineItemsTableFromDisplayFields(
+  rows: Array<{ displayField: string; value: string; source?: string | null }>
+) {
   const items = new Map<
     number,
     { source: string; description: string; quantity: string; unitPrice: string; amount: string }
   >()
 
-  for (const row of parsedRows) {
-    const match = row.field.match(/^Item (\d+) - (Description|Quantity|Unit Price|Amount)$/i)
+  for (const row of rows) {
+    const match = row.displayField.match(/^Item (\d+) - (Description|Quantity|Unit Price|Amount)$/i)
     if (!match) continue
 
     const itemNumber = Number(match[1])
     const attribute = match[2].toLowerCase()
     const current = items.get(itemNumber) || {
-      source: row.source,
+      source: row.source || "",
       description: "",
       quantity: "",
       unitPrice: "",
@@ -157,6 +169,115 @@ const SECTION_HEADER_STYLE = {
   fill: { patternType: "solid", fgColor: { rgb: "DBEAFE" } },
 }
 
+const RECEIPT_HEADER_COLORS = ["DBEAFE", "D1FAE5", "FEF3C7", "EDE9FE"]
+
+const SUBSECTION_HEADER_STYLE = {
+  font: { bold: true, color: { rgb: "374151" } },
+  fill: { patternType: "solid", fgColor: { rgb: "F3F4F6" } },
+}
+
+function receiptHeaderStyle(receiptIndex: number) {
+  return {
+    font: { bold: true, sz: 12, color: { rgb: "1F2937" } },
+    fill: {
+      patternType: "solid",
+      fgColor: { rgb: RECEIPT_HEADER_COLORS[receiptIndex % RECEIPT_HEADER_COLORS.length] },
+    },
+  }
+}
+
+function buildReceiptGroupSection(group: ExtractedRowGroup): string[][] {
+  const section: string[][] = [
+    [group.title, group.subtitle || ""],
+    ["Key Details"],
+    ["Field", "Value"],
+  ]
+
+  const nonItemRows = group.rows.filter(
+    (row) => !/^Item \d+ - /i.test(row.displayField)
+  )
+  const sortedRows = [...nonItemRows].sort((a, b) =>
+    sortSummaryFields(a.displayField, b.displayField)
+  )
+
+  const usedKeys = new Set<string>()
+  for (const key of KEY_DETAIL_FIELDS) {
+    const row = sortedRows.find((entry) => fieldMatches(entry.displayField, key))
+    if (!row || !row.value.trim()) continue
+    usedKeys.add(row.displayField.toLowerCase())
+    section.push([normalizeFieldLabel(row.displayField), row.value])
+  }
+
+  const lineItemsTable = buildLineItemsTableFromDisplayFields(group.rows)
+  if (lineItemsTable.length > 1) {
+    section.push([])
+    section.push(["Line Items"])
+    section.push(...lineItemsTable)
+  }
+
+  const additionalRows = sortedRows.filter(
+    (row) => !usedKeys.has(row.displayField.toLowerCase())
+  )
+  if (additionalRows.length > 0) {
+    section.push([])
+    section.push(["Additional Details"])
+    section.push(["Field", "Value"])
+    for (const row of additionalRows) {
+      section.push([normalizeFieldLabel(row.displayField), row.value])
+    }
+  }
+
+  return section
+}
+
+function buildFlatExpenseDataSection(
+  parsedRows: ParsedRow[],
+  hasMultipleSources: boolean
+): string[][] {
+  const summaryRows: ParsedRow[] = []
+  for (const row of parsedRows) {
+    if (/^Item \d+ - /i.test(row.field)) continue
+    summaryRows.push(row)
+  }
+
+  summaryRows.sort((a, b) => sortSummaryFields(a.field, b.field))
+
+  const lineItemsTable = buildLineItemsTable(parsedRows)
+  const section: string[][] = [["Key Details"], ["Field", "Value"]]
+
+  const usedKeys = new Set<string>()
+  for (const key of KEY_DETAIL_FIELDS) {
+    const row = findSummaryRow(summaryRows, key)
+    if (!row || !row.value.trim()) continue
+    usedKeys.add(row.field.toLowerCase())
+    const line = [normalizeFieldLabel(row.field), row.value]
+    if (hasMultipleSources) line.push(row.source)
+    section.push(line)
+  }
+
+  if (lineItemsTable.length > 1) {
+    section.push([])
+    section.push(["Line Items"])
+    section.push(...lineItemsTable)
+  }
+
+  const additionalRows = summaryRows.filter((row) => !usedKeys.has(row.field.toLowerCase()))
+  if (additionalRows.length > 0) {
+    section.push([])
+    section.push(["Additional Details"])
+    section.push(["Field", "Value"])
+    if (hasMultipleSources) section[section.length - 1].push("Source")
+
+    for (const row of additionalRows) {
+      const line = [normalizeFieldLabel(row.field), row.value]
+      if (hasMultipleSources) line.push(row.source)
+      section.push(line)
+    }
+  }
+
+  return section
+}
+
 const NAME_LABEL_STYLE = {
   font: { bold: true, color: { rgb: "1F2937" } },
 }
@@ -179,11 +300,27 @@ function applyCellStyle(
 }
 
 function applyExpenseReportStyles(worksheet: XLSX.WorkSheet, data: string[][]) {
+  let receiptIndex = 0
+
   for (let rowIndex = 0; rowIndex < data.length; rowIndex++) {
     const label = String(data[rowIndex][0] ?? "")
 
     if (label === "Submitter Information" || label === "Expense Review Report") {
       applyCellStyle(worksheet, rowIndex, 0, SECTION_HEADER_STYLE)
+      continue
+    }
+
+    if (/^Receipt \d+$/i.test(label)) {
+      applyCellStyle(worksheet, rowIndex, 0, receiptHeaderStyle(receiptIndex))
+      if (data[rowIndex][1]) {
+        applyCellStyle(worksheet, rowIndex, 1, receiptHeaderStyle(receiptIndex))
+      }
+      receiptIndex += 1
+      continue
+    }
+
+    if (label === "Key Details" || label === "Line Items" || label === "Additional Details") {
+      applyCellStyle(worksheet, rowIndex, 0, SUBSECTION_HEADER_STYLE)
       continue
     }
 
@@ -202,21 +339,22 @@ function buildExpenseSheets(
     submitterInfo?: ExpenseExportSubmitterInfo | null
   }
 ) {
+  const groups = groupExtractedRows(rows)
+  const useGroupedLayout = groups.some((group) => group.receiptLabel) || groups.length > 1
+  const receiptGroups = groups.filter((group) => group.receiptLabel)
+
   const parsedRows = rows.map(parseRow)
   const sources = [...new Set(parsedRows.map((row) => row.source))]
   const hasMultipleSources = sources.length > 1
   const documentLabel =
     sources.length === 1 && sources[0] !== "Document" ? sources[0] : `${sources.length || 1} document(s)`
+  const receiptsLabel =
+    receiptGroups.length > 1
+      ? `${receiptGroups.length} receipts · ${rows.length} fields`
+      : receiptGroups.length === 1
+        ? `${receiptGroups[0].title} · ${rows.length} fields`
+        : `${rows.length} fields`
 
-  const summaryRows: ParsedRow[] = []
-  for (const row of parsedRows) {
-    if (/^Item \d+ - /i.test(row.field)) continue
-    summaryRows.push(row)
-  }
-
-  summaryRows.sort((a, b) => sortSummaryFields(a.field, b.field))
-
-  const lineItemsTable = buildLineItemsTable(parsedRows)
   const report: string[][] = []
 
   if (options.submitterInfo) {
@@ -229,40 +367,18 @@ function buildExpenseSheets(
     [],
     ["Session", options.sessionTitle || "Expense Review"],
     ["Document", documentLabel],
+    ["Receipts", receiptsLabel],
     ["Exported", new Date().toLocaleString("en-HK")],
-    [],
-    ["Key Details"],
-    ["Field", "Value"]
+    []
   )
 
-  const usedKeys = new Set<string>()
-  for (const key of KEY_DETAIL_FIELDS) {
-    const row = findSummaryRow(summaryRows, key)
-    if (!row || !row.value.trim()) continue
-    usedKeys.add(row.field.toLowerCase())
-    const line = [normalizeFieldLabel(row.field), row.value]
-    if (hasMultipleSources) line.push(row.source)
-    report.push(line)
-  }
-
-  if (lineItemsTable.length > 1) {
-    report.push([])
-    report.push(["Line Items"])
-    report.push(...lineItemsTable)
-  }
-
-  const additionalRows = summaryRows.filter((row) => !usedKeys.has(row.field.toLowerCase()))
-  if (additionalRows.length > 0) {
-    report.push([])
-    report.push(["Additional Details"])
-    report.push(["Field", "Value"])
-    if (hasMultipleSources) report[report.length - 1].push("Source")
-
-    for (const row of additionalRows) {
-      const line = [normalizeFieldLabel(row.field), row.value]
-      if (hasMultipleSources) line.push(row.source)
-      report.push(line)
-    }
+  if (useGroupedLayout) {
+    groups.forEach((group, index) => {
+      if (index > 0) report.push([])
+      report.push(...buildReceiptGroupSection(group))
+    })
+  } else {
+    report.push(...buildFlatExpenseDataSection(parsedRows, hasMultipleSources))
   }
 
   if (options.policyResults && options.policyResults.length > 0) {

@@ -9,6 +9,7 @@
   ],
   "scripts": {
     "dev": "npm run dev -w apps/web",
+    "dev:restart": "bash scripts/restart-dev.sh",
     "build": "npm run build -w apps/web",
     "start": "npm run start -w apps/web",
     "lint": "npm run lint -w apps/web",
@@ -26,10 +27,13 @@
     "lodash": "4.18.1"
   },
   "dependencies": {
+    "@hyzyla/pdfium": "^2.1.13",
     "docx": "^9.7.1",
     "jsonrepair": "^3.14.0",
     "mammoth": "^1.12.0",
     "pdf-parse": "^2.4.5",
+    "sharp": "^0.35.1",
+    "word-extractor": "^1.0.4",
     "xlsx": "^0.18.5",
     "xlsx-js-style": "^1.2.0"
   }
