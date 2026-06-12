@@ -96,7 +96,14 @@ export default function ReportSessionPage() {
     if (!sessionId) return
     try {
       const res = await fetch("/api/report/sessions")
-      if (!res.ok) throw new Error("Failed to load sessions")
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(
+          (body as { detail?: string; error?: string }).detail ||
+            (body as { error?: string }).error ||
+            `Failed to load sessions (${res.status})`
+        )
+      }
       const data = await res.json()
       const found = (data.sessions || []).find((s: SessionData) => s.id === sessionId)
       if (found) {
