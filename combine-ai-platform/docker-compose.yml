@@ -6,7 +6,7 @@ services:
     container_name: combine-ai-postgres
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       POSTGRES_USER: combine_ai
       POSTGRES_PASSWORD: combine_ai_dev

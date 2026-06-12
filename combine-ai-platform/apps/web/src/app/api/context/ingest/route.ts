@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { prisma } from "@/lib/server/prisma"
 import { requireSession } from "@/lib/server/auth-helpers"
-import { generateEmbedding, chunkText } from "@combine-ai/ai-provider"
+import { chunkText } from "@combine-ai/ai-provider"
+import { generateEmbedding } from "@combine-ai/ai-provider/server"
 
 export const dynamic = "force-dynamic"
 
@@ -61,60 +62,66 @@ export async function POST(request: NextRequest) {
           },
         })
 
-        // Chunk and embed
-        const chunks = chunkText(text)
-        const chunkRecords: Array<{
-          articleId: string
-          content: string
-          chunkIndex: number
-          tokenCount: number
-        }> = []
+        try {
+          // Chunk and embed
+          const chunks = chunkText(text)
+          const chunkRecords: Array<{
+            articleId: string
+            content: string
+            chunkIndex: number
+            tokenCount: number
+          }> = []
 
-        for (let i = 0; i < chunks.length; i++) {
-          const chunkContent = chunks[i]
-          const embedding = await generateEmbedding(chunkContent)
+          for (let i = 0; i < chunks.length; i++) {
+            const chunkContent = chunks[i]
+            const embedding = await generateEmbedding(chunkContent)
 
-          // Create chunk with raw SQL for embedding column
-          const created = await prisma.knowledgeChunk.create({
-            data: {
+            // Create chunk with raw SQL for embedding column
+            const created = await prisma.knowledgeChunk.create({
+              data: {
+                articleId: article.id,
+                content: chunkContent,
+                chunkIndex: i,
+                tokenCount: Math.ceil(chunkContent.length / 4), // rough CJK token estimate
+              },
+            })
+
+            // Insert embedding via raw SQL
+            await prisma.$executeRaw`
+              UPDATE "KnowledgeChunk"
+              SET embedding = ${embedding}::vector
+              WHERE id = ${created.id}
+            `
+
+            chunkRecords.push({
               articleId: article.id,
-              content: chunkContent,
+              content: chunkContent.slice(0, 100),
               chunkIndex: i,
-              tokenCount: Math.ceil(chunkContent.length / 4), // rough CJK token estimate
+              tokenCount: Math.ceil(chunkContent.length / 4),
+            })
+          }
+
+          return NextResponse.json(
+            {
+              article: {
+                id: article.id,
+                title: article.title,
+                content: article.content.slice(0, 500),
+                tags: article.tags,
+                language: article.language,
+                targetAudience: article.targetAudience,
+                businessProcesses: article.businessProcesses,
+                documentType: article.documentType,
+              },
+              chunksCreated: chunks.length,
             },
-          })
-
-          // Insert embedding via raw SQL
-          await prisma.$executeRaw`
-            UPDATE "KnowledgeChunk"
-            SET embedding = ${embedding}::vector
-            WHERE id = ${created.id}
-          `
-
-          chunkRecords.push({
-            articleId: article.id,
-            content: chunkContent.slice(0, 100),
-            chunkIndex: i,
-            tokenCount: Math.ceil(chunkContent.length / 4),
-          })
+            { status: 201 }
+          )
+        } catch (embedErr) {
+          await prisma.knowledgeChunk.deleteMany({ where: { articleId: article.id } })
+          await prisma.knowledgeArticle.delete({ where: { id: article.id } })
+          throw embedErr
         }
-
-        return NextResponse.json(
-          {
-            article: {
-              id: article.id,
-              title: article.title,
-              content: article.content.slice(0, 500),
-              tags: article.tags,
-              language: article.language,
-              targetAudience: article.targetAudience,
-              businessProcesses: article.businessProcesses,
-              documentType: article.documentType,
-            },
-            chunksCreated: chunks.length,
-          },
-          { status: 201 }
-        )
       }
 
       case "reprocess": {

@@ -1,5 +1,5 @@
 import { prisma } from "@/lib/server/prisma"
-import { generateEmbedding } from "@combine-ai/ai-provider"
+import { generateEmbedding } from "@combine-ai/ai-provider/server"
 import { COL, KB_JOIN_CHAIN } from "@/lib/server/db-columns"
 
 export interface KnowledgeChunkResult {

@@ -11,16 +11,17 @@ import type {
   ContentPart,
 } from "../index"
 import { THINKING_MODELS } from "../models"
+import { readEnv } from "../env"
 
 // ── Configuration ─────────────────────────────────────────────────
 
 function getConfig() {
   const baseUrl =
-    process.env.DASHSCOPE_BASE_URL ||
+    readEnv("DASHSCOPE_BASE_URL") ||
     "https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1"
 
-  const apiKey = process.env.DASHSCOPE_API_KEY || ""
-  const defaultModel = process.env.DASHSCOPE_DEFAULT_MODEL || "qwen3.6-plus"
+  const apiKey = readEnv("DASHSCOPE_API_KEY") || readEnv("LLM_API_KEY")
+  const defaultModel = readEnv("DASHSCOPE_DEFAULT_MODEL") || "qwen3.6-plus"
 
   return { baseUrl, apiKey, defaultModel }
 }

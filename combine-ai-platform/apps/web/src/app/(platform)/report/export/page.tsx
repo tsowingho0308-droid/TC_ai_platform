@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
-import { ArrowLeft, Download, FileSpreadsheet, Loader2 } from "lucide-react"
+import { ArrowLeft, Download, FileSpreadsheet, FileText, Loader2 } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
 
 interface ReportSession {
@@ -13,11 +13,13 @@ interface ReportSession {
   rows?: Array<{ field: string; value: string }>
 }
 
+type ExportFormat = "batch-md" | "batch-xlsx"
+
 export default function BatchExportPage() {
   const [sessions, setSessions] = useState<ReportSession[]>([])
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(true)
-  const [exporting, setExporting] = useState(false)
+  const [exporting, setExporting] = useState<ExportFormat | null>(null)
 
   useEffect(() => {
     fetch("/api/report/sessions")
@@ -46,60 +48,44 @@ export default function BatchExportPage() {
     }
   }
 
-  async function exportSelected() {
+  async function exportSelected(format: ExportFormat) {
     if (selected.size === 0) return
 
-    setExporting(true)
+    setExporting(format)
     try {
-      // Collect all rows from selected sessions
-      const allRows: Array<{ field: string; value: string }> = []
-
-      for (const session of sessions) {
-        if (!selected.has(session.id)) continue
-
-        // Fetch full session data
-        const res = await fetch(`/api/report/sessions`)
-        const data = await res.json()
-        const fullSession = (data.sessions || []).find(
-          (s: ReportSession) => s.id === session.id
-        )
-
-        if (fullSession?.rows && Array.isArray(fullSession.rows)) {
-          // Add section header
-          allRows.push({ field: `=== ${session.title} ===`, value: "" })
-          for (const row of fullSession.rows) {
-            allRows.push(row)
-          }
-          allRows.push({ field: "", value: "" }) // spacer
-        }
-      }
-
-      if (allRows.length === 0) {
-        console.error("No data to export")
-        return
-      }
-
       const res = await fetch("/api/report/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rows: allRows, format: "xlsx" }),
+        body: JSON.stringify({
+          format,
+          sessionIds: Array.from(selected),
+          includeSummaries: true,
+        }),
       })
 
-      if (!res.ok) throw new Error("Export failed")
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({})) as { error?: string }
+        throw new Error(errData.error || "Export failed")
+      }
 
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = url
-      a.download = `batch-report-${Date.now()}.xlsx`
+      a.download =
+        format === "batch-md"
+          ? `integrated-report-${Date.now()}.md`
+          : `integrated-report-${Date.now()}.xlsx`
       a.click()
       URL.revokeObjectURL(url)
     } catch (err) {
       console.error("Batch export error:", err)
     } finally {
-      setExporting(false)
+      setExporting(null)
     }
   }
+
+  const isExporting = exporting !== null
 
   return (
     <div className="flex h-full flex-col">
@@ -110,21 +96,38 @@ export default function BatchExportPage() {
           </Link>
           <h1 className="text-lg font-semibold">Batch Export</h1>
         </div>
-        <button
-          disabled={selected.size === 0 || exporting}
-          onClick={exportSelected}
-          className={cn(
-            "inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
-            "disabled:opacity-50"
-          )}
-        >
-          {exporting ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <Download className="h-4 w-4" />
-          )}
-          {exporting ? "Exporting..." : `Export Selected (${selected.size})`}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            disabled={selected.size === 0 || isExporting}
+            onClick={() => exportSelected("batch-md")}
+            className={cn(
+              "inline-flex items-center gap-2 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent",
+              "disabled:opacity-50"
+            )}
+          >
+            {exporting === "batch-md" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <FileText className="h-4 w-4" />
+            )}
+            Export Integrated Report (.md)
+          </button>
+          <button
+            disabled={selected.size === 0 || isExporting}
+            onClick={() => exportSelected("batch-xlsx")}
+            className={cn(
+              "inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground",
+              "disabled:opacity-50"
+            )}
+          >
+            {exporting === "batch-xlsx" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Download className="h-4 w-4" />
+            )}
+            Export Combined Spreadsheet (.xlsx)
+          </button>
+        </div>
       </header>
 
       <div className="flex-1 overflow-y-auto p-6">
@@ -148,6 +151,7 @@ export default function BatchExportPage() {
             <div className="mb-4 flex items-center justify-between">
               <p className="text-sm text-muted-foreground">
                 {sessions.length} session{sessions.length !== 1 ? "s" : ""} available
+                {selected.size > 0 && ` · ${selected.size} selected`}
               </p>
               <button
                 onClick={toggleAll}
@@ -161,7 +165,7 @@ export default function BatchExportPage() {
               {sessions.map((session) => (
                 <label
                   key={session.id}
-                  className="flex items-center gap-3 rounded-lg border p-4 cursor-pointer hover:bg-accent/50 transition-colors"
+                  className="flex cursor-pointer items-center gap-3 rounded-lg border p-4 transition-colors hover:bg-accent/50"
                 >
                   <input
                     type="checkbox"
@@ -170,7 +174,7 @@ export default function BatchExportPage() {
                     className="h-4 w-4 rounded border-primary accent-primary"
                   />
                   <FileSpreadsheet className="h-5 w-5 shrink-0 text-muted-foreground" />
-                  <div className="flex-1 min-w-0">
+                  <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium">{session.title}</p>
                     <p className="text-xs text-muted-foreground">
                       {new Date(session.updatedAt).toLocaleDateString("en-HK", {
@@ -180,6 +184,9 @@ export default function BatchExportPage() {
                         hour: "2-digit",
                         minute: "2-digit",
                       })}
+                      {session.rows && session.rows.length > 0
+                        ? ` · ${session.rows.length} fields`
+                        : ""}
                     </p>
                   </div>
                   <span

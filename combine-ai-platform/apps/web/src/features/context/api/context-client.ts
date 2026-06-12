@@ -157,8 +157,9 @@ export async function ingestText(params: {
     body: JSON.stringify(params),
   })
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error(err?.error || `Ingest failed: ${res.status}`)
+    const err = await res.json().catch(() => ({})) as { error?: string; detail?: string }
+    const message = [err?.error, err?.detail].filter(Boolean).join(": ") || `Ingest failed: ${res.status}`
+    throw new Error(message)
   }
   return res.json()
 }

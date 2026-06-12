@@ -1,5 +1,6 @@
 import { PrismaClient } from "@prisma/client"
-import { chunkText, generateEmbedding } from "../packages/ai-provider/src/index"
+import { chunkText } from "../packages/ai-provider/src/index"
+import { generateEmbedding } from "../packages/ai-provider/src/server"
 
 const prisma = new PrismaClient()
 

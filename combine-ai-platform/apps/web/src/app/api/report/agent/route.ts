@@ -6,7 +6,9 @@ import { mockReportExtraction } from "@/lib/server/mock-extraction"
 import { extractTextFromDocument, validateDocumentText } from "@/lib/server/document-text"
 import { searchKnowledgeChunks, type KnowledgeSearchResult } from "@/lib/server/knowledge-search"
 import { extractKbHighlightPhrases } from "@/lib/server/kb-highlight-phrases"
-import { getDashScopeProvider, DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { buildReportDocx } from "@/lib/server/report-docx-export"
+import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { getDashScopeProvider, ensureAiEnvLoaded } from "@combine-ai/ai-provider/server"
 import path from "path"
 import fs from "fs"
 
@@ -55,6 +57,7 @@ async function callAI(req: {
   messages: Array<{ role: string; content: string | unknown[] }>
   tools?: unknown[]
 }) {
+  ensureAiEnvLoaded()
   const provider = getDashScopeProvider()
   return provider.createCompletion({
     model: req.model || DEFAULT_MODELS.report,
@@ -83,7 +86,7 @@ Rules:
 8. Preserve exact values — do not modify, summarize, or translate.
 9. Flag any unclear or ambiguous text with "⚠️" prefix.
 10. When possible, identify the page number (1-based) where each field appears in the document and include it as the "page" field in the row.
-11. For PDF highlighting: "value" must match the document text EXACTLY (same punctuation, currency symbols, spacing). For amounts, dates, titles, and reference numbers, "page" is REQUIRED.
+11. For PDF highlighting: "value" must match the document text EXACTLY (same punctuation, currency symbols, spacing). "field" should use the label text as it appears in the PDF when visible (e.g. "Invoice Date", not a paraphrase), so field+value can be highlighted together. For amounts, dates, titles, and reference numbers, "page" is REQUIRED.
 
 Respond ONLY with valid JSON:
 {
@@ -113,7 +116,7 @@ User instructions:
 Apply the user's instructions to modify the rows. You may:
 - Add new rows
 - Update existing rows' field names or values
-- Remove rows as requested
+- Remove rows as requested (e.g. "刪除第 3 行", "delete row 3", "remove rows containing 備註")
 - Reorganize or reformat data
 
 Respond ONLY with valid JSON:
@@ -181,7 +184,8 @@ function highlightRowScore(row: ExtractRow): number {
   let score = 0
   if (row.page && row.page >= 1) score += 100
   const v = row.value?.trim() || ""
-  if (v.length >= 2 && v.length <= 80) score += 20
+  if (v.length >= 4 && v.length <= 40) score += 30
+  else if (v.length >= 2 && v.length <= 80) score += 10
   if (/\d/.test(v)) score += 10
   if (/[$¥€£]|HKD|USD|CNY/i.test(v)) score += 15
   if (/\d{4}[-/]\d{1,2}/.test(v)) score += 10
@@ -189,12 +193,12 @@ function highlightRowScore(row: ExtractRow): number {
   return score
 }
 
-const HIGHLIGHT_SOFT_CAP = 60
+const HIGHLIGHT_SOFT_CAP = 12
 
 function selectHighlightRows(rows: ExtractRow[], limit = HIGHLIGHT_SOFT_CAP): ExtractRow[] {
   const filtered = [...rows].filter((r) => {
     const v = r.value?.trim() || ""
-    return v.length >= 2 && v.length <= 80
+    return v.length >= 3 && v.length <= 80
   })
   if (filtered.length <= limit) return filtered
   return filtered
@@ -1326,19 +1330,21 @@ async function handleSummarize(
 
 // ── Generate Full Report ──────────────────────────────────────
 
-const REPORT_GENERATE_PROMPT = `你是香港企業的報告撰寫助手。根據文件內容、郵件背景（如有）與知識庫參考資料，撰寫完整繁體中文分析報告。
+const REPORT_GENERATE_PROMPT = `你是香港企業的高級分析師，負責撰寫可直接呈交上司的正式內部報告（繁體中文）。
 
 要求：
-1. 以 Markdown 格式輸出，包含以下章節（標題使用 ##）：
-   - 報告概要
-   - 郵件／文件背景（若無郵件背景則改為「文件背景」）
-   - 重點發現（條列，引用抽取欄位中的具體數據）
-   - 知識庫政策對照與合規注意事項
+1. 語氣專業、客觀、簡潔，結論先行；像資深同事寫給管理層的備忘錄，而非 AI 分析摘要
+2. 禁止使用：「AI 分析」「知識庫搜尋」「產生時間」「本報告由…生成」等元描述
+3. 以 Markdown 格式輸出正文（## 章節標題），建議章節：
+   - 報告標題（一句話）
+   - 背景及目的
+   - 主要發現（引用具體數據與事實，條列）
+   - 風險與合規事項
    - 建議行動
-   - 附錄：參考條文
-2. 知識庫條文須在正文中引用並說明關聯；附錄列出所有參考條文
-3. 語氣專業、條理清晰，每章節 2-6 段或條列
-4. 僅回傳 Markdown 正文，不要 JSON 包裝，不要 code fence`
+   - 結論
+4. 政策／合規內容自然融入正文，不要單獨列出「參考條文清單」或技術性附錄
+5. 每章節 2–5 段或條列，可直接複製到 Word 使用
+6. 僅回傳 Markdown 正文，不要 JSON，不要 code fence`
 
 async function performReportGenerate(
   session: { workspaceId: string },
@@ -1351,7 +1357,7 @@ async function performReportGenerate(
     reportSummary?: ReportSummaryResult
     emailContext?: { subject?: string; sender?: string; body?: string }
   }
-): Promise<{ markdown: string; fileName: string }> {
+): Promise<{ docxBase64: string; fileName: string }> {
   const { documentText, fileName, documentType, title, rows, reportSummary, emailContext } = params
 
   let reportContent = documentText?.trim() || ""
@@ -1448,59 +1454,55 @@ async function performReportGenerate(
       ],
     })
 
-    let markdown = result.messageContent.trim()
-    markdown = markdown.replace(/^```(?:markdown|md)?\s*|\s*```$/g, "").trim()
+    let bodyText = result.messageContent.trim()
+    bodyText = bodyText.replace(/^```(?:markdown|md)?\s*|\s*```$/g, "").trim()
 
-    const header = [
-      `# 分析報告 — ${baseName}`,
-      "",
-      `> 產生時間：${new Date().toLocaleString("zh-HK", { timeZone: "Asia/Hong_Kong" })}`,
-      emailContext?.sender ? `> 郵件來源：${emailContext.sender}` : "",
-      "",
-    ]
-      .filter(Boolean)
-      .join("\n")
+    const reportTitle = title || fileName || emailContext?.subject || "內部報告"
+    const docxBuffer = await buildReportDocx({
+      title: reportTitle.replace(/\.[^.]+$/, ""),
+      bodyText,
+    })
 
     return {
-      markdown: header + markdown,
-      fileName: `report-${safeName}-${Date.now()}.md`,
+      docxBase64: docxBuffer.toString("base64"),
+      fileName: `report-${safeName}-${Date.now()}.docx`,
     }
   } catch (err) {
     console.warn("Report generate AI unavailable:", (err as Error).message)
 
-    const fallbackSections = [
-      `# 分析報告 — ${baseName}`,
-      "",
-      `> 產生時間：${new Date().toLocaleString("zh-HK", { timeZone: "Asia/Hong_Kong" })}`,
-      "",
-      "## 報告概要",
-      reportSummary?.summary || reportContent.slice(0, 500) || "無法取得報告內容。",
-      "",
-      "## 郵件／文件背景",
+    const fallbackBody = [
+      "## 背景及目的",
       emailContext
-        ? `主旨：${emailContext.subject || ""}\n寄件人：${emailContext.sender || ""}`
-        : fileName || "（無背景資訊）",
+        ? `本報告就「${emailContext.subject || "相關郵件"}」所附文件作出摘要，供管理層審閱。`
+        : fileName
+          ? `本報告就「${fileName}」所載內容作出摘要，供管理層審閱。`
+          : "本報告就相關文件內容作出摘要，供管理層審閱。",
       "",
-      "## 重點發現",
-      extractedFields,
+      "## 主要發現",
+      reportSummary?.summary || reportContent.slice(0, 500) || "請參閱附件及抽取欄位。",
       "",
-      "## 知識庫政策對照與合規注意事項",
-      reportSummary?.keyPoints?.map((p) => `- ${p}`).join("\n") || "（AI 暫不可用）",
+      extractedFields !== "（無抽取欄位）" ? extractedFields : "",
+      "",
+      "## 風險與合規事項",
+      reportSummary?.keyPoints?.map((p) => `- ${p}`).join("\n") || "請人工覆核相關合規要求。",
       "",
       "## 建議行動",
-      "- 請人工覆核上述重點與知識庫條文",
+      "- 請管理層確認上述重點及建議後，指示後續跟進。",
       "",
-      "## 附錄：參考條文",
-      chunks.length > 0
-        ? chunks
-            .map((c) => `- **${c.articleTitle}** (${c.knowledgeBaseName})\n  ${c.excerpt.slice(0, 200)}`)
-            .join("\n")
-        : "（知識庫中未找到相關條文）",
+      "## 結論",
+      reportSummary?.summary?.slice(0, 200) || "綜上，建議按上述行動跟進。",
     ]
+      .filter(Boolean)
+      .join("\n")
+
+    const docxBuffer = await buildReportDocx({
+      title: (title || fileName || "內部報告").replace(/\.[^.]+$/, ""),
+      bodyText: fallbackBody,
+    })
 
     return {
-      markdown: fallbackSections.join("\n"),
-      fileName: `report-${safeName}-${Date.now()}.md`,
+      docxBase64: docxBuffer.toString("base64"),
+      fileName: `report-${safeName}-${Date.now()}.docx`,
     }
   }
 }
