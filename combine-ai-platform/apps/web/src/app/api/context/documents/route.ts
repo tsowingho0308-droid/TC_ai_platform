@@ -26,7 +26,7 @@ export async function GET(request: NextRequest) {
       where.knowledgeBaseId = knowledgeBaseId
     }
 
-    if (department && department !== "GENERAL") {
+    if (department) {
       where.knowledgeBase = {
         ...(where.knowledgeBase as Record<string, unknown>),
         department: department,
@@ -166,10 +166,11 @@ Assign to ONE OR MORE departments based on content:
 - **HR**: leave, benefits, training, recruitment, performance, employee relations, payroll
 - **IT**: software, hardware, VPN, security, email systems, cloud, infrastructure, technical specifications
 - **ADMIN**: facilities, access cards, travel, office supplies, visitors, meeting rooms
-- **FINANCE**: expenses, procurement, budget, invoices, tax, payments, pricing, financial terms
+- **FINANCE**: expenses, procurement, budget, invoices, tax, payments, pricing, financial terms, tenders, RFPs, RFQs, bidding, quotations, contracts
 - **GENERAL**: company-wide policies, handbook, holidays, compliance, emergency
 
-Example: An IT infrastructure tender → category: "Tender", departments: ["IT", "FINANCE"] (IT for technical scope, FINANCE for budget/procurement)
+IMPORTANT: All tender/RFP/RFQ/bidding/procurement documents MUST be assigned to FINANCE as the primary department. Tender documents are always managed by the Finance department.
+Example: An IT infrastructure tender → category: "Tender", departments: ["FINANCE"] (tender documents are Finance responsibility)
 Example: An expense policy document → category: "Policy", departments: ["FINANCE", "GENERAL"]
 
 Return ONLY valid JSON:

@@ -73,7 +73,7 @@ export async function GET(request: NextRequest) {
         JOIN "KnowledgeBase" kb ON kb.id = ka."knowledgeBaseId"
         WHERE kb."workspaceId" = ${session.workspaceId}
           ${
-            department && department !== "GENERAL"
+            department
               ? prisma.$queryRaw`AND kb.department = ${department}::text`
               : prisma.$queryRaw`AND 1=1`
           }
@@ -108,7 +108,7 @@ export async function GET(request: NextRequest) {
       where: {
         knowledgeBase: {
           workspaceId: session.workspaceId,
-          ...(department && department !== "GENERAL"
+          ...(department
             ? { department: department as any }
             : {}),
         },

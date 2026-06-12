@@ -250,9 +250,9 @@ export default function TicketsPage() {
                     )}
                   </div>
                   {ticket.aiAnswer && (
-                    <p className="mt-1 text-xs text-muted-foreground line-clamp-2">
+                    <div className="mt-1 text-xs text-muted-foreground line-clamp-2">
                       <span className="text-xs text-muted-foreground">AI:</span> <MarkdownContent compact>{ticket.aiAnswer}</MarkdownContent>
-                    </p>
+                    </div>
                   )}
                 </div>
                 <div className="flex items-center gap-1 shrink-0">

@@ -130,14 +130,28 @@ export function DocumentDetailPanel({
           </div>
         )}
 
-        {/* Document Type */}
-        {document.documentType && (
+        {/* File Format */}
+        {document.sourceDocName && (
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase">
-              Document Type
+              File Format
             </label>
             <p className="mt-1">
               <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                {document.sourceDocName.split(".").pop()?.toUpperCase() || "Unknown"}
+              </span>
+            </p>
+          </div>
+        )}
+
+        {/* Document Category */}
+        {document.documentType && (
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase">
+              Document Category
+            </label>
+            <p className="mt-1">
+              <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
                 {document.documentType.replace(/_/g, " ")}
               </span>
             </p>

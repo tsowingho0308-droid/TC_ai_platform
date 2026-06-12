@@ -25,11 +25,20 @@ export function ContextPage() {
   const [error, setError] = useState<string | null>(null)
   const [total, setTotal] = useState(0)
 
-  // Filters
+  // Filters & Sort
   const [selectedDepartment, setSelectedDepartment] = useState<string>(
     searchParams.get("department") || ""
   )
+  const [sortBy, setSortBy] = useState<"updatedAt_desc" | "updatedAt_asc" | "department">(
+    "updatedAt_desc"
+  )
   const [searchQuery, setSearchQuery] = useState("")
+
+  // Sync department from URL (sidebar clicks)
+  useEffect(() => {
+    const dept = searchParams.get("department") || ""
+    setSelectedDepartment(dept)
+  }, [searchParams])
 
   // Selected document for detail panel
   const [selectedDoc, setSelectedDoc] = useState<ContextDocument | null>(null)
@@ -44,6 +53,29 @@ export function ContextPage() {
     return () => clearTimeout(timer)
   }, [searchQuery])
 
+  // Sort helper
+  function sortDocuments(docs: ContextDocument[], sort: string): ContextDocument[] {
+    const sorted = [...docs]
+    switch (sort) {
+      case "updatedAt_asc":
+        sorted.sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime())
+        break
+      case "department":
+        sorted.sort((a, b) => {
+          const deptA = a.knowledgeBase?.department || ""
+          const deptB = b.knowledgeBase?.department || ""
+          if (deptA !== deptB) return deptA.localeCompare(deptB)
+          return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+        })
+        break
+      case "updatedAt_desc":
+      default:
+        sorted.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+        break
+    }
+    return sorted
+  }
+
   // Fetch documents
   const fetchDocuments = useCallback(async () => {
     try {
@@ -54,7 +86,7 @@ export function ContextPage() {
         search: debouncedQuery || undefined,
         limit: 50,
       })
-      setDocuments(result.documents)
+      setDocuments(sortDocuments(result.documents, sortBy))
       setTotal(result.total)
     } catch (err) {
       console.error("Failed to fetch documents:", err)
@@ -62,7 +94,7 @@ export function ContextPage() {
     } finally {
       setLoading(false)
     }
-  }, [selectedDepartment, debouncedQuery])
+  }, [selectedDepartment, debouncedQuery, sortBy])
 
   useEffect(() => {
     fetchDocuments()
@@ -150,17 +182,28 @@ export function ContextPage() {
               Manage knowledge bases, documents, and semantic search
             </p>
           </div>
-          <button
-            onClick={() => setShowUpload(!showUpload)}
-            className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-          >
-            <svg className="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="17 8 12 3 7 8" />
-              <line x1="12" y1="3" x2="12" y2="15" />
-            </svg>
-            Upload Document
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowUpload(!showUpload)}
+              className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              <svg className="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+              Upload Document
+            </button>
+            <select
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
+              className="rounded-md border bg-transparent px-3 py-2 text-sm"
+            >
+              <option value="updatedAt_desc">Upload Time (Newest)</option>
+              <option value="updatedAt_asc">Upload Time (Oldest)</option>
+              <option value="department">Department</option>
+            </select>
+          </div>
         </div>
 
         {/* Search + Filters */}
