@@ -19,6 +19,7 @@ import { ModelSelector } from "@/features/shared/model-selector"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
 import {
   chatStream,
+  waitForTaskResult,
   type HelpdeskMessage,
 } from "@/features/helpdesk/api/helpdesk-client"
 import {
@@ -121,6 +122,43 @@ async function generateTitle(question: string): Promise<string> {
   return question.slice(0, 50)
 }
 
+// ══════════════════════════════════════════════════════════════════
+// Global Session Cache — survives component unmount/remount when
+// user switches between Agents in the sidebar. Without this, any
+// in-progress AI stream or async task would be lost on unmount
+// because the DB hasn't received the final AI response yet.
+// ══════════════════════════════════════════════════════════════════
+
+interface RoomCacheEntry {
+  streamContent: string
+  streamThinking: string
+  toolCalls: ActiveToolCall[]
+  loading: boolean
+}
+
+// Per-room message history (survives unmount/remount)
+const roomTurnsCache = new Map<string, QATurn[]>()
+// Per-room live streaming state
+const roomStreamCache = new Map<string, RoomCacheEntry>()
+// Per-room SSE abort controllers
+const roomAbortCache = new Map<string, AbortController>()
+// Which room currently has an active SSE stream connection
+let activeStreamRoomId: string | null = null
+
+function getRoomStream(roomId: string): RoomCacheEntry {
+  let e = roomStreamCache.get(roomId)
+  if (!e) {
+    e = { streamContent: "", streamThinking: "", toolCalls: [], loading: false }
+    roomStreamCache.set(roomId, e)
+  }
+  return e
+}
+
+function restoreRoomStream(roomId: string | null) {
+  if (!roomId) return { streamContent: "", streamThinking: "", toolCalls: [] as ActiveToolCall[], loading: false }
+  return roomStreamCache.get(roomId) ?? { streamContent: "", streamThinking: "", toolCalls: [] as ActiveToolCall[], loading: false }
+}
+
 // ── Main Component ───────────────────────────────────────────────
 
 export default function HelpdeskPage() {
@@ -139,54 +177,7 @@ export default function HelpdeskPage() {
   const [attachedDoc, setAttachedDoc] = useState<AttachedDocument | null>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
-
-  // Store turns per room so history survives switching
-  const turnsByRoomRef = useRef<Map<string, QATurn[]>>(new Map())
   const firstQuestionRef = useRef(false)
-
-  // Per-room streaming state — persists AI stream across room switches
-  interface RoomStreamState {
-    content: string
-    thinking: string
-    toolCalls: ActiveToolCall[]
-    loading: boolean
-  }
-  const streamingByRoomRef = useRef<Map<string, RoomStreamState>>(new Map())
-  const activeStreamRoomRef = useRef<string | null>(null)
-  const abortByRoomRef = useRef<Map<string, AbortController>>(new Map())
-
-  // Get or create streaming state for a room
-  function getStreamState(roomId: string): RoomStreamState {
-    let s = streamingByRoomRef.current.get(roomId)
-    if (!s) {
-      s = { content: "", thinking: "", toolCalls: [], loading: false }
-      streamingByRoomRef.current.set(roomId, s)
-    }
-    return s
-  }
-
-  // Sync React streaming state from a room's persisted state
-  function restoreStreamState(roomId: string | null) {
-    if (!roomId) {
-      setStreamingContent("")
-      setStreamingThinking("")
-      setActiveToolCalls([])
-      setLoading(false)
-      return
-    }
-    const s = streamingByRoomRef.current.get(roomId)
-    if (s) {
-      setStreamingContent(s.content)
-      setStreamingThinking(s.thinking)
-      setActiveToolCalls(s.toolCalls)
-      setLoading(s.loading)
-    } else {
-      setStreamingContent("")
-      setStreamingThinking("")
-      setActiveToolCalls([])
-      setLoading(false)
-    }
-  }
 
   // ── Auto-scroll ──────────────────────────────────────────────
 
@@ -202,7 +193,37 @@ export default function HelpdeskPage() {
     }
   }, [loading])
 
+  // ── Sync streaming state from global cache ──────────────────
+  // When user switches away and back while an SSE stream is still
+  // running, the old callbacks update only the module-level cache
+  // (the old React setters are stale). This effect polls the cache
+  // to keep the new component's React state in sync.
+  useEffect(() => {
+    if (!activeRoomId) return
+    const entry = roomStreamCache.get(activeRoomId)
+    if (!entry?.loading) return
+
+    const interval = setInterval(() => {
+      const e = roomStreamCache.get(activeRoomId!)
+      if (!e) { clearInterval(interval); return }
+      setStreamingContent(e.streamContent)
+      setStreamingThinking(e.streamThinking)
+      setActiveToolCalls(e.toolCalls)
+      if (!e.loading) {
+        clearInterval(interval)
+        setLoading(false)
+        setStreamingContent("")
+        setStreamingThinking("")
+      }
+    }, 100)
+
+    return () => clearInterval(interval)
+  }, [activeRoomId])
+
   // ── Auto-select most recent room on mount ──────────────────
+  // Prioritises rooms with an active stream/async task in the
+  // global cache (survived unmount), so the user sees their
+  // in-progress conversation when switching back to Helpdesk.
 
   const initialLoadDone = useRef(false)
 
@@ -212,6 +233,22 @@ export default function HelpdeskPage() {
 
     async function loadLatestRoom() {
       try {
+        // ══ Check global cache for rooms with active streams first ══
+        for (const [roomId, stream] of roomStreamCache) {
+          if (stream.loading) {
+            const cachedTurns = roomTurnsCache.get(roomId) || []
+            setActiveRoomId(roomId)
+            setTurns(cachedTurns)
+            firstQuestionRef.current = cachedTurns.length > 0
+            setStreamingContent(stream.streamContent)
+            setStreamingThinking(stream.streamThinking)
+            setActiveToolCalls(stream.toolCalls)
+            setLoading(stream.loading)
+            return // ← restored active room, skip DB
+          }
+        }
+
+        // ══ No active streams — load latest room from DB ══
         const res = await fetch("/api/helpdesk/conversations")
         if (!res.ok) return
         const data = await res.json()
@@ -219,7 +256,16 @@ export default function HelpdeskPage() {
         if (conversations.length === 0) return
 
         const latest = conversations[0] // already sorted by updatedAt desc
-        // Load full conversation with messages
+        // Check cache first for this room
+        const cached = roomTurnsCache.get(latest.id)
+        if (cached) {
+          setActiveRoomId(latest.id)
+          setTurns(cached)
+          firstQuestionRef.current = cached.length > 0
+          return
+        }
+
+        // Load full conversation with messages from DB
         const detailRes = await fetch(
           `/api/helpdesk/conversations?id=${encodeURIComponent(latest.id)}`
         )
@@ -228,7 +274,7 @@ export default function HelpdeskPage() {
         const conv = detailData.conversation
         const messages = (conv?.messages as QATurn[]) || []
 
-        turnsByRoomRef.current.set(latest.id, messages)
+        roomTurnsCache.set(latest.id, messages)
         setActiveRoomId(latest.id)
         setTurns(messages)
         firstQuestionRef.current = messages.length > 0
@@ -309,23 +355,27 @@ export default function HelpdeskPage() {
       // Save current turns + streaming state for old room
       if (activeRoomId) {
         if (turns.length > 0) {
-          turnsByRoomRef.current.set(activeRoomId, turns)
+          roomTurnsCache.set(activeRoomId, turns)
           persistMessages(activeRoomId, turns)
         }
         // Save streaming state (don't lose in-progress AI)
-        getStreamState(activeRoomId).content = streamingContent
-        getStreamState(activeRoomId).thinking = streamingThinking
-        getStreamState(activeRoomId).toolCalls = activeToolCalls
-        getStreamState(activeRoomId).loading = loading
+        getRoomStream(activeRoomId).streamContent = streamingContent
+        getRoomStream(activeRoomId).streamThinking = streamingThinking
+        getRoomStream(activeRoomId).toolCalls = activeToolCalls
+        getRoomStream(activeRoomId).loading = loading
       }
 
       // Try loading turns from local cache first
-      const cached = turnsByRoomRef.current.get(roomId)
+      const cached = roomTurnsCache.get(roomId)
       if (cached) {
         setActiveRoomId(roomId)
         setTurns(cached)
         firstQuestionRef.current = cached.length > 0
-        restoreStreamState(roomId)
+        const rs = restoreRoomStream(roomId)
+        setStreamingContent(rs.streamContent)
+        setStreamingThinking(rs.streamThinking)
+        setActiveToolCalls(rs.toolCalls)
+        setLoading(rs.loading)
         setError(null)
         return
       }
@@ -339,7 +389,7 @@ export default function HelpdeskPage() {
           const data = await res.json()
           const conv = data.conversation
           const dbMessages = (conv?.messages as QATurn[]) || []
-          turnsByRoomRef.current.set(roomId, dbMessages)
+          roomTurnsCache.set(roomId, dbMessages)
           setActiveRoomId(roomId)
           setTurns(dbMessages)
           firstQuestionRef.current = dbMessages.length > 0
@@ -354,7 +404,11 @@ export default function HelpdeskPage() {
         firstQuestionRef.current = false
       }
       setError(null)
-      restoreStreamState(roomId)
+      const rs2 = restoreRoomStream(roomId)
+      setStreamingContent(rs2.streamContent)
+      setStreamingThinking(rs2.streamThinking)
+      setActiveToolCalls(rs2.toolCalls)
+      setLoading(rs2.loading)
     },
     [activeRoomId, turns, streamingContent, streamingThinking, activeToolCalls, loading, persistMessages]
   )
@@ -365,13 +419,13 @@ export default function HelpdeskPage() {
     // Save current turns + streaming state to DB before switching
     if (activeRoomId) {
       if (turns.length > 0) {
-        turnsByRoomRef.current.set(activeRoomId, turns)
+        roomTurnsCache.set(activeRoomId, turns)
         persistMessages(activeRoomId, turns)
       }
-      getStreamState(activeRoomId).content = streamingContent
-      getStreamState(activeRoomId).thinking = streamingThinking
-      getStreamState(activeRoomId).toolCalls = activeToolCalls
-      getStreamState(activeRoomId).loading = loading
+      getRoomStream(activeRoomId).streamContent = streamingContent
+      getRoomStream(activeRoomId).streamThinking = streamingThinking
+      getRoomStream(activeRoomId).toolCalls = activeToolCalls
+      getRoomStream(activeRoomId).loading = loading
     }
 
     const newId = await createNewRoom()
@@ -379,7 +433,11 @@ export default function HelpdeskPage() {
       setActiveRoomId(newId)
       setTurns([])
       firstQuestionRef.current = false
-      restoreStreamState(newId)
+      const rs3 = restoreRoomStream(newId)
+      setStreamingContent(rs3.streamContent)
+      setStreamingThinking(rs3.streamThinking)
+      setActiveToolCalls(rs3.toolCalls)
+      setLoading(rs3.loading)
       setError(null)
     }
   }, [activeRoomId, turns, streamingContent, streamingThinking, activeToolCalls, loading, createNewRoom, persistMessages])
@@ -389,14 +447,14 @@ export default function HelpdeskPage() {
   const handleDeleteRoom = useCallback(
     (roomId: string) => {
       // Abort any active AI stream for this room
-      abortByRoomRef.current.get(roomId)?.abort()
-      abortByRoomRef.current.delete(roomId)
+      roomAbortCache.get(roomId)?.abort()
+      roomAbortCache.delete(roomId)
 
       // Clean up all refs for this room
-      turnsByRoomRef.current.delete(roomId)
-      streamingByRoomRef.current.delete(roomId)
-      if (activeStreamRoomRef.current === roomId) {
-        activeStreamRoomRef.current = null
+      roomTurnsCache.delete(roomId)
+      roomStreamCache.delete(roomId)
+      if (activeStreamRoomId === roomId) {
+        activeStreamRoomId = null
       }
 
       // If this was the active room, clear the display
@@ -447,10 +505,10 @@ export default function HelpdeskPage() {
       ].join("\n")
     }
 
-    // ── All turn operations use turnsByRoomRef (per-room, never shared) ──
-    const roomTurns = turnsByRoomRef.current.get(capturedRoomId) || []
+    // ── All turn operations use roomTurnsCache (per-room, never shared) ──
+    const roomTurns = roomTurnsCache.get(capturedRoomId) || []
     const turnsWithUser = [...roomTurns, { role: "user" as const, content: userContent }]
-    turnsByRoomRef.current.set(capturedRoomId, turnsWithUser)
+    roomTurnsCache.set(capturedRoomId, turnsWithUser)
     // Persist immediately so updatedAt reflects when user sent the message
     persistMessages(capturedRoomId, turnsWithUser)
     setSidebarRefreshKey((k) => k + 1)
@@ -477,20 +535,20 @@ export default function HelpdeskPage() {
     }))
 
     // Initialize streaming state for this room
-    const streamState = getStreamState(capturedRoomId)
-    streamState.content = ""
-    streamState.thinking = ""
+    const streamState = getRoomStream(capturedRoomId)
+    streamState.streamContent = ""
+    streamState.streamThinking = ""
     streamState.toolCalls = []
     streamState.loading = true
-    activeStreamRoomRef.current = capturedRoomId
+    activeStreamRoomId = capturedRoomId
 
     // Create AbortController for this room (abort previous if exists)
-    abortByRoomRef.current.get(capturedRoomId)?.abort()
+    roomAbortCache.get(capturedRoomId)?.abort()
     const abortController = new AbortController()
-    abortByRoomRef.current.set(capturedRoomId, abortController)
+    roomAbortCache.set(capturedRoomId, abortController)
 
     // Check if room still exists (hasn't been deleted)
-    const roomExists = () => turnsByRoomRef.current.has(capturedRoomId) || activeRoomId === capturedRoomId
+    const roomExists = () => roomTurnsCache.has(capturedRoomId) || activeRoomId === capturedRoomId
 
     // Track streaming state locally
     let latestContent = ""
@@ -513,14 +571,14 @@ export default function HelpdeskPage() {
           onThinking: (text) => {
             if (!roomExists()) return // room deleted — discard
             latestThinking += text
-            streamState.thinking = latestThinking
+            streamState.streamThinking = latestThinking
             if (activeRoomId === capturedRoomId) setStreamingThinking(latestThinking)
           },
 
           onToken: (text) => {
             if (!roomExists()) return
             latestContent += text
-            streamState.content = latestContent
+            streamState.streamContent = latestContent
             if (activeRoomId === capturedRoomId) setStreamingContent(latestContent)
           },
 
@@ -549,7 +607,7 @@ export default function HelpdeskPage() {
             const answer = result.answer || latestContent || "No response received."
             streamState.loading = false
 
-            const currentTurns = turnsByRoomRef.current.get(capturedRoomId) || []
+            const currentTurns = roomTurnsCache.get(capturedRoomId) || []
             const updated = [
               ...currentTurns,
               {
@@ -561,7 +619,7 @@ export default function HelpdeskPage() {
                 suggestedDepartment: result.suggestedDepartment,
               },
             ]
-            turnsByRoomRef.current.set(capturedRoomId, updated)
+            roomTurnsCache.set(capturedRoomId, updated)
             persistMessages(capturedRoomId, updated)
 
             if (activeRoomId === capturedRoomId) {
@@ -579,13 +637,24 @@ export default function HelpdeskPage() {
               setError(detail)
               setLoading(false)
             }
-            const currentTurns = turnsByRoomRef.current.get(capturedRoomId) || []
+            const currentTurns = roomTurnsCache.get(capturedRoomId) || []
             const updated = [
               ...currentTurns,
               { role: "assistant" as const, content: `Sorry, something went wrong: ${detail}` },
             ]
-            turnsByRoomRef.current.set(capturedRoomId, updated)
+            roomTurnsCache.set(capturedRoomId, updated)
             if (activeRoomId === capturedRoomId) setTurns(updated)
+          },
+
+          onUpgradeToAsync: (taskId) => {
+            if (!roomExists()) return
+            // Stop streaming — the task is now handled by the Python worker
+            streamState.loading = false
+            if (activeStreamRoomId === capturedRoomId) {
+              activeStreamRoomId = null
+            }
+            // Start background polling; the placeholder UI is set by handleUpgradeToAsync
+            handleUpgradeToAsync(capturedRoomId, taskId, userContent)
           },
         },
         { signal: abortController.signal }
@@ -602,8 +671,8 @@ export default function HelpdeskPage() {
         setStreamingContent("")
         setStreamingThinking("")
       }
-      activeStreamRoomRef.current = null
-      abortByRoomRef.current.delete(capturedRoomId)
+      activeStreamRoomId = null
+      roomAbortCache.delete(capturedRoomId)
     }
   }
 
@@ -619,7 +688,7 @@ export default function HelpdeskPage() {
       if (res.ok) {
         const data = await res.json()
         // Use THIS room's turns from ref
-        const currentTurns = turnsByRoomRef.current.get(roomId) || []
+        const currentTurns = roomTurnsCache.get(roomId) || []
         const updated = [
           ...currentTurns,
           {
@@ -630,7 +699,7 @@ export default function HelpdeskPage() {
             suggestedDepartment: data.suggestedDepartment,
           },
         ]
-        turnsByRoomRef.current.set(roomId, updated)
+        roomTurnsCache.set(roomId, updated)
         persistMessages(roomId, updated)
         if (activeRoomId === roomId) setTurns(updated)
       } else {
@@ -646,13 +715,95 @@ export default function HelpdeskPage() {
     }
   }
 
+  // ── Upgrade to async (called when backend detects complex task) ──
+
+  async function handleUpgradeToAsync(
+    capturedRoomId: string,
+    taskId: string,
+    userContent: string
+  ) {
+    const roomTurns = roomTurnsCache.get(capturedRoomId) || []
+
+    // Add placeholder turn showing background processing
+    const turnsWithPlaceholder = [
+      ...roomTurns,
+      {
+        role: "assistant" as const,
+        content: "📥 **已自動轉入背景處理** — 正在為您查閱知識庫 / 執行工單流程，您可以先切換到其他聊天室，完成後將自動為您呈現結果。",
+        needsEscalation: false,
+      },
+    ]
+    roomTurnsCache.set(capturedRoomId, turnsWithPlaceholder)
+    persistMessages(capturedRoomId, turnsWithPlaceholder)
+
+    if (activeRoomId === capturedRoomId) {
+      setTurns(turnsWithPlaceholder)
+      setLoading(false)
+      setStreamingContent("")
+      setStreamingThinking("")
+      setActiveToolCalls([])
+    }
+
+    const streamState = getRoomStream(capturedRoomId)
+    streamState.loading = false
+
+    setSidebarRefreshKey((k) => k + 1)
+
+    // Poll for result in background
+    try {
+      const result = await waitForTaskResult(taskId, 120000, 1500)
+
+      if (result.status === "completed" && result.result) {
+        const answer = result.result.answer || "No response."
+
+        const currentTurns = roomTurnsCache.get(capturedRoomId) || []
+        // Replace the placeholder with the actual answer
+        const withoutPlaceholder = currentTurns.filter(
+          (t) => !t.content.startsWith("📥 **已自動轉入背景處理**")
+        )
+        const updated = [
+          ...withoutPlaceholder,
+          {
+            role: "assistant" as const,
+            content: answer,
+            thinking: result.result.thinking || undefined,
+            sources: result.result.sources,
+            needsEscalation: result.result.needsEscalation,
+            suggestedDepartment: result.result.suggestedDepartment,
+          },
+        ]
+        roomTurnsCache.set(capturedRoomId, updated)
+        persistMessages(capturedRoomId, updated)
+
+        if (activeRoomId === capturedRoomId) {
+          setTurns(updated)
+        }
+        setSidebarRefreshKey((k) => k + 1)
+      } else {
+        throw new Error(result.error || "Background processing failed")
+      }
+    } catch (err) {
+      const errorMsg = (err as Error).message || "Background processing failed"
+      const currentTurns = roomTurnsCache.get(capturedRoomId) || []
+      const withoutPlaceholder = currentTurns.filter(
+        (t) => !t.content.startsWith("📥 **已自動轉入背景處理**")
+      )
+      const updated = [
+        ...withoutPlaceholder,
+        { role: "assistant" as const, content: `Sorry, something went wrong: ${errorMsg}` },
+      ]
+      roomTurnsCache.set(capturedRoomId, updated)
+      if (activeRoomId === capturedRoomId) setTurns(updated)
+    }
+  }
+
   // ── Suggested questions for current department ───────────────
 
   const suggestions =
     SUGGESTED_QUESTIONS[department] || SUGGESTED_QUESTIONS.GENERAL
 
   const conversationTitle = activeRoomId
-    ? turnsByRoomRef.current.get(activeRoomId)?.[0]?.content?.slice(0, 60) ||
+    ? roomTurnsCache.get(activeRoomId)?.[0]?.content?.slice(0, 60) ||
       "Chat"
     : null
 

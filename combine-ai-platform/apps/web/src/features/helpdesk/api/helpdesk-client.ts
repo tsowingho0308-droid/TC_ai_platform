@@ -44,6 +44,8 @@ export interface StreamCallbacks {
     title: string
     detail?: string
   }) => void
+  /** Fired when the backend auto-upgrades a complex request to async processing */
+  onUpgradeToAsync?: (taskId: string, conversationId: string) => void
 }
 
 // ── Non-streaming Chat ───────────────────────────────────────────
@@ -157,7 +159,92 @@ export async function chatStream(
         case "error":
           callbacks.onError?.((parsed.detail as string) || "Unknown error")
           break
+        case "upgrade_to_async":
+          callbacks.onUpgradeToAsync?.(
+            (parsed.taskId as string) || "",
+            (parsed.conversationId as string) || ""
+          )
+          break
       }
     }
   }
+}
+
+// ── Async Chat (Redis queue + Python worker) ─────────────────────
+// Returns immediately with taskId; caller polls for result
+
+export interface AsyncChatResponse {
+  taskId: string
+  conversationId: string
+  status: "queued"
+  message: string
+}
+
+export interface PollStatusResponse {
+  status: "queued" | "processing" | "completed" | "error" | "expired"
+  result?: ChatResponse & { thinking?: string }
+  error?: string
+}
+
+export async function chatAsync(req: ChatRequest): Promise<AsyncChatResponse> {
+  const res = await fetch("/api/helpdesk/agent?action=chat-async", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  })
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "Request failed" }))
+    throw new Error(err.error || `Chat async failed: ${res.status}`)
+  }
+
+  return res.json()
+}
+
+/**
+ * Poll for the result of an async chat task.
+ * Returns null if the task is still pending, the result when completed.
+ * Throws on error status.
+ */
+export async function pollTaskStatus(
+  taskId: string
+): Promise<PollStatusResponse> {
+  const res = await fetch(`/api/helpdesk/agent/status/${encodeURIComponent(taskId)}`)
+
+  if (!res.ok) {
+    if (res.status === 404) {
+      return { status: "expired" }
+    }
+    const err = await res.json().catch(() => ({ error: "Poll failed" }))
+    throw new Error(err.error || `Poll failed: ${res.status}`)
+  }
+
+  return res.json()
+}
+
+/**
+ * Poll repeatedly until the task completes or times out.
+ * @param taskId - The task ID to poll
+ * @param maxWaitMs - Maximum time to wait (default 60s)
+ * @param intervalMs - Poll interval (default 1000ms)
+ */
+export async function waitForTaskResult(
+  taskId: string,
+  maxWaitMs = 60000,
+  intervalMs = 1000
+): Promise<PollStatusResponse> {
+  const start = Date.now()
+
+  while (Date.now() - start < maxWaitMs) {
+    const status = await pollTaskStatus(taskId)
+
+    if (status.status === "completed" || status.status === "error" || status.status === "expired") {
+      return status
+    }
+
+    // Wait before next poll
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+  }
+
+  return { status: "expired", error: "Task timed out" }
 }

@@ -21,5 +21,22 @@ services:
     ports:
       - "6379:6379"
 
+  python-worker:
+    build:
+      context: ./apps/python-worker
+      dockerfile: Dockerfile
+    container_name: combine-ai-python-worker
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      REDIS_URL: "redis://redis:6379"
+      DASHSCOPE_BASE_URL: "${DASHSCOPE_BASE_URL:-https://dashscope-intl.aliyuncs.com/compatible-mode/v1}"
+      DASHSCOPE_API_KEY: "${DASHSCOPE_API_KEY}"
+      DASHSCOPE_DEFAULT_MODEL: "${DASHSCOPE_DEFAULT_MODEL:-qwen3.6-plus}"
+      NODE_INTERNAL_API_URL: "http://host.docker.internal:3000/api/helpdesk/internal"
+      INTERNAL_API_SECRET: "${INTERNAL_API_SECRET:-dev-secret-change-me}"
+      MAX_WORKERS: "3"
+
 volumes:
   pgdata:
