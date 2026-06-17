@@ -1024,14 +1024,9 @@ ${suggestions.map((s) => `[Doc] ${s.title} (${s.department}, ${Math.round((s.sim
                 }
 
                 // ── Tool calls detected → auto-upgrade to async ──
-                // Append assistant message with tool calls
-                currentMessages.push({
-                  role: "assistant",
-                  content: accumulatedContent || "",
-                  toolCalls: result.toolCalls,
-                } as ChatMessage)
-
-                // Generate task ID and push to Redis
+                // Push messages BEFORE the incomplete tool-call turn.
+                // The Python worker will re-do the AI call from scratch
+                // with a clean tool-calling loop — no orphaned tool calls.
                 const taskId = `task_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 
                 await pushTask({
@@ -1041,7 +1036,7 @@ ${suggestions.map((s) => `[Doc] ${s.title} (${s.department}, ${Math.round((s.sim
                   userId: session.sub,
                   department: streamDept || "GENERAL",
                   model: (streamModel as string) || DEFAULT_MODELS.helpdesk,
-                  messages: currentMessages,
+                  messages: currentMessages, // pre-tool-call state — clean
                   tools: streamTools.length > 0 ? streamTools : undefined,
                   systemPrompt,
                   createdAt: new Date().toISOString(),
