@@ -1,9 +1,10 @@
 // Shared RAG search helper for Helpdesk Agent
-// Supports optional query expansion for cross-language retrieval.
+// Supports optional query expansion, temporal decay, and result refinement.
 
 import { prisma } from "@/lib/server/prisma"
 import { generateEmbedding } from "@combine-ai/ai-provider/server"
 import { COL, KB_JOIN_CHAIN, KB_VECTOR_SELECT, KB_WORKSPACE_WHERE } from "@/lib/server/db-columns"
+import { refineSearchResults } from "@/lib/server/rag-refiner"
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -95,6 +96,9 @@ async function runVectorSearch(
       ${KB_VECTOR_SELECT},
       (1 - (kc."${C_COL.embedding}" <=> ${embLiteral}::vector))
         * CASE WHEN ka."${A_COL.documentType}" IN ('PLAYBOOK', 'PROCESS_MAP') THEN 0.85 ELSE 1.0 END
+        * POWER(0.5, GREATEST(0,
+            EXTRACT(DAY FROM NOW() - ka."${A_COL.createdAt}") / 365.0
+          ))
         as similarity
     ${KB_JOIN_CHAIN}
     WHERE ${KB_WORKSPACE_WHERE} = '${workspaceId}'${deptFilter}
@@ -520,10 +524,19 @@ export async function searchKnowledgeBase(
           .slice(0, topK)
           .map(({ bestSimilarity: _, ...rest }) => rest)
 
-        const tierResult = computeTier(rawResults, minSimilarity, suggestionThreshold, options.dateFilter, query)
-        const topScores = rawResults.slice(0, 3).map((a) => (a.similarity ?? 0).toFixed(2))
+        // Apply RAG refinement: dedup + temporal boost + token budget
+        // Reduces 15+ raw chunks → ~4-6 high-quality, non-redundant chunks
+        const { refinedChunks } = refineSearchResults(rawResults, {
+          maxTokens: 3000,
+          articleDedup: true,
+          contentDedup: true,
+          temporalBoost: true,
+        })
+
+        const tierResult = computeTier(refinedChunks, minSimilarity, suggestionThreshold, options.dateFilter, query)
+        const topScores = refinedChunks.slice(0, 3).map((a) => (a.similarity ?? 0).toFixed(2))
         console.log(
-          `[RAG Expanded Search] query="${query.slice(0, 80)}" | variants=${expanded.variants.length} | top scores: [${topScores.join(", ")}] | tier=${tierResult.tier} | matched=${tierResult.articles.length} | suggestions=${tierResult.suggestions.length}`
+          `[RAG Expanded Search] query="${query.slice(0, 80)}" | variants=${expanded.variants.length} | raw=${rawResults.length} → refined=${refinedChunks.length} | top scores: [${topScores.join(", ")}] | tier=${tierResult.tier}`
         )
         return { ...tierResult, searchMethod: "expanded" }
       }

@@ -2,6 +2,73 @@ import { prisma } from "./prisma"
 import { chunkText } from "@combine-ai/ai-provider"
 import { generateEmbedding } from "@combine-ai/ai-provider/server"
 
+// ══════════════════════════════════════════════════════════════════════
+// Table-Aware Chunking
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * Detect whether text is tabular (CSV/TSV-like structure).
+ * Returns the delimiter if tabular, null otherwise.
+ */
+function detectTabular(text: string): string | null {
+  const lines = text.split("\n").filter((l) => l.trim().length > 0)
+  if (lines.length < 3) return null
+
+  // Try common delimiters
+  for (const delim of [",", "\t", "|"]) {
+    const counts = lines.map((l) => (l.match(new RegExp(`\\${delim}`, "g")) || []).length)
+    const mode = getMode(counts)
+    if (mode === undefined || mode < 1) continue
+
+    // >80% of lines have the same number of delimiters → tabular
+    const consistent = counts.filter((c) => c === mode).length
+    if (consistent > lines.length * 0.8) return delim
+  }
+  return null
+}
+
+function getMode(arr: number[]): number | undefined {
+  const freq = new Map<number, number>()
+  for (const n of arr) freq.set(n, (freq.get(n) || 0) + 1)
+  let best: number | undefined, bestCount = 0
+  for (const [n, c] of freq) {
+    if (c > bestCount) { best = n; bestCount = c }
+  }
+  return best
+}
+
+/**
+ * Convert a raw CSV/TSV text into self-describing chunks.
+ * Each chunk includes the header row + 1 data row, so the embedding
+ * captures both the column name AND the value in one semantic unit.
+ *
+ * Before: "HR,500000,200000,150000" (meaningless numbers)
+ * After:  "部門: HR | 差旅費: 500000 | 加班費: 200000 | 設備費: 150000"
+ */
+function structureTableChunks(text: string, delimiter: string): string[] {
+  const lines = text.split("\n").filter((l) => l.trim().length > 0)
+  if (lines.length < 2) return []
+
+  const headers = lines[0].split(delimiter).map((h) => h.trim().replace(/^["']|["']$/g, ""))
+  const chunks: string[] = []
+
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split(delimiter).map((c) => c.trim().replace(/^["']|["']$/g, ""))
+    const rowPairs = headers
+      .map((header, j) => {
+        const val = (cells[j] || "").trim()
+        if (!val) return ""
+        return `${header}: ${val}`
+      })
+      .filter((p) => p.length > 0)
+    if (rowPairs.length > 0) {
+      chunks.push(rowPairs.join(" | "))
+    }
+  }
+
+  return chunks
+}
+
 /**
  * Extract text from a file buffer based on MIME type.
  * Supported formats: PDF, DOCX, XLSX, TXT
@@ -101,8 +168,15 @@ export async function processDocument(
     throw new Error("No text content could be extracted from the file")
   }
 
-  // 2. Chunk the text
-  const chunks = chunkText(text)
+  // 2. Chunk the text — table-aware if tabular data is detected
+  const tableDelim = detectTabular(text)
+  const chunks = tableDelim
+    ? structureTableChunks(text, tableDelim)
+    : chunkText(text)
+
+  console.log(
+    `[processDocument] ${tableDelim ? "table" : "text"} mode: ${chunks.length} chunks from "${fileName}"`
+  )
 
   // 3. Create the KnowledgeArticle
   const fileExt = fileName.split(".").pop()?.toLowerCase()
