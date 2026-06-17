@@ -218,6 +218,13 @@ export default function HelpdeskPage() {
   const chatEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const firstQuestionRef = useRef(false)
+  // Always-current room ID — avoids stale closure in SSE/async callbacks
+  const activeRoomIdRef = useRef<string | null>(null)
+
+  // Keep ref in sync with state — refs are never stale in closures
+  useEffect(() => {
+    activeRoomIdRef.current = activeRoomId
+  }, [activeRoomId])
 
   // ── Auto-scroll ──────────────────────────────────────────────
 
@@ -592,7 +599,7 @@ export default function HelpdeskPage() {
     roomAbortCache.set(capturedRoomId, abortController)
 
     // Check if room still exists (hasn't been deleted)
-    const roomExists = () => roomTurnsCache.has(capturedRoomId) || activeRoomId === capturedRoomId
+    const roomExists = () => roomTurnsCache.has(capturedRoomId) || activeRoomIdRef.current === capturedRoomId
 
     // Track streaming state locally
     let latestContent = ""
@@ -616,20 +623,20 @@ export default function HelpdeskPage() {
             if (!roomExists()) return // room deleted — discard
             latestThinking += text
             streamState.streamThinking = latestThinking
-            if (activeRoomId === capturedRoomId) setStreamingThinking(latestThinking)
+            if (activeRoomIdRef.current === capturedRoomId) setStreamingThinking(latestThinking)
           },
 
           onToken: (text) => {
             if (!roomExists()) return
             latestContent += text
             streamState.streamContent = latestContent
-            if (activeRoomId === capturedRoomId) setStreamingContent(latestContent)
+            if (activeRoomIdRef.current === capturedRoomId) setStreamingContent(latestContent)
           },
 
           onToolUse: (name, _args) => {
             if (!roomExists()) return
             streamState.toolCalls = [...streamState.toolCalls, { name, status: "running" }]
-            if (activeRoomId === capturedRoomId) setActiveToolCalls(streamState.toolCalls)
+            if (activeRoomIdRef.current === capturedRoomId) setActiveToolCalls(streamState.toolCalls)
           },
 
           onToolResult: (name, summary) => {
@@ -639,7 +646,7 @@ export default function HelpdeskPage() {
                 ? { ...tc, status: "complete" as const, summary }
                 : tc
             )
-            if (activeRoomId === capturedRoomId) setActiveToolCalls(streamState.toolCalls)
+            if (activeRoomIdRef.current === capturedRoomId) setActiveToolCalls(streamState.toolCalls)
           },
 
           onResult: (result, thinkingProcess) => {
@@ -666,7 +673,7 @@ export default function HelpdeskPage() {
             cacheTurnsSet(capturedRoomId, updated)
             persistMessages(capturedRoomId, updated)
 
-            if (activeRoomId === capturedRoomId) {
+            if (activeRoomIdRef.current === capturedRoomId) {
               setTurns(updated)
               setLoading(false)
             }
@@ -677,7 +684,7 @@ export default function HelpdeskPage() {
           onError: (detail) => {
             if (!roomExists()) return
             streamState.loading = false
-            if (activeRoomId === capturedRoomId) {
+            if (activeRoomIdRef.current === capturedRoomId) {
               setError(detail)
               setLoading(false)
             }
@@ -687,7 +694,7 @@ export default function HelpdeskPage() {
               { role: "assistant" as const, content: `Sorry, something went wrong: ${detail}` },
             ]
             cacheTurnsSet(capturedRoomId, updated)
-            if (activeRoomId === capturedRoomId) setTurns(updated)
+            if (activeRoomIdRef.current === capturedRoomId) setTurns(updated)
           },
 
           onUpgradeToAsync: (taskId) => {
@@ -706,11 +713,11 @@ export default function HelpdeskPage() {
     } catch (err) {
       if ((err as Error).name === "AbortError") return // stream aborted by room deletion
       streamState.loading = false
-      if (activeRoomId === capturedRoomId) setLoading(false)
+      if (activeRoomIdRef.current === capturedRoomId) setLoading(false)
       await handleAskFallback(capturedRoomId, q)
     } finally {
       streamState.loading = false
-      if (activeRoomId === capturedRoomId) {
+      if (activeRoomIdRef.current === capturedRoomId) {
         setLoading(false)
         setStreamingContent("")
         setStreamingThinking("")
@@ -780,7 +787,7 @@ export default function HelpdeskPage() {
     cacheTurnsSet(capturedRoomId, turnsWithPlaceholder)
     persistMessages(capturedRoomId, turnsWithPlaceholder)
 
-    if (activeRoomId === capturedRoomId) {
+    if (activeRoomIdRef.current === capturedRoomId) {
       setTurns(turnsWithPlaceholder)
       setLoading(false)
       setStreamingContent("")
@@ -819,7 +826,7 @@ export default function HelpdeskPage() {
         cacheTurnsSet(capturedRoomId, updated)
         persistMessages(capturedRoomId, updated)
 
-        if (activeRoomId === capturedRoomId) {
+        if (activeRoomIdRef.current === capturedRoomId) {
           setTurns(updated)
         }
         setSidebarRefreshKey((k) => k + 1)
@@ -837,7 +844,7 @@ export default function HelpdeskPage() {
         { role: "assistant" as const, content: `Sorry, something went wrong: ${errorMsg}` },
       ]
       cacheTurnsSet(capturedRoomId, updated)
-      if (activeRoomId === capturedRoomId) setTurns(updated)
+      if (activeRoomIdRef.current === capturedRoomId) setTurns(updated)
     }
   }
 
