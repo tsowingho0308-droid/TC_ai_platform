@@ -1,7 +1,6 @@
 "use client"
 
 import { useState, useRef, useEffect, useCallback, useMemo, Suspense } from "react"
-import dynamic from "next/dynamic"
 import { useSearchParams } from "next/navigation"
 import Link from "next/link"
 import {
@@ -35,18 +34,20 @@ import {
 } from "@/features/report/components/report-upload-queue"
 import type { ExtractionRow } from "@/features/report/components/report-extraction-table"
 import type { PreviewDocument } from "@/features/report/components/pdf-highlight-viewer"
+import { ReportDocumentPreview } from "@/features/report/components/report-document-preview"
+import {
+  fileNeedsBlobUrl,
+  isPreviewableFile,
+  previewKindFromFile,
+  type ReportPreviewKind,
+} from "@/features/report/lib/report-preview-kind"
 import { buildReportDraftNote } from "@/features/report/lib/report-draft-note"
-const PdfHighlightViewer = dynamic(
-  () => import("@/features/report/components/pdf-highlight-viewer"),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="flex flex-1 items-center justify-center min-h-[300px] bg-muted/20">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground/50" />
-      </div>
-    ),
-  }
-)
+import {
+  clearReportAnalyzeWorkspace,
+  getReportAnalyzeWorkspace,
+  REPORT_NEW_ANALYZE_EVENT,
+} from "@/features/report/lib/report-workspace-store"
+import { useReportAnalyzeWorkspaceSync } from "@/features/report/hooks/use-report-analyze-workspace-sync"
 
 interface TableRow extends ExtractionRow {}
 
@@ -100,47 +101,86 @@ function ReportPageContent() {
   const emailSubjectParam = searchParams.get("emailSubject")
   const attachmentIdParam = searchParams.get("attachmentId")
   const attachmentIdsParam = searchParams.get("attachmentIds")
-  const [emailSource, setEmailSource] = useState<EmailSource | null>(null)
+  const restoredWorkspace = getReportAnalyzeWorkspace()
+  const [emailSource, setEmailSource] = useState<EmailSource | null>(
+    restoredWorkspace?.emailSource ?? null
+  )
   const [loadingEmail, setLoadingEmail] = useState(false)
-  const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<Set<string>>(new Set())
+  const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<Set<string>>(
+    () => new Set(restoredWorkspace?.selectedAttachmentIds ?? [])
+  )
   const [loadingEmailExtract, setLoadingEmailExtract] = useState(false)
-  const [extractedRows, setExtractedRows] = useState<TableRow[]>([])
-  const [kbHighlightPhrases, setKbHighlightPhrases] = useState<string[]>([])
-  const [highlightEnabled, setHighlightEnabled] = useState(false)
-  const [activePreviewId, setActivePreviewId] = useState<string | null>(null)
+  const [extractedRows, setExtractedRows] = useState<TableRow[]>(
+    restoredWorkspace?.extractedRows ?? []
+  )
+  const [kbHighlightPhrases, setKbHighlightPhrases] = useState<string[]>(
+    restoredWorkspace?.kbHighlightPhrases ?? []
+  )
+  const [highlightEnabled, setHighlightEnabled] = useState(
+    restoredWorkspace?.highlightEnabled ?? false
+  )
+  const [activePreviewId, setActivePreviewId] = useState<string | null>(
+    restoredWorkspace?.activePreviewId ?? null
+  )
   const [focusTarget, setFocusTarget] = useState<{
     page?: number
     field: string
     value: string
-  } | null>(null)
-  const [selectedTableRowIndex, setSelectedTableRowIndex] = useState<number | null>(null)
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
-  const [pendingFiles, setPendingFiles] = useState<PendingUploadFile[]>([])
-  const [selectedUploadFileIds, setSelectedUploadFileIds] = useState<Set<string>>(new Set())
+  } | null>(restoredWorkspace?.focusTarget ?? null)
+  const [selectedTableRowIndex, setSelectedTableRowIndex] = useState<number | null>(
+    restoredWorkspace?.selectedTableRowIndex ?? null
+  )
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(
+    restoredWorkspace?.activeSessionId ?? null
+  )
+  const [pendingFiles, setPendingFiles] = useState<PendingUploadFile[]>(
+    restoredWorkspace?.pendingFiles ?? []
+  )
+  const [selectedUploadFileIds, setSelectedUploadFileIds] = useState<Set<string>>(
+    () => new Set(restoredWorkspace?.selectedUploadFileIds ?? [])
+  )
   const [loadingBatchExtract, setLoadingBatchExtract] = useState(false)
   const [savingRows, setSavingRows] = useState(false)
-  const [reportSummary, setReportSummary] = useState<ReportSummary | null>(null)
+  const [reportSummary, setReportSummary] = useState<ReportSummary | null>(
+    restoredWorkspace?.reportSummary ?? null
+  )
   const [extracting, setExtracting] = useState(false)
-  const [model, setModel] = useState(DEFAULT_MODELS.report)
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
-  const [previewFile, setPreviewFile] = useState<File | null>(null)
+  const [model, setModel] = useState(restoredWorkspace?.model ?? DEFAULT_MODELS.report)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(
+    restoredWorkspace?.previewUrl ?? null
+  )
+  const [previewFile, setPreviewFile] = useState<File | null>(
+    restoredWorkspace?.previewFile ?? null
+  )
   const [traceEvents, setTraceEvents] = useState<TraceEvent[]>([])
   const [thinkingText, setThinkingText] = useState("")
-  const [error, setError] = useState<string | null>(null)
-  const [mockWarning, setMockWarning] = useState<string | null>(null)
-  const [documentType, setDocumentType] = useState<string | null>(null)
-  const [confidence, setConfidence] = useState<number | null>(null)
+  const [error, setError] = useState<string | null>(restoredWorkspace?.error ?? null)
+  const [mockWarning, setMockWarning] = useState<string | null>(
+    restoredWorkspace?.mockWarning ?? null
+  )
+  const [documentType, setDocumentType] = useState<string | null>(
+    restoredWorkspace?.documentType ?? null
+  )
+  const [confidence, setConfidence] = useState<number | null>(
+    restoredWorkspace?.confidence ?? null
+  )
   const [streamingStatus, setStreamingStatus] = useState<
     "idle" | "connecting" | "thinking" | "highlighting" | "done" | "error"
-  >("idle")
+  >(restoredWorkspace?.streamingStatus ?? "idle")
   const [editingRowIndex, setEditingRowIndex] = useState<number | null>(null)
   const [editingField, setEditingField] = useState("")
   const [editingValue, setEditingValue] = useState("")
-  const [refineInstruction, setRefineInstruction] = useState("")
+  const [refineInstruction, setRefineInstruction] = useState(
+    restoredWorkspace?.refineInstruction ?? ""
+  )
   const [refining, setRefining] = useState(false)
-  const [rowsManuallyEdited, setRowsManuallyEdited] = useState(false)
+  const [rowsManuallyEdited, setRowsManuallyEdited] = useState(
+    restoredWorkspace?.rowsManuallyEdited ?? false
+  )
   const [refreshingSummary, setRefreshingSummary] = useState(false)
-  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [sessionId, setSessionId] = useState<string | null>(
+    restoredWorkspace?.sessionId ?? null
+  )
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const extractMergeRef = useRef<{ appendRows: boolean; sourceLabel?: string }>({
@@ -148,6 +188,8 @@ function ReportPageContent() {
   })
   const rowsSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const traceSeqRef = useRef(0)
+  const previewUrlRef = useRef<string | null>(previewUrl)
+  previewUrlRef.current = previewUrl
 
   function buildSummaryDraftNote(summary: ReportSummary): string {
     return buildReportDraftNote(summary)
@@ -221,10 +263,7 @@ function ReportPageContent() {
   }, [extractedRows, activeSessionId, persistSessionRows])
 
   useEffect(() => {
-    if (!fromEmailId) {
-      setEmailSource(null)
-      return
-    }
+    if (!fromEmailId) return
 
     setLoadingEmail(true)
     fetch(`/api/email/mailbox?conversationId=${encodeURIComponent(fromEmailId)}`)
@@ -304,9 +343,7 @@ function ReportPageContent() {
     const file = new File([blob], att.fileName, { type: mimeType })
 
     if (!options?.skipPreviewReset) {
-      if (previewUrl) URL.revokeObjectURL(previewUrl)
-      setPreviewUrl(URL.createObjectURL(file))
-      setPreviewFile(file)
+      setPreviewFromFile(file)
     }
 
     extractMergeRef.current = {
@@ -470,6 +507,13 @@ function ReportPageContent() {
     setSelectedAttachmentIds(new Set())
   }
 
+  function setPreviewFromFile(file: File) {
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    const kind = previewKindFromFile(file)
+    setPreviewUrl(fileNeedsBlobUrl(kind) ? URL.createObjectURL(file) : null)
+    setPreviewFile(file)
+  }
+
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? [])
     if (files.length === 0) return
@@ -496,12 +540,52 @@ function ReportPageContent() {
     })
 
     const firstFile = nextEntries[0].file
-    if (previewUrl) URL.revokeObjectURL(previewUrl)
-    setPreviewUrl(URL.createObjectURL(firstFile))
-    setPreviewFile(firstFile)
+    setPreviewFromFile(firstFile)
 
     if (fileInputRef.current) fileInputRef.current.value = ""
   }
+
+  const resetForNewAnalyze = useCallback(() => {
+    if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current)
+    clearReportAnalyzeWorkspace()
+    abortRef.current?.abort()
+    setEmailSource(null)
+    setSelectedAttachmentIds(new Set())
+    setPreviewUrl(null)
+    setPreviewFile(null)
+    setPendingFiles([])
+    setSelectedUploadFileIds(new Set())
+    setActiveSessionId(null)
+    setSessionId(null)
+    setActivePreviewId(null)
+    setHighlightEnabled(false)
+    setEditingRowIndex(null)
+    setEditingField("")
+    setEditingValue("")
+    setRefineInstruction("")
+    setModel(DEFAULT_MODELS.report)
+    setExtracting(false)
+    setStreamingStatus("idle")
+    setTraceEvents([])
+    traceSeqRef.current = 0
+    setThinkingText("")
+    setError(null)
+    setMockWarning(null)
+    setDocumentType(null)
+    setConfidence(null)
+    setReportSummary(null)
+    setExtractedRows([])
+    setKbHighlightPhrases([])
+    setFocusTarget(null)
+    setSelectedTableRowIndex(null)
+    setRowsManuallyEdited(false)
+  }, [])
+
+  useEffect(() => {
+    const handler = () => resetForNewAnalyze()
+    window.addEventListener(REPORT_NEW_ANALYZE_EVENT, handler)
+    return () => window.removeEventListener(REPORT_NEW_ANALYZE_EVENT, handler)
+  }, [resetForNewAnalyze])
 
   function clearUploadedFiles() {
     if (previewUrl) URL.revokeObjectURL(previewUrl)
@@ -509,6 +593,7 @@ function ReportPageContent() {
     setPreviewFile(null)
     setPendingFiles([])
     setSelectedUploadFileIds(new Set())
+    clearReportAnalyzeWorkspace()
     resetAnalysisState()
   }
 
@@ -571,9 +656,7 @@ function ReportPageContent() {
       for (let i = 0; i < selected.length; i++) {
         const entry = selected[i]
         if (i === 0) {
-          if (previewUrl) URL.revokeObjectURL(previewUrl)
-          setPreviewUrl(URL.createObjectURL(entry.file))
-          setPreviewFile(entry.file)
+          setPreviewFromFile(entry.file)
         }
         extractMergeRef.current = {
           appendRows: i > 0,
@@ -601,40 +684,73 @@ function ReportPageContent() {
     })
   }, [])
 
-  const pdfPreviewDocuments = useMemo((): PreviewDocument[] => {
+  interface PreviewDocumentEntry {
+    id: string
+    name: string
+    url: string | null
+    previewKind: ReportPreviewKind
+    mimeType: string
+    file: File
+  }
+
+  const previewDocuments = useMemo((): PreviewDocumentEntry[] => {
     return pendingFiles
-      .filter((p) => p.file.type === "application/pdf")
-      .map((p) => ({
-        id: p.id,
-        name: p.file.name,
-        url: URL.createObjectURL(p.file),
-      }))
+      .filter((p) => isPreviewableFile(p.file))
+      .map((p) => {
+        const previewKind = previewKindFromFile(p.file)
+        return {
+          id: p.id,
+          name: p.file.name,
+          url: fileNeedsBlobUrl(previewKind) ? URL.createObjectURL(p.file) : null,
+          previewKind,
+          mimeType: p.file.type,
+          file: p.file,
+        }
+      })
   }, [pendingFiles])
+
+  const pdfPreviewDocuments = useMemo((): PreviewDocument[] => {
+    return previewDocuments
+      .filter((d) => d.previewKind === "pdf" && d.url)
+      .map((d) => ({ id: d.id, name: d.name, url: d.url! }))
+  }, [previewDocuments])
 
   useEffect(() => {
     return () => {
-      pdfPreviewDocuments.forEach((d) => URL.revokeObjectURL(d.url))
+      previewDocuments.forEach((d) => {
+        if (d.url) URL.revokeObjectURL(d.url)
+      })
     }
-  }, [pdfPreviewDocuments])
+  }, [previewDocuments])
 
   useEffect(() => {
-    if (pdfPreviewDocuments.length === 0) {
+    if (previewDocuments.length === 0) {
       setActivePreviewId(null)
       return
     }
-    if (!activePreviewId || !pdfPreviewDocuments.some((d) => d.id === activePreviewId)) {
-      setActivePreviewId(pdfPreviewDocuments[0].id)
+    if (!activePreviewId || !previewDocuments.some((d) => d.id === activePreviewId)) {
+      setActivePreviewId(previewDocuments[0].id)
     }
-  }, [pdfPreviewDocuments, activePreviewId])
+  }, [previewDocuments, activePreviewId])
 
-  const activePdfDoc =
-    pdfPreviewDocuments.find((d) => d.id === activePreviewId) ?? pdfPreviewDocuments[0]
+  const activePreviewDoc =
+    previewDocuments.find((d) => d.id === activePreviewId) ?? previewDocuments[0]
+
+  const viewerPreviewKind: ReportPreviewKind | null =
+    activePreviewDoc?.previewKind ??
+    (previewFile ? previewKindFromFile(previewFile) : null)
 
   const viewerFileUrl =
-    activePdfDoc?.url ??
-    (previewFile?.type === "application/pdf" ? previewUrl : null)
+    activePreviewDoc?.url ??
+    (previewFile && viewerPreviewKind && fileNeedsBlobUrl(viewerPreviewKind)
+      ? previewUrl
+      : null)
 
-  const viewerFileName = activePdfDoc?.name ?? previewFile?.name ?? ""
+  const viewerFileName = activePreviewDoc?.name ?? previewFile?.name ?? ""
+  const viewerMimeType = activePreviewDoc?.mimeType ?? previewFile?.type ?? null
+  const viewerLocalFile = activePreviewDoc?.file ?? previewFile
+  const hasDocumentPreview = viewerPreviewKind !== null && viewerPreviewKind !== "other"
+  const isPdfRowHighlight = viewerPreviewKind === "pdf" && Boolean(viewerFileUrl)
 
   async function extractFromFile(file: File, sessionId?: string | null) {
     setExtracting(true)
@@ -912,14 +1028,23 @@ function ReportPageContent() {
     }
   }
 
-  async function exportSummary() {
+  async function downloadExportBlob(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  async function exportWord() {
     if (!reportSummary) return
     try {
       const res = await fetch("/api/report/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          format: "md",
+          format: "docx",
           rows: extractedRows.length > 0 ? extractedRows : undefined,
           summary: reportSummary.summary,
           keyPoints: reportSummary.keyPoints,
@@ -928,21 +1053,59 @@ function ReportPageContent() {
         }),
       })
       if (!res.ok) throw new Error("Export failed")
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = `report-summary-${Date.now()}.md`
-      a.click()
-      URL.revokeObjectURL(url)
+      await downloadExportBlob(await res.blob(), `report-summary-${Date.now()}.docx`)
     } catch (err) {
-      console.error("Export error:", err)
+      console.error("Export Word error:", err)
     }
   }
 
-  const isPdfPreview = Boolean(viewerFileUrl)
+  async function exportExcel() {
+    if (extractedRows.length === 0) return
+    try {
+      const res = await fetch("/api/report/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          format: "xlsx",
+          rows: extractedRows,
+        }),
+      })
+      if (!res.ok) throw new Error("Export failed")
+      await downloadExportBlob(await res.blob(), `report-export-${Date.now()}.xlsx`)
+    } catch (err) {
+      console.error("Export Excel error:", err)
+    }
+  }
+
+  const isPdfPreview = isPdfRowHighlight
 
   const isAnalyzing = extracting || loadingBatchExtract || loadingEmailExtract
+
+  useReportAnalyzeWorkspaceSync({
+    emailSource,
+    selectedAttachmentIds: Array.from(selectedAttachmentIds),
+    extractedRows,
+    kbHighlightPhrases,
+    highlightEnabled,
+    activePreviewId,
+    focusTarget,
+    selectedTableRowIndex,
+    activeSessionId,
+    sessionId,
+    pendingFiles,
+    selectedUploadFileIds: Array.from(selectedUploadFileIds),
+    reportSummary,
+    model,
+    previewFile,
+    previewUrl,
+    documentType,
+    confidence,
+    streamingStatus,
+    refineInstruction,
+    rowsManuallyEdited,
+    error,
+    mockWarning,
+  })
 
   return (
     <div className="flex h-full">
@@ -983,12 +1146,20 @@ function ReportPageContent() {
               </span>
             )}
             <button
-              onClick={exportSummary}
+              onClick={exportWord}
               disabled={!reportSummary}
+              className="inline-flex items-center gap-2 rounded-md border bg-background px-3 py-1.5 text-sm font-medium disabled:opacity-50"
+            >
+              <Download className="h-4 w-4" />
+              Export Word (.docx)
+            </button>
+            <button
+              onClick={exportExcel}
+              disabled={extractedRows.length === 0}
               className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-50"
             >
               <Download className="h-4 w-4" />
-              Export Summary
+              Export Excel (.xlsx)
             </button>
           </div>
         </header>
@@ -1133,7 +1304,7 @@ function ReportPageContent() {
               className={cn(
                 "rounded-lg border-2 border-dashed p-6 text-center transition-colors",
                 "hover:border-primary/50 hover:bg-accent/50",
-                previewUrl ? "border-solid" : ""
+                previewFile ? "border-solid" : ""
               )}
             >
               <input
@@ -1144,9 +1315,9 @@ function ReportPageContent() {
                 onChange={handleFileUpload}
                 className="hidden"
               />
-              {previewUrl ? (
+              {previewFile ? (
                 <div className="space-y-4">
-                  {previewFile?.type.startsWith("image/") ? (
+                  {previewFile?.type.startsWith("image/") && previewUrl ? (
                     <img src={previewUrl} alt="Preview" className="mx-auto max-h-48 rounded-lg object-contain" />
                   ) : previewFile?.type === "application/pdf" ? (
                     <div className="flex h-32 flex-col items-center justify-center rounded-lg bg-muted">
@@ -1616,16 +1787,18 @@ function ReportPageContent() {
 
           </div>
 
-          {/* Right: PDF Preview — always full height */}
+          {/* Right: Document Preview — always full height */}
           <div className="flex w-1/2 flex-col overflow-hidden">
-            {isPdfPreview && viewerFileUrl ? (
-              <PdfHighlightViewer
+            {hasDocumentPreview ? (
+              <ReportDocumentPreview
+                previewKind={viewerPreviewKind}
                 fileUrl={viewerFileUrl}
                 fileName={viewerFileName}
+                mimeType={viewerMimeType}
+                localFile={viewerLocalFile}
                 documents={pdfPreviewDocuments}
                 activeDocumentId={activePreviewId ?? undefined}
                 onDocumentChange={setActivePreviewId}
-                highlights={[]}
                 highlightEnabled={highlightEnabled}
                 onHighlightEnabledChange={handleHighlightEnabledChange}
                 focusTarget={focusTarget}
@@ -1635,11 +1808,11 @@ function ReportPageContent() {
               <div className="flex h-full flex-col items-center justify-center gap-4 bg-muted/20 text-center">
                 <div className="rounded-xl border-2 border-dashed border-muted-foreground/20 p-10">
                   <FileText className="mx-auto h-14 w-14 text-muted-foreground/30" />
-                  <p className="mt-4 text-sm font-medium text-muted-foreground">PDF Preview</p>
+                  <p className="mt-4 text-sm font-medium text-muted-foreground">Document Preview</p>
                   <p className="mt-1 text-xs text-muted-foreground/60">
-                    Upload a PDF on the left to preview it here.
+                    Upload a document on the left to preview it here.
                     <br />
-                    AI key highlights (yellow) appear after analysis; click a row for blue focus.
+                    Click a table row to highlight matching text in PDFs.
                   </p>
                 </div>
               </div>

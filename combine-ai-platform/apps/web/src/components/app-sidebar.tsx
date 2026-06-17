@@ -24,6 +24,7 @@ import { FinanceSidebarContent } from "@/features/finance/components/finance-sid
 import { HelpdeskSidebarContent } from "@/features/helpdesk/components/helpdesk-sidebar-content"
 import { WorkflowSidebarContent } from "@/features/workflow/components/workflow-sidebar-content"
 import { ContextSidebarContent } from "@/features/context/components/context-sidebar-content"
+import { getReportAgentHref } from "@/features/report/lib/report-workspace-store"
 
 interface AgentNavItem {
   slug: string
@@ -95,10 +96,11 @@ export function AppSidebar() {
         <nav className="space-y-1">
           {AGENTS.map((agent) => {
             const isActive = agent.slug === activeAgent
+            const href = agent.slug === "report" ? getReportAgentHref() : agent.href
             return (
               <Link
                 key={agent.slug}
-                href={agent.href}
+                href={href}
                 className={cn(
                   "flex items-center gap-3 rounded-md px-2 py-2 text-sm font-medium transition-colors",
                   isActive

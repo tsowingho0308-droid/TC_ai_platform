@@ -1,7 +1,10 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { requireSession } from "@/lib/server/auth-helpers"
 import { prisma } from "@/lib/server/prisma"
-import { readStoredReportFile } from "@/lib/server/report-session-file"
+import {
+  findStoredReportFile,
+  previewKindFromMime,
+} from "@/lib/server/report-session-file"
 
 export const dynamic = "force-dynamic"
 
@@ -23,19 +26,25 @@ export async function GET(
     return NextResponse.json({ error: "Session not found" }, { status: 404 })
   }
 
-  const stored = readStoredReportFile(id)
+  const stored = findStoredReportFile(id)
   if (!stored) {
-    return NextResponse.json({ error: "No file stored for this session" }, { status: 404 })
+    return NextResponse.json({
+      available: false,
+      fileName: reportSession.title,
+      mimeType: null,
+      extension: null,
+      previewKind: null,
+    })
   }
 
-  const downloadName = reportSession.title || stored.storedName
+  const previewKind = previewKindFromMime(stored.mimeType, stored.extension)
 
-  return new NextResponse(new Uint8Array(stored.buffer), {
-    headers: {
-      "Content-Type": stored.mimeType,
-      "Content-Length": String(stored.buffer.length),
-      "Content-Disposition": `inline; filename="${downloadName.replace(/"/g, "")}"`,
-      "Cache-Control": "private, max-age=3600",
-    },
+  return NextResponse.json({
+    available: true,
+    fileName: reportSession.title || stored.storedName,
+    storedFileName: stored.storedName,
+    mimeType: stored.mimeType,
+    extension: stored.extension,
+    previewKind,
   })
 }
