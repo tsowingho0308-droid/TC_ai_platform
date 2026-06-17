@@ -3,7 +3,6 @@
 import { useState, useRef, useEffect, useCallback } from "react"
 import { useParams } from "next/navigation"
 import Link from "next/link"
-import dynamic from "next/dynamic"
 import {
   Download,
   Loader2,
@@ -19,17 +18,8 @@ import {
 import { cn } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
-const PdfHighlightViewer = dynamic(
-  () => import("@/features/report/components/pdf-highlight-viewer"),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="flex flex-1 items-center justify-center min-h-[300px] bg-muted/20">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground/50" />
-      </div>
-    ),
-  }
-)
+import { ReportDocumentPreview } from "@/features/report/components/report-document-preview"
+import type { ReportPreviewKind } from "@/features/report/lib/report-preview-kind"
 
 interface TableRow {
   field: string
@@ -46,6 +36,13 @@ interface ReportSummary {
     relevance: string
   }>
   searchType: "semantic" | "keyword" | "none"
+}
+
+interface FileMeta {
+  available: boolean
+  fileName: string | null
+  mimeType: string | null
+  previewKind: ReportPreviewKind | null
 }
 
 interface SessionData {
@@ -81,9 +78,7 @@ export default function ReportSessionPage() {
   const [editingValue, setEditingValue] = useState("")
   const [refineInstruction, setRefineInstruction] = useState("")
   const [refining, setRefining] = useState(false)
-  const [fileUrl, setFileUrl] = useState<string | null>(null)
-  const [fileName, setFileName] = useState<string | null>(null)
-  const [fileAvailable, setFileAvailable] = useState(false)
+  const [fileMeta, setFileMeta] = useState<FileMeta | null>(null)
   const [fileChecked, setFileChecked] = useState(false)
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -137,20 +132,37 @@ export default function ReportSessionPage() {
     loadSession()
   }, [loadSession])
 
-  // Set up file preview URL — check if file actually exists
+  // Load file metadata from disk (real extension, not session title)
   useEffect(() => {
     if (!sessionId) return
-    const url = `/api/report/sessions/${encodeURIComponent(sessionId)}/file`
-    setFileUrl(url)
-    setFileName(session?.title || "Document")
-    // Check if file is available
-    fetch(url, { method: "HEAD" })
-      .then((r) => {
-        if (r.ok) setFileAvailable(true)
+    setFileChecked(false)
+    const metaUrl = `/api/report/sessions/${encodeURIComponent(sessionId)}/file/meta`
+    fetch(metaUrl)
+      .then(async (r) => {
+        if (!r.ok) throw new Error("Failed to load file metadata")
+        const data = (await r.json()) as {
+          available?: boolean
+          fileName?: string
+          mimeType?: string | null
+          previewKind?: ReportPreviewKind | null
+        }
+        setFileMeta({
+          available: Boolean(data.available),
+          fileName: data.fileName ?? null,
+          mimeType: data.mimeType ?? null,
+          previewKind: data.previewKind ?? null,
+        })
       })
-      .catch(() => setFileAvailable(false))
+      .catch(() => {
+        setFileMeta({
+          available: false,
+          fileName: session?.title ?? null,
+          mimeType: null,
+          previewKind: null,
+        })
+      })
       .finally(() => setFileChecked(true))
-  }, [sessionId, session?.title])
+  }, [sessionId])
 
   // Poll while processing
   useEffect(() => {
@@ -338,7 +350,7 @@ export default function ReportSessionPage() {
           summary: reportSummary.summary,
           keyPoints: reportSummary.keyPoints,
           kbReferences: reportSummary.kbReferences,
-          fileName: session?.title || fileName || undefined,
+          fileName: session?.title || fileMeta?.fileName || undefined,
         }),
       })
       if (!res.ok) throw new Error("Export failed")
@@ -393,7 +405,12 @@ export default function ReportSessionPage() {
   }
 
   const isProcessing = session.status === "processing"
-  const isPdfPreview = fileAvailable && fileName?.toLowerCase().endsWith(".pdf")
+  const fileUrl = fileMeta?.available
+    ? `/api/report/sessions/${encodeURIComponent(sessionId)}/file`
+    : null
+  const viewerFileName = fileMeta?.fileName || session.title || "Document"
+  const viewerPreviewKind = fileMeta?.previewKind ?? null
+  const isPdfRowHighlight = viewerPreviewKind === "pdf" && Boolean(fileUrl)
 
   return (
     <div className="flex h-full flex-col">
@@ -523,6 +540,7 @@ export default function ReportSessionPage() {
                             : "hover:bg-muted/30 cursor-pointer"
                         )}
                         onDoubleClick={() => {
+                          if (!isPdfRowHighlight) return
                           setHighlightEnabled(true)
                           setFocusTarget({
                             page: row.page,
@@ -530,7 +548,7 @@ export default function ReportSessionPage() {
                             value: row.value,
                           })
                         }}
-                        title="Double-click to highlight in PDF"
+                        title={isPdfRowHighlight ? "Double-click to highlight in PDF" : undefined}
                       >
                         <td className="px-2 py-1.5 text-[10px] text-muted-foreground">
                           {i + 1}
@@ -803,42 +821,24 @@ export default function ReportSessionPage() {
           </div>
         </div>
 
-        {/* ── Right Panel: PDF Preview ── */}
+        {/* ── Right Panel: Document Preview ── */}
         <div className="flex w-1/2 flex-col overflow-hidden">
           {!fileChecked ? (
             <div className="flex h-full items-center justify-center bg-muted/20">
               <Loader2 className="h-6 w-6 animate-spin text-muted-foreground/50" />
             </div>
-          ) : isPdfPreview && fileUrl ? (
-            <PdfHighlightViewer
+          ) : fileMeta?.available && viewerPreviewKind ? (
+            <ReportDocumentPreview
+              previewKind={viewerPreviewKind}
               fileUrl={fileUrl}
-              fileName={fileName || "Document"}
-              highlights={[]}
+              fileName={viewerFileName}
+              mimeType={fileMeta.mimeType}
+              sessionId={sessionId}
               highlightEnabled={highlightEnabled}
               onHighlightEnabledChange={setHighlightEnabled}
               focusTarget={focusTarget}
               className="h-full"
             />
-          ) : fileAvailable && fileUrl ? (
-            <div className="flex h-full flex-col items-center justify-center gap-4 bg-muted/20 text-center">
-              <div className="rounded-xl border-2 border-dashed border-muted-foreground/20 p-10">
-                <FileText className="mx-auto h-14 w-14 text-muted-foreground/30" />
-                <p className="mt-4 text-sm font-medium text-muted-foreground">Document Available</p>
-                <p className="mt-1 text-xs text-muted-foreground/60">
-                  {fileName || "Document"} is available but not a PDF.
-                  <br />
-                  Download it to view the full content.
-                </p>
-                <a
-                  href={fileUrl}
-                  download={fileName || "document"}
-                  className="mt-3 inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground"
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  Download
-                </a>
-              </div>
-            </div>
           ) : (
             <div className="flex h-full flex-col items-center justify-center gap-4 bg-muted/20 text-center">
               <div className="rounded-xl border-2 border-dashed border-muted-foreground/20 p-10">

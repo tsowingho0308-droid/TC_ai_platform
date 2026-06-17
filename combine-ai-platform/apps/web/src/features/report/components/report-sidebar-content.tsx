@@ -5,6 +5,7 @@ import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@combine-ai/shared-ui"
 import { Plus, Trash2, Download, FileSpreadsheet, Loader2 } from "lucide-react"
+import { startNewReportAnalyze } from "@/features/report/lib/report-workspace-store"
 
 interface ReportSession {
   id: string
@@ -84,18 +85,12 @@ export function ReportSidebarContent() {
     }
   }, [fetchSessions])
 
-  const handleCreateSession = useCallback(async () => {
-    const id = `report-${Date.now()}`
-    const res = await fetch("/api/report/sessions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, title: `New Report ${new Date().toLocaleDateString()}` }),
-    })
-    if (res.ok) {
-      await fetchSessions() // refresh full list
-      router.push(`/report/${id}`)
+  const handleNewAnalyze = useCallback(() => {
+    startNewReportAnalyze()
+    if (pathname !== "/report") {
+      router.push("/report")
     }
-  }, [router])
+  }, [pathname, router])
 
   const handleDeleteSession = useCallback(async (sessionId: string) => {
     if (pendingDelete === sessionId) {
@@ -128,8 +123,13 @@ export function ReportSidebarContent() {
     <div className="px-2">
       {/* New Session */}
       <button
-        onClick={handleCreateSession}
-        className="mb-3 flex w-full items-center gap-2 rounded-md border border-dashed px-3 py-2 text-sm text-muted-foreground hover:border-primary/50 hover:bg-accent hover:text-accent-foreground"
+        onClick={handleNewAnalyze}
+        className={cn(
+          "mb-3 flex w-full items-center gap-2 rounded-md border border-dashed px-3 py-2 text-sm transition-colors",
+          pathname === "/report"
+            ? "border-primary/50 bg-accent text-accent-foreground"
+            : "text-muted-foreground hover:border-primary/50 hover:bg-accent hover:text-accent-foreground"
+        )}
       >
         <Plus className="h-4 w-4" />
         New Report Session
