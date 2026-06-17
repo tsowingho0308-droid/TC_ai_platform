@@ -586,7 +586,7 @@ export async function searchKnowledgeBase(
 
 export function formatSourcesText(
   articles: SearchResult[],
-  contentMaxChars = 1500
+  contentMaxChars = 8000
 ): string {
   if (articles.length === 0) {
     return "No relevant policy documents found in the knowledge base."

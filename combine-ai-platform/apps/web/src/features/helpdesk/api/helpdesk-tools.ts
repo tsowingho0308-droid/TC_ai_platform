@@ -348,7 +348,7 @@ export async function executeToolCall(
         results: articles.map((a) => ({
           id: a.id,
           title: a.title,
-          content: a.content.slice(0, 2000),
+          content: a.content.slice(0, 8000), // was 2000 — too short for CSV/XLSX data
           department: a.department,
           knowledgeBaseName: a.knowledgeBaseName,
           similarity: a.similarity,
