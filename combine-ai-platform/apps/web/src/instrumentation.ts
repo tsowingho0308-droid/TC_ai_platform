@@ -10,4 +10,9 @@ export async function register() {
     : cwd
 
   loadEnvConfig(monorepoRoot)
+
+  // Start the Helpdesk Timeout Reaper — recovers abandoned tasks
+  // from crashed Python workers (RPOPLPUSH backup → re-enqueue).
+  const { startReaper } = await import("@/lib/server/helpdesk-reaper")
+  startReaper()
 }

@@ -136,6 +136,11 @@ interface RoomCacheEntry {
   loading: boolean
 }
 
+// ── Cache eviction limits ──────────────────────────────────────
+const MAX_CACHED_ROOMS = 20          // max rooms to keep in memory
+const CACHE_TTL_MS = 30 * 60_000     // 30 min — unused rooms are evicted
+const roomLastAccess = new Map<string, number>()
+
 // Per-room message history (survives unmount/remount)
 const roomTurnsCache = new Map<string, QATurn[]>()
 // Per-room live streaming state
@@ -145,12 +150,47 @@ const roomAbortCache = new Map<string, AbortController>()
 // Which room currently has an active SSE stream connection
 let activeStreamRoomId: string | null = null
 
+/** Evict least-recently-used entry if cache is full. */
+function evictIfNeeded() {
+  if (roomTurnsCache.size < MAX_CACHED_ROOMS) return
+  let oldest = "", oldestTime = Infinity
+  for (const [id, time] of roomLastAccess) {
+    if (time < oldestTime) { oldest = id; oldestTime = time }
+  }
+  if (oldest) {
+    roomTurnsCache.delete(oldest)
+    roomStreamCache.delete(oldest)
+    roomAbortCache.delete(oldest)
+    roomLastAccess.delete(oldest)
+  }
+}
+
+/** Sweep entries that haven't been accessed in >30 min. */
+function cacheSweep() {
+  const now = Date.now()
+  for (const [id, time] of roomLastAccess) {
+    if (now - time > CACHE_TTL_MS) {
+      roomTurnsCache.delete(id)
+      roomStreamCache.delete(id)
+      roomAbortCache.delete(id)
+      roomLastAccess.delete(id)
+    }
+  }
+}
+
+function cacheTurnsSet(roomId: string, turns: QATurn[]) {
+  evictIfNeeded()
+  roomTurnsCache.set(roomId, turns)
+  roomLastAccess.set(roomId, Date.now())
+}
+
 function getRoomStream(roomId: string): RoomCacheEntry {
   let e = roomStreamCache.get(roomId)
   if (!e) {
     e = { streamContent: "", streamThinking: "", toolCalls: [], loading: false }
     roomStreamCache.set(roomId, e)
   }
+  roomLastAccess.set(roomId, Date.now())
   return e
 }
 
@@ -233,6 +273,8 @@ export default function HelpdeskPage() {
 
     async function loadLatestRoom() {
       try {
+        cacheSweep() // evict expired entries on mount
+
         // ══ Check global cache for rooms with active streams first ══
         for (const [roomId, stream] of roomStreamCache) {
           if (stream.loading) {
@@ -274,7 +316,7 @@ export default function HelpdeskPage() {
         const conv = detailData.conversation
         const messages = (conv?.messages as QATurn[]) || []
 
-        roomTurnsCache.set(latest.id, messages)
+        cacheTurnsSet(latest.id, messages)
         setActiveRoomId(latest.id)
         setTurns(messages)
         firstQuestionRef.current = messages.length > 0
@@ -352,10 +394,12 @@ export default function HelpdeskPage() {
     async (roomId: string) => {
       if (roomId === activeRoomId) return
 
+      cacheSweep() // evict expired entries before adding new ones
+
       // Save current turns + streaming state for old room
       if (activeRoomId) {
         if (turns.length > 0) {
-          roomTurnsCache.set(activeRoomId, turns)
+          cacheTurnsSet(activeRoomId, turns)
           persistMessages(activeRoomId, turns)
         }
         // Save streaming state (don't lose in-progress AI)
@@ -389,7 +433,7 @@ export default function HelpdeskPage() {
           const data = await res.json()
           const conv = data.conversation
           const dbMessages = (conv?.messages as QATurn[]) || []
-          roomTurnsCache.set(roomId, dbMessages)
+          cacheTurnsSet(roomId, dbMessages)
           setActiveRoomId(roomId)
           setTurns(dbMessages)
           firstQuestionRef.current = dbMessages.length > 0
@@ -419,7 +463,7 @@ export default function HelpdeskPage() {
     // Save current turns + streaming state to DB before switching
     if (activeRoomId) {
       if (turns.length > 0) {
-        roomTurnsCache.set(activeRoomId, turns)
+        cacheTurnsSet(activeRoomId, turns)
         persistMessages(activeRoomId, turns)
       }
       getRoomStream(activeRoomId).streamContent = streamingContent
@@ -508,7 +552,7 @@ export default function HelpdeskPage() {
     // ── All turn operations use roomTurnsCache (per-room, never shared) ──
     const roomTurns = roomTurnsCache.get(capturedRoomId) || []
     const turnsWithUser = [...roomTurns, { role: "user" as const, content: userContent }]
-    roomTurnsCache.set(capturedRoomId, turnsWithUser)
+    cacheTurnsSet(capturedRoomId, turnsWithUser)
     // Persist immediately so updatedAt reflects when user sent the message
     persistMessages(capturedRoomId, turnsWithUser)
     setSidebarRefreshKey((k) => k + 1)
@@ -619,7 +663,7 @@ export default function HelpdeskPage() {
                 suggestedDepartment: result.suggestedDepartment,
               },
             ]
-            roomTurnsCache.set(capturedRoomId, updated)
+            cacheTurnsSet(capturedRoomId, updated)
             persistMessages(capturedRoomId, updated)
 
             if (activeRoomId === capturedRoomId) {
@@ -642,7 +686,7 @@ export default function HelpdeskPage() {
               ...currentTurns,
               { role: "assistant" as const, content: `Sorry, something went wrong: ${detail}` },
             ]
-            roomTurnsCache.set(capturedRoomId, updated)
+            cacheTurnsSet(capturedRoomId, updated)
             if (activeRoomId === capturedRoomId) setTurns(updated)
           },
 
@@ -699,7 +743,7 @@ export default function HelpdeskPage() {
             suggestedDepartment: data.suggestedDepartment,
           },
         ]
-        roomTurnsCache.set(roomId, updated)
+        cacheTurnsSet(roomId, updated)
         persistMessages(roomId, updated)
         if (activeRoomId === roomId) setTurns(updated)
       } else {
@@ -733,7 +777,7 @@ export default function HelpdeskPage() {
         needsEscalation: false,
       },
     ]
-    roomTurnsCache.set(capturedRoomId, turnsWithPlaceholder)
+    cacheTurnsSet(capturedRoomId, turnsWithPlaceholder)
     persistMessages(capturedRoomId, turnsWithPlaceholder)
 
     if (activeRoomId === capturedRoomId) {
@@ -751,7 +795,7 @@ export default function HelpdeskPage() {
 
     // Poll for result in background
     try {
-      const result = await waitForTaskResult(taskId, 120000, 1500)
+      const result = await waitForTaskResult(taskId, 120000)
 
       if (result.status === "completed" && result.result) {
         const answer = result.result.answer || "No response."
@@ -772,7 +816,7 @@ export default function HelpdeskPage() {
             suggestedDepartment: result.result.suggestedDepartment,
           },
         ]
-        roomTurnsCache.set(capturedRoomId, updated)
+        cacheTurnsSet(capturedRoomId, updated)
         persistMessages(capturedRoomId, updated)
 
         if (activeRoomId === capturedRoomId) {
@@ -792,7 +836,7 @@ export default function HelpdeskPage() {
         ...withoutPlaceholder,
         { role: "assistant" as const, content: `Sorry, something went wrong: ${errorMsg}` },
       ]
-      roomTurnsCache.set(capturedRoomId, updated)
+      cacheTurnsSet(capturedRoomId, updated)
       if (activeRoomId === capturedRoomId) setTurns(updated)
     }
   }
