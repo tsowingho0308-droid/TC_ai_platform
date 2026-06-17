@@ -122,24 +122,31 @@ export function ContextPage() {
     toast.error(`Upload failed: ${err.message}`)
   }, [])
 
-  // Handle document selection
+  // Handle document selection — preserve existing filters
   const handleSelectDocument = useCallback((doc: ContextDocument) => {
     setSelectedDoc(doc)
-    router.push(`/context?document=${doc.id}`, { scroll: false })
-  }, [router])
+    const params = new URLSearchParams(searchParams.toString())
+    params.set("document", doc.id)
+    router.push(`/context?${params.toString()}`, { scroll: false })
+  }, [router, searchParams])
 
   // Handle document deletion
   const handleDeleteDocument = useCallback(async (id: string) => {
     try {
       await deleteDocument(id)
       setSelectedDoc(null)
+      // Preserve department filter when removing deleted doc from URL
+      const params = new URLSearchParams(searchParams.toString())
+      params.delete("document")
+      const qs = params.toString()
+      router.push(qs ? `/context?${qs}` : "/context", { scroll: false })
       window.dispatchEvent(new Event("context:data-updated"))
       toast.success("Document deleted")
     } catch (err) {
       console.error("Failed to delete document:", err)
       toast.error("Failed to delete document")
     }
-  }, [])
+  }, [router, searchParams])
 
   // Handle search
   const [searchResults, setSearchResults] = useState<SearchResult[]>([])
@@ -264,7 +271,11 @@ export function ContextPage() {
           document={selectedDoc}
           onClose={() => {
             setSelectedDoc(null)
-            router.push("/context", { scroll: false })
+            // Preserve department filter when closing detail panel
+            const params = new URLSearchParams(searchParams.toString())
+            params.delete("document")
+            const qs = params.toString()
+            router.push(qs ? `/context?${qs}` : "/context", { scroll: false })
           }}
           onDelete={() => handleDeleteDocument(selectedDoc.id)}
         />
