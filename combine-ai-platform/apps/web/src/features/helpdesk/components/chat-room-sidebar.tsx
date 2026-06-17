@@ -208,6 +208,17 @@ export function ChatRoomSidebar({
 
   return (
     <div className="flex flex-col border-l bg-muted/10 w-72 shrink-0 h-full">
+      {/* ════════════════ Top bar: collapse toggle ════════════════ */}
+      <div className="flex items-center justify-end px-2 py-1 border-b shrink-0">
+        <button
+          onClick={() => setCollapsed(true)}
+          className="rounded-md p-1 hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+          title="Hide sidebar"
+        >
+          <ChevronRight className="h-4 w-4" />
+        </button>
+      </div>
+
       {/* ════════════════ Knowledge Search Section (top 50%) ════════════════ */}
       <div className="flex flex-col flex-1 border-b min-h-0">
         <div className="px-3 pt-3 pb-2">
@@ -293,22 +304,13 @@ export function ChatRoomSidebar({
             </span>
           )}
         </div>
-        <div className="flex items-center gap-0.5">
-          <button
-            onClick={onNewRoom}
-            className="rounded-md p-1.5 hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
-            title="New chat room"
-          >
-            <Plus className="h-3.5 w-3.5" />
-          </button>
-          <button
-            onClick={() => setCollapsed(true)}
-            className="rounded-md p-1.5 hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
-            title="Hide sidebar"
-          >
-            <ChevronRight className="h-3.5 w-3.5" />
-          </button>
-        </div>
+        <button
+          onClick={onNewRoom}
+          className="rounded-md p-1.5 hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+          title="New chat room"
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </button>
       </div>
 
       {/* ── Room List ── */}

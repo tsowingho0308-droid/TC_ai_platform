@@ -38,12 +38,14 @@ async def main():
 
     while running:
         try:
-            # BRPOP with 5s timeout for graceful shutdown responsiveness
-            result = await redis.brpop(QUEUE_KEY, timeout=5)
-            if result is None:
+            # RPOPLPUSH: atomically pop from queue AND push to backup.
+            # If the worker crashes mid-task, the Reaper can recover the
+            # task from the backup list and re-enqueue it.
+            task_data = await redis.rpoplpush(QUEUE_KEY, "helpdesk:processing-backup")
+            if task_data is None:
+                await asyncio.sleep(1)
                 continue
 
-            _, task_data = result
             task = json.loads(task_data)
             task_id = task.get("taskId", "unknown")
             print(f"[DEQUEUE] {task_id} — room={task.get('conversationId', '?')[:8]}")

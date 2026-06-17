@@ -224,27 +224,57 @@ export async function pollTaskStatus(
 
 /**
  * Poll repeatedly until the task completes or times out.
- * @param taskId - The task ID to poll
- * @param maxWaitMs - Maximum time to wait (default 60s)
- * @param intervalMs - Poll interval (default 1000ms)
+ * Uses exponential backoff with jitter to prevent thundering herd
+ * when many clients are polling simultaneously.
+ *
+ * @param taskId  - The task ID to poll
+ * @param maxWaitMs - Maximum time to wait (default 120s)
  */
 export async function waitForTaskResult(
   taskId: string,
-  maxWaitMs = 60000,
-  intervalMs = 1000
+  maxWaitMs = 120000
 ): Promise<PollStatusResponse> {
   const start = Date.now()
+  let delay = 1000       // start at 1s
+  const maxDelay = 16000 // cap at 16s
+  const baseDelay = 1000
 
   while (Date.now() - start < maxWaitMs) {
     const status = await pollTaskStatus(taskId)
 
-    if (status.status === "completed" || status.status === "error" || status.status === "expired") {
+    if (
+      status.status === "completed" ||
+      status.status === "error" ||
+      status.status === "expired"
+    ) {
       return status
     }
 
-    // Wait before next poll
-    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+    // Exponential backoff: 1s → 2s → 4s → 8s → 16s (capped)
+    // Add ±20% random jitter to spread load across clients
+    const jitter = delay * (0.8 + Math.random() * 0.4)
+    await new Promise((resolve) => setTimeout(resolve, jitter))
+    delay = Math.min(delay * 2, maxDelay)
   }
 
   return { status: "expired", error: "Task timed out" }
+}
+
+/**
+ * Batch-check multiple task statuses in a single HTTP round-trip.
+ * Uses Redis MGET under the hood for O(1) server-side cost.
+ */
+export async function pollBatchStatus(
+  taskIds: string[]
+): Promise<Record<string, PollStatusResponse>> {
+  if (taskIds.length === 0) return {}
+
+  const ids = taskIds.map(encodeURIComponent).join(",")
+  const res = await fetch(`/api/helpdesk/agent/status/batch?ids=${ids}`)
+
+  if (!res.ok) {
+    throw new Error(`Batch poll failed: ${res.status}`)
+  }
+
+  return res.json()
 }

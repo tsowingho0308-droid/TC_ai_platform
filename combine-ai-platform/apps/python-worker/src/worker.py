@@ -44,9 +44,18 @@ class TaskProcessor:
         """
         task_id = task.get("taskId", "unknown")
         redis = await get_redis()
+        task_data_str = json.dumps(task)
 
         # Mark as processing
         await redis.setex(f"{STATUS_PREFIX}{task_id}", TASK_TTL, "processing")
+
+        # Heartbeat: refresh TTL every 10s so the Reaper knows we're alive
+        async def heartbeat_loop():
+            while True:
+                await asyncio.sleep(10)
+                await redis.setex(f"helpdesk:heartbeat:{task_id}", 30, "alive")
+
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
 
         messages: list[dict] = task.get("messages", [])
         tools: list[dict] | None = task.get("tools")
@@ -244,6 +253,19 @@ class TaskProcessor:
                 "failedAt": str(asyncio.get_event_loop().time()),
             }
             await redis.lpush(DEAD_LETTER_KEY, json.dumps(dead_entry))
+
+        finally:
+            # Cancel heartbeat
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+            # Remove from processing backup (task is done, no longer at risk)
+            await redis.lrem("helpdesk:processing-backup", 0, task_data_str)
+            # Clean up heartbeat key
+            await redis.delete(f"helpdesk:heartbeat:{task_id}")
 
     async def _execute_tool(
         self,

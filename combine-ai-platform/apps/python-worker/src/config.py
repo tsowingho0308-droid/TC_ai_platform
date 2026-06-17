@@ -35,7 +35,9 @@ TASK_TTL = 300  # 5 minutes — matches Node.js side
 
 # ── Redis Keys (must match Node.js helpdesk-queue.ts) ────────────────
 QUEUE_KEY = "helpdesk:queue"
+PROCESSING_BACKUP_KEY = "helpdesk:processing-backup"
 STREAM_PREFIX = "helpdesk:stream:"
 RESULT_PREFIX = "helpdesk:result:"
 STATUS_PREFIX = "helpdesk:status:"
+HEARTBEAT_PREFIX = "helpdesk:heartbeat:"
 DEAD_LETTER_KEY = "helpdesk:dead-letter"
