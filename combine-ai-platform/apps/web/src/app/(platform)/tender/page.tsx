@@ -1,12 +1,12 @@
 "use client"
 
-import { useState, useRef, useEffect, useMemo, Suspense } from "react"
+import { useState, useRef, useEffect, useMemo, useCallback, Suspense } from "react"
 import { useSearchParams } from "next/navigation"
 import Link from "next/link"
 import {
-  Upload, FileText, Download, Plus, Trash2, Loader2,
+  FileText, Download, Plus, Trash2, Loader2,
   GitCompare, Brain, BarChart3, Search, Pencil, BookOpen, ArrowLeft,
-  Mail, Paperclip, Sparkles,
+  Mail, Sparkles,
 } from "lucide-react"
 import { cn } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
@@ -24,6 +24,49 @@ import {
   buildComparisonKbText,
   defaultComparisonKbTitle,
 } from "@/features/tender/lib/tender-comparison-kb-text"
+import { useAuth } from "@/features/auth/auth-context"
+import {
+  getApiErrorMessage,
+  handleUnauthorizedResponse,
+} from "@/features/auth/handle-api-unauthorized"
+import {
+  cacheTenderSessionWorkspace,
+  clearTenderWorkspace,
+  getCachedTenderSessionWorkspace,
+  getTenderWorkspace,
+  TENDER_NEW_ANALYZE_EVENT,
+  updateCachedTenderSessionWorkspace,
+  type TenderWorkspaceSnapshot,
+} from "@/features/tender/lib/tender-workspace-store"
+import { useTenderWorkspaceSync } from "@/features/tender/hooks/use-tender-workspace-sync"
+import {
+  deriveTenderSessionTitle,
+  deriveTenderSessionType,
+  packTenderFieldInputs,
+  packTenderProcessingMarker,
+  unpackTenderSessionWorkspace,
+  getTenderBatchAnalysis,
+  setTenderBatchAnalysis,
+  clearTenderBatchAnalysis,
+  isTenderBatchInProgress,
+  normalizeTenderViewMode,
+  type TenderBatchAnalysisState,
+  type TenderSessionWorkspace,
+} from "@/features/tender/lib/tender-session-workspace"
+import {
+  registerPendingTenderAnalysis,
+  removePendingTenderAnalysis,
+  TENDER_ANALYSIS_COMPLETE,
+  TENDER_ANALYSIS_STARTED,
+  type TenderAnalysisCompleteDetail,
+} from "@/features/tender/tender-analysis-tracker"
+import { fetchTenderSessionById } from "@/features/tender/lib/tender-session-loader"
+import { readAgentSseStream } from "@/features/shared/lib/agent-sse"
+import { AgentUploadPanel } from "@/features/shared/components/agent-upload-panel"
+import {
+  AgentUploadQueue,
+  buildUploadFileId,
+} from "@/features/shared/components/agent-upload-queue"
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -97,6 +140,17 @@ interface ExtractionResult {
   tenderType?: string
   confidence?: number
   model?: string
+}
+
+interface TenderAnalysisResult {
+  tender: TenderItem
+  confidence?: number
+  mockWarning?: string | null
+}
+
+interface TenderBatchError {
+  fileName: string
+  error: string
 }
 
 interface PendingUploadFile {
@@ -199,30 +253,6 @@ function buildComparison(tenders: TenderItem[]): ComparisonResult | null {
   }
 }
 
-function buildUploadFileId(file: File): string {
-  return `${file.name}-${file.size}-${file.lastModified}`
-}
-
-function formatFileSize(sizeBytes: number): string {
-  if (sizeBytes < 1024) return `${sizeBytes} B`
-  if (sizeBytes < 1024 * 1024) return `${Math.max(1, Math.round(sizeBytes / 1024))} KB`
-  return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function parseSseRecord(raw: string): { event: string; data: Record<string, any> | null } {
-  const lines = raw.split(/\r?\n/)
-  let eventType = "message"
-  const dataLines: string[] = []
-  for (const line of lines) {
-    if (line.startsWith("event:")) eventType = line.slice(6).trim()
-    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim())
-  }
-  if (!dataLines.length) return { event: eventType, data: null }
-  try { return { event: eventType, data: JSON.parse(dataLines.join("\n")) } }
-  catch { return { event: eventType, data: null } }
-}
-
 // ── Component ──────────────────────────────────────────────────
 
 export default function TenderPage() {
@@ -234,37 +264,78 @@ export default function TenderPage() {
 }
 
 function TenderPageContent() {
+  const { refreshSession } = useAuth()
   const searchParams = useSearchParams()
   const fromEmailId = searchParams.get("fromEmail")
   const emailSubjectParam = searchParams.get("emailSubject")
   const attachmentIdParam = searchParams.get("attachmentId")
   const attachmentIdsParam = searchParams.get("attachmentIds")
+  const restoredWorkspace = getTenderWorkspace()
+  const initialTenders = restoredWorkspace?.tenders ?? []
 
-  const [viewMode, setViewMode] = useState<"edit" | "compare">("edit")
-  const [tenders, setTenders] = useState<TenderItem[]>([])
-  const [analyzing, setAnalyzing] = useState(false)
-  const [model, setModel] = useState(DEFAULT_MODELS.tender)
-  const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null)
+  const [viewMode, setViewMode] = useState<"edit" | "compare">(
+    normalizeTenderViewMode(restoredWorkspace?.viewMode ?? "edit", initialTenders.length)
+  )
+  const [tenders, setTenders] = useState<TenderItem[]>(initialTenders)
+  const [analyzing, setAnalyzing] = useState(
+    restoredWorkspace?.streamingStatus === "thinking" ||
+      restoredWorkspace?.streamingStatus === "connecting"
+  )
+  const [model, setModel] = useState(restoredWorkspace?.model ?? DEFAULT_MODELS.tender)
+  const [selectedTemplate, setSelectedTemplate] = useState<string | null>(
+    restoredWorkspace?.selectedTemplate ?? null
+  )
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(
+    restoredWorkspace?.activeSessionId ?? null
+  )
   const [templates, setTemplates] = useState<Template[]>([])
   const [traceEvents, setTraceEvents] = useState<TraceEvent[]>([])
   const [thinkingText, setThinkingText] = useState("")
-  const [error, setError] = useState<string | null>(null)
-  const [streamingStatus, setStreamingStatus] = useState<"idle" | "connecting" | "thinking" | "done" | "error">("idle")
-  const [confidence, setConfidence] = useState<number | null>(null)
-  const [pendingFiles, setPendingFiles] = useState<PendingUploadFile[]>([])
-  const [selectedUploadFileIds, setSelectedUploadFileIds] = useState<Set<string>>(new Set())
-  const [showDiffsOnly, setShowDiffsOnly] = useState(true)
-  const [aiCompareResult, setAiCompareResult] = useState<AiCompareResult | null>(null)
+  const [error, setError] = useState<string | null>(restoredWorkspace?.error ?? null)
+  const [streamingStatus, setStreamingStatus] = useState<
+    "idle" | "connecting" | "thinking" | "done" | "error"
+  >(restoredWorkspace?.streamingStatus ?? "idle")
+  const [confidence, setConfidence] = useState<number | null>(
+    restoredWorkspace?.confidence ?? null
+  )
+  const [pendingFiles, setPendingFiles] = useState<PendingUploadFile[]>(
+    restoredWorkspace?.pendingFiles ?? []
+  )
+  const [selectedUploadFileIds, setSelectedUploadFileIds] = useState<Set<string>>(
+    () => new Set(restoredWorkspace?.selectedUploadFileIds ?? [])
+  )
+  const [showDiffsOnly, setShowDiffsOnly] = useState(
+    restoredWorkspace?.showDiffsOnly ?? true
+  )
+  const [aiCompareResult, setAiCompareResult] = useState<AiCompareResult | null>(
+    restoredWorkspace?.aiCompareResult ?? null
+  )
   const [loadingAiCompare, setLoadingAiCompare] = useState(false)
-  const [mockWarning, setMockWarning] = useState<string | null>(null)
+  const [mockWarning, setMockWarning] = useState<string | null>(
+    restoredWorkspace?.mockWarning ?? null
+  )
   const [kbImportOpen, setKbImportOpen] = useState(false)
   const [statusBanner, setStatusBanner] = useState<{ tone: "success" | "error"; message: string } | null>(null)
   const [exportingPdf, setExportingPdf] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const abortRef = useRef<AbortController | null>(null)
-  const [emailSource, setEmailSource] = useState<EmailSource | null>(null)
+  const sessionAbortControllersRef = useRef<Map<string, AbortController>>(new Map())
+  const sessionSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const tendersRef = useRef(tenders)
+  const activeSessionIdRef = useRef(activeSessionId)
+  const viewModeRef = useRef(viewMode)
+  const analyzingRef = useRef(analyzing)
+  const ensureSessionInFlightRef = useRef<Promise<string | null> | null>(null)
+  tendersRef.current = tenders
+  activeSessionIdRef.current = activeSessionId
+  viewModeRef.current = viewMode
+  analyzingRef.current = analyzing
+  const [emailSource, setEmailSource] = useState<EmailSource | null>(
+    restoredWorkspace?.emailSource ?? null
+  )
   const [loadingEmail, setLoadingEmail] = useState(false)
-  const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<Set<string>>(new Set())
+  const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<Set<string>>(
+    () => new Set(restoredWorkspace?.selectedAttachmentIds ?? [])
+  )
   const [loadingEmailExtract, setLoadingEmailExtract] = useState(false)
 
   const comparisonResult = useMemo(() => buildComparison(tenders), [tenders])
@@ -281,6 +352,179 @@ function TenderPageContent() {
   }, [comparisonResult, tenders, showDiffsOnly, aiCompareResult])
   const hasEditableFields = tenders.some((t) => t.fields.length > 0)
 
+  const ensureSessionId = useCallback(
+    async (titleHint?: string): Promise<string | null> => {
+      if (activeSessionIdRef.current) return activeSessionIdRef.current
+      if (ensureSessionInFlightRef.current) return ensureSessionInFlightRef.current
+
+      ensureSessionInFlightRef.current = (async () => {
+        const id = `tender-${Date.now()}`
+        const title = titleHint || `Tender Analysis ${new Date().toLocaleDateString()}`
+        try {
+          const res = await fetch("/api/tender/sessions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              id,
+              title,
+              templateId: selectedTemplate || undefined,
+            }),
+          })
+          if (await handleUnauthorizedResponse(res, refreshSession)) return null
+          if (res.ok) {
+            activeSessionIdRef.current = id
+            setActiveSessionId(id)
+            window.dispatchEvent(new Event("tender:sessions-updated"))
+            return id
+          }
+        } catch (err) {
+          console.error("Failed to create tender session:", err)
+        }
+        return null
+      })()
+
+      const createdId = await ensureSessionInFlightRef.current
+      ensureSessionInFlightRef.current = null
+      return createdId
+    },
+    [selectedTemplate, refreshSession]
+  )
+
+  const persistSessionSnapshot = useCallback(
+    async (
+      tendersSnapshot: TenderItem[],
+      options?: {
+        sessionId?: string | null
+        viewMode?: "edit" | "compare"
+        status?: "processing" | "completed" | "failed"
+        allowEmpty?: boolean
+      }
+    ) => {
+      const sessionId = options?.sessionId ?? activeSessionIdRef.current
+      if (!sessionId) return
+      if (tendersSnapshot.length === 0 && !options?.allowEmpty) return
+
+      const snapshotViewMode = normalizeTenderViewMode(
+        options?.viewMode ?? viewModeRef.current,
+        tendersSnapshot.length
+      )
+
+      const batch = sessionId ? getTenderBatchAnalysis(sessionId) : null
+      const batchIncomplete = batch
+        ? batch.completedFiles + (batch.failedFiles ?? 0) < batch.totalFiles
+        : false
+      const resolvedStatus =
+        options?.status ??
+        (batchIncomplete || analyzing ? "processing" : "completed")
+
+      const workspace: TenderSessionWorkspace = {
+        version: 1,
+        tenders: tendersSnapshot,
+        viewMode: snapshotViewMode,
+        showDiffsOnly,
+        selectedTemplate,
+        model,
+        aiCompareResult,
+        analysisState:
+          resolvedStatus === "processing"
+            ? "processing"
+            : resolvedStatus === "failed"
+              ? "failed"
+              : "completed",
+        analysisProgress: batch
+          ? {
+              totalFiles: batch.totalFiles,
+              completedFiles: batch.completedFiles,
+              failedFiles: batch.failedFiles ?? 0,
+              fileNames: batch.fileNames,
+              errors: batch.errors ?? [],
+            }
+          : resolvedStatus === "processing"
+            ? undefined
+            : undefined,
+      }
+
+      try {
+        const res = await fetch("/api/tender/sessions", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: sessionId,
+            title: deriveTenderSessionTitle(tendersSnapshot),
+            templateId: selectedTemplate || undefined,
+            tenderType: deriveTenderSessionType(tendersSnapshot),
+            fieldInputs: packTenderFieldInputs(workspace),
+            status: resolvedStatus,
+          }),
+        })
+        if (await handleUnauthorizedResponse(res, refreshSession)) return
+        if (!res.ok) {
+          const errData = (await res.json().catch(() => ({}))) as { error?: string; detail?: string }
+          console.error("Failed to save tender session:", errData.error || errData.detail || res.status)
+          return
+        }
+        window.dispatchEvent(new Event("tender:sessions-updated"))
+      } catch (err) {
+        console.error("Failed to save tender session:", err)
+      }
+    },
+    [showDiffsOnly, selectedTemplate, model, aiCompareResult, analyzing, refreshSession]
+  )
+
+  const persistProcessingMarker = useCallback(
+    async (sessionId: string, fileNames: string[]) => {
+      if (!sessionId || fileNames.length === 0) return
+      const title =
+        fileNames.length === 1
+          ? fileNames[0]
+          : `Batch (${fileNames.length} files)`
+      try {
+        const res = await fetch("/api/tender/sessions", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: sessionId,
+            title,
+            fieldInputs: packTenderProcessingMarker({
+              fileNames,
+              model,
+              selectedTemplate,
+              showDiffsOnly,
+            }),
+            status: "processing",
+          }),
+        })
+        if (await handleUnauthorizedResponse(res, refreshSession)) return
+        if (!res.ok) {
+          const errData = (await res.json().catch(() => ({}))) as { error?: string; detail?: string }
+          console.error("Failed to save processing marker:", errData.error || errData.detail || res.status)
+          return
+        }
+        window.dispatchEvent(new Event("tender:sessions-updated"))
+      } catch (err) {
+        console.error("Failed to save processing marker:", err)
+      }
+    },
+    [model, selectedTemplate, showDiffsOnly, refreshSession]
+  )
+
+  const persistSessionWorkspace = useCallback(async () => {
+    await persistSessionSnapshot(tendersRef.current)
+  }, [persistSessionSnapshot])
+
+  useEffect(() => {
+    if (!activeSessionId) return
+    const batchInProgress = isTenderBatchInProgress(activeSessionId)
+    if (tenders.length === 0 && !batchInProgress && !analyzing) return
+    if (sessionSaveTimerRef.current) clearTimeout(sessionSaveTimerRef.current)
+    sessionSaveTimerRef.current = setTimeout(() => {
+      void persistSessionWorkspace()
+    }, 800)
+    return () => {
+      if (sessionSaveTimerRef.current) clearTimeout(sessionSaveTimerRef.current)
+    }
+  }, [activeSessionId, tenders, viewMode, showDiffsOnly, aiCompareResult, analyzing, persistSessionWorkspace])
+
   useEffect(() => {
     fetch("/api/tender/templates")
       .then((r) => r.json())
@@ -289,10 +533,7 @@ function TenderPageContent() {
   }, [])
 
   useEffect(() => {
-    if (!fromEmailId) {
-      setEmailSource(null)
-      return
-    }
+    if (!fromEmailId) return
 
     setLoadingEmail(true)
     fetch(`/api/email/mailbox?conversationId=${encodeURIComponent(fromEmailId)}`)
@@ -322,16 +563,60 @@ function TenderPageContent() {
   }, [fromEmailId, emailSubjectParam, attachmentIdParam, attachmentIdsParam])
 
   useEffect(() => {
-    return () => {
-      abortRef.current?.abort()
-    }
-  }, [])
-
-  useEffect(() => {
     if (tenders.length < 2 && viewMode === "compare") {
       setViewMode("edit")
     }
   }, [tenders.length, viewMode])
+
+  useEffect(() => {
+    function onAnalysisComplete(event: Event) {
+      const detail = (event as CustomEvent<TenderAnalysisCompleteDetail>).detail
+      if (!detail?.sessionId || detail.sessionId !== activeSessionIdRef.current) return
+
+      const cached = getCachedTenderSessionWorkspace(detail.sessionId)
+      if (cached && cached.tenders.length > 0) {
+        const hydratedViewMode = normalizeTenderViewMode(
+          cached.viewMode,
+          cached.tenders.length
+        )
+        setTenders(cached.tenders)
+        setViewMode(hydratedViewMode)
+        viewModeRef.current = hydratedViewMode
+        setShowDiffsOnly(cached.showDiffsOnly)
+        setModel(cached.model)
+        setSelectedTemplate(cached.selectedTemplate)
+        setAiCompareResult(cached.aiCompareResult)
+        setStreamingStatus(cached.streamingStatus)
+        setAnalyzing(cached.streamingStatus === "thinking" || cached.streamingStatus === "connecting")
+        setError(cached.error)
+        return
+      }
+
+      void fetchTenderSessionById(detail.sessionId).then((session) => {
+        if (!session) return
+        const workspace = unpackTenderSessionWorkspace(session.fieldInputs, {
+          title: session.title,
+        })
+        if (!workspace || workspace.tenders.length === 0) return
+        const hydratedViewMode = normalizeTenderViewMode(
+          workspace.viewMode,
+          workspace.tenders.length
+        )
+        setTenders(workspace.tenders)
+        setViewMode(hydratedViewMode)
+        viewModeRef.current = hydratedViewMode
+        setShowDiffsOnly(workspace.showDiffsOnly)
+        setModel(workspace.model || DEFAULT_MODELS.tender)
+        setSelectedTemplate(workspace.selectedTemplate)
+        setAiCompareResult(workspace.aiCompareResult ?? null)
+        setStreamingStatus("done")
+        setAnalyzing(false)
+      })
+    }
+
+    window.addEventListener(TENDER_ANALYSIS_COMPLETE, onAnalysisComplete)
+    return () => window.removeEventListener(TENDER_ANALYSIS_COMPLETE, onAnalysisComplete)
+  }, [])
 
   useEffect(() => {
     if (viewMode !== "compare" || tenders.length < 2) {
@@ -352,17 +637,19 @@ function TenderPageContent() {
         })),
       }),
     })
-      .then((r) => r.json())
-      .then((data: AiCompareResult) => {
-        if (!cancelled) {
-          setAiCompareResult(data)
-          if (data.mockWarning) {
-            setMockWarning(
-              data.mockWarning === "AI unavailable, using demo data"
-                ? "未連接大模型，目前為演示資料。請確認 combine-ai-platform/.env 中的 DASHSCOPE_API_KEY 並重啟 dev server。"
-                : data.mockWarning
-            )
-          }
+      .then(async (r) => {
+        if (await handleUnauthorizedResponse(r, refreshSession)) return null
+        return r.json()
+      })
+      .then((data: AiCompareResult | null) => {
+        if (!data || cancelled) return
+        setAiCompareResult(data)
+        if (data.mockWarning) {
+          setMockWarning(
+            data.mockWarning === "AI unavailable, using demo data"
+              ? "未連接大模型，目前為演示資料。請確認 combine-ai-platform/.env 中的 DASHSCOPE_API_KEY 並重啟 dev server。"
+              : data.mockWarning
+          )
         }
       })
       .catch(console.error)
@@ -373,12 +660,14 @@ function TenderPageContent() {
     return () => {
       cancelled = true
     }
-  }, [viewMode, tenders])
+  }, [viewMode, tenders, refreshSession])
 
-  function resetState() {
-    abortRef.current?.abort()
-    setAnalyzing(false)
-    setStreamingStatus("idle")
+  function isActiveSession(sessionId?: string | null): boolean {
+    const resolved = sessionId ?? activeSessionIdRef.current
+    return resolved === activeSessionIdRef.current
+  }
+
+  function clearStreamingUi() {
     setTraceEvents([])
     setThinkingText("")
     setError(null)
@@ -386,37 +675,133 @@ function TenderPageContent() {
     setMockWarning(null)
   }
 
-  function applyExtractionResult(result: ExtractionResult, fileName: string) {
-    if (result.fields && result.fields.length > 0) {
-      const newTender: TenderItem = {
-        id: `tender-${Date.now()}`,
+  function resetState() {
+    clearStreamingUi()
+    setAnalyzing(false)
+    setStreamingStatus("idle")
+  }
+
+  function abortAllSessionExtractions() {
+    for (const controller of sessionAbortControllersRef.current.values()) {
+      controller.abort()
+    }
+    sessionAbortControllersRef.current.clear()
+  }
+
+  function resetForNewBatch() {
+    abortAllSessionExtractions()
+    resetState()
+    tendersRef.current = []
+    viewModeRef.current = "edit"
+    setTenders([])
+    setViewMode("edit")
+    setAiCompareResult(null)
+  }
+
+  function buildTenderAnalysisResult(
+    result: ExtractionResult,
+    fileName: string
+  ): TenderAnalysisResult {
+    if (!result.fields || result.fields.length === 0) {
+      throw new Error("AI 未能識別結構化欄位，可手動新增或重試")
+    }
+
+    return {
+      tender: {
+        id: `tender-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: result.tenderTitle || fileName.replace(/\.(pdf|docx?|txt)$/i, ""),
         fileName,
         fields: result.fields,
         type: result.tenderType || null,
-      }
-      setTenders((prev) => {
-        const next = [...prev, newTender]
-        if (next.length >= 2) setViewMode("compare")
-        return next
-      })
-      if (result.confidence !== undefined) setConfidence(result.confidence)
-      setStreamingStatus("done")
-      return true
+      },
+      confidence: result.confidence,
+      mockWarning: result.model === "mock-template" ? "未連接大模型，目前為演示資料" : null,
     }
-    setError("AI 未能識別結構化欄位，可手動新增或重試")
-    setStreamingStatus("error")
-    return false
   }
 
-  async function consumeExtractionStream(response: Response, fileName: string) {
+  function applyExtractionResult(
+    result: ExtractionResult,
+    fileName: string,
+    sessionId?: string | null
+  ) {
+    const resolvedSessionId = sessionId ?? activeSessionIdRef.current
+    const active = isActiveSession(resolvedSessionId)
+
+    try {
+      const analysis = buildTenderAnalysisResult(result, fileName)
+      const cached = resolvedSessionId
+        ? getCachedTenderSessionWorkspace(resolvedSessionId)
+        : null
+      const baseTenders = active ? tendersRef.current : (cached?.tenders ?? [])
+      const next = [...baseTenders, analysis.tender]
+      const nextViewMode = normalizeTenderViewMode(
+        next.length >= 2 ? "compare" : (cached?.viewMode ?? viewModeRef.current),
+        next.length
+      )
+
+      if (resolvedSessionId) {
+        removePendingTenderAnalysis(resolvedSessionId)
+        clearTenderBatchAnalysis(resolvedSessionId)
+        sessionAbortControllersRef.current.delete(resolvedSessionId)
+        updateCachedTenderSessionWorkspace(resolvedSessionId, {
+          tenders: next,
+          viewMode: nextViewMode,
+          streamingStatus: "done",
+          error: null,
+        })
+        void persistSessionSnapshot(next, {
+          sessionId: resolvedSessionId,
+          viewMode: nextViewMode,
+          status: "completed",
+        })
+      }
+
+      if (active) {
+        tendersRef.current = next
+        viewModeRef.current = nextViewMode
+        if (resolvedSessionId && !activeSessionIdRef.current) {
+          activeSessionIdRef.current = resolvedSessionId
+          setActiveSessionId(resolvedSessionId)
+        }
+        setTenders(next)
+        setViewMode(nextViewMode)
+        if (analysis.confidence !== undefined) setConfidence(analysis.confidence)
+        if (analysis.mockWarning) setMockWarning(analysis.mockWarning)
+        setStreamingStatus("done")
+        setAnalyzing(false)
+      }
+      return true
+    } catch (err) {
+      if (resolvedSessionId) {
+        removePendingTenderAnalysis(resolvedSessionId)
+        clearTenderBatchAnalysis(resolvedSessionId)
+        sessionAbortControllersRef.current.delete(resolvedSessionId)
+      }
+      if (active) {
+        setError(err instanceof Error ? err.message : "AI 未能識別結構化欄位，可手動新增或重試")
+        setStreamingStatus("error")
+        setAnalyzing(false)
+      }
+      return false
+    }
+  }
+
+  async function consumeExtractionStream(
+    response: Response,
+    fileName: string,
+    sessionId?: string | null
+  ): Promise<ExtractionResult> {
     if (!response.ok) {
+      if (await handleUnauthorizedResponse(response, refreshSession)) {
+        throw new Error("Unauthorized")
+      }
       const errData = await response.json().catch(() => ({})) as { error?: string; detail?: string }
-      throw new Error(errData.detail || errData.error || `Server error: ${response.status}`)
+      throw new Error(getApiErrorMessage(response, errData))
     }
     if (!response.body) throw new Error("Response body is not available")
 
     const appendTraceEvent = (trace: TraceEvent) => {
+      if (!isActiveSession(sessionId)) return
       setTraceEvents((prev) => [
         ...prev,
         {
@@ -426,72 +811,67 @@ function TenderPageContent() {
       ])
     }
 
-    const bodyReader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ""
     let result: ExtractionResult | null = null
     let streamError: string | null = null
 
-    while (true) {
-      const { value, done } = await bodyReader.read()
-      if (value) buffer += decoder.decode(value, { stream: !done })
-      let boundary = buffer.indexOf("\n\n")
-      while (boundary >= 0) {
-        const record = buffer.slice(0, boundary).trim()
-        buffer = buffer.slice(boundary + 2)
-        if (record) {
-          const parsed = parseSseRecord(record)
-          switch (parsed.event) {
-            case "trace":
-              if (parsed.data?.trace) appendTraceEvent(parsed.data.trace as TraceEvent)
-              break
-            case "thinking":
-              if (parsed.data?.text) setThinkingText(parsed.data.text)
-              break
-            case "result": {
-              if (parsed.data?.result) {
-                result = parsed.data.result as ExtractionResult
-                if (result.model === "mock-template") {
-                  setMockWarning("未連接大模型，目前為演示資料")
-                }
-              }
-              if (parsed.data?.warning) {
-                setMockWarning("未連接大模型，目前為演示資料")
-              }
-              break
-            }
-            case "error": {
-              const code = parsed.data?.code as string | undefined
-              streamError =
-                code === "TEXT_EXTRACTION_FAILED"
-                  ? (parsed.data?.detail as string) || "無法從文件中讀取文字，請嘗試文字版 PDF 或 DOCX"
-                  : (parsed.data?.detail as string) || (parsed.data?.error as string) || "Unknown error"
-              setError(streamError)
-              setStreamingStatus("error")
-              break
+    await readAgentSseStream(response, (event, data) => {
+      const active = isActiveSession(sessionId)
+      switch (event) {
+        case "trace":
+          if (data?.trace) appendTraceEvent(data.trace as TraceEvent)
+          break
+        case "thinking":
+          if (data?.text && active) setThinkingText(data.text as string)
+          break
+        case "result": {
+          if (data?.result) {
+            result = data.result as ExtractionResult
+            if (active && result.model === "mock-template") {
+              setMockWarning("未連接大模型，目前為演示資料")
             }
           }
+          if (data?.warning && active) {
+            setMockWarning("未連接大模型，目前為演示資料")
+          }
+          break
         }
-        boundary = buffer.indexOf("\n\n")
+        case "error": {
+          const code = data?.code as string | undefined
+          streamError =
+            code === "TEXT_EXTRACTION_FAILED"
+              ? (data?.detail as string) || "無法從文件中讀取文字，請嘗試文字版 PDF 或 DOCX"
+              : (data?.detail as string) || (data?.error as string) || "Unknown error"
+          if (active) {
+            setError(streamError)
+            setStreamingStatus("error")
+          }
+          break
+        }
       }
-      if (done) break
-    }
+    })
 
-    if (streamError) return false
-    if (result) return applyExtractionResult(result, fileName)
-    setError("分析未完成，請重試")
-    setStreamingStatus("error")
-    return false
+    if (streamError) throw new Error(streamError)
+    if (result) return result
+    throw new Error("分析未完成，請重試")
   }
 
-  async function runExtraction(documentText: string, fileName: string, options?: { skipReset?: boolean }) {
-    if (!options?.skipReset) resetState()
-    setAnalyzing(true)
-    setStreamingStatus("connecting")
+  async function analyzeOneTenderText(
+    documentText: string,
+    fileName: string,
+    options?: { sessionId?: string | null; skipReset?: boolean }
+  ): Promise<ExtractionResult> {
+    const resolvedSessionId = options?.sessionId ?? activeSessionIdRef.current
+    if (!options?.skipReset && isActiveSession(resolvedSessionId)) resetState()
+    if (isActiveSession(resolvedSessionId)) {
+      setAnalyzing(true)
+      setStreamingStatus("connecting")
+    }
     const controller = new AbortController()
-    abortRef.current = controller
+    if (resolvedSessionId) {
+      sessionAbortControllersRef.current.set(resolvedSessionId, controller)
+    }
     try {
-      setStreamingStatus("thinking")
+      if (isActiveSession(resolvedSessionId)) setStreamingStatus("thinking")
       const response = await fetch("/api/tender/agent?action=extract&stream=1", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -500,84 +880,274 @@ function TenderPageContent() {
           fileName,
           templateId: selectedTemplate || undefined,
           model,
+          sessionId: resolvedSessionId || undefined,
         }),
         signal: controller.signal,
       })
-      await consumeExtractionStream(response, fileName)
+      return await consumeExtractionStream(response, fileName, resolvedSessionId)
     } catch (err) {
-      if ((err as Error).name === "AbortError") return
-      setError(err instanceof Error ? err.message : "Unknown error")
-      setStreamingStatus("error")
-    } finally {
-      setAnalyzing(false)
+      if ((err as Error).name === "AbortError") throw err
+      throw err
     }
   }
 
-  async function extractFromFile(file: File, options?: { skipReset?: boolean }) {
-    if (!options?.skipReset) resetState()
-    setAnalyzing(true)
-    setStreamingStatus("connecting")
+  async function analyzeOneTenderFile(
+    file: File,
+    options?: { skipReset?: boolean; sessionId?: string | null }
+  ): Promise<ExtractionResult> {
+    const resolvedSessionId = options?.sessionId ?? activeSessionIdRef.current
+    if (!options?.skipReset && isActiveSession(resolvedSessionId)) resetState()
+    if (isActiveSession(resolvedSessionId)) {
+      setAnalyzing(true)
+      setStreamingStatus("connecting")
+    }
     const controller = new AbortController()
-    abortRef.current = controller
+    if (resolvedSessionId) {
+      sessionAbortControllersRef.current.set(resolvedSessionId, controller)
+    }
     try {
-      setStreamingStatus("thinking")
+      if (isActiveSession(resolvedSessionId)) setStreamingStatus("thinking")
       const formData = new FormData()
       formData.append("file", file)
       if (selectedTemplate) formData.append("templateId", selectedTemplate)
       formData.append("model", model)
+      if (resolvedSessionId) formData.append("sessionId", resolvedSessionId)
 
       const response = await fetch("/api/tender/agent?action=extract&stream=1", {
         method: "POST",
         body: formData,
         signal: controller.signal,
       })
-      return await consumeExtractionStream(response, file.name)
+      return await consumeExtractionStream(response, file.name, resolvedSessionId)
     } catch (err) {
-      if ((err as Error).name === "AbortError") return false
-      setError(err instanceof Error ? err.message : "Unknown error")
-      setStreamingStatus("error")
-      return false
-    } finally {
-      setAnalyzing(false)
+      if ((err as Error).name === "AbortError") throw err
+      throw err
     }
   }
 
-  async function loadEmailAttachmentAndAnalyze(
-    attachmentId: string,
-    options?: { skipReset?: boolean }
+  async function runExtraction(
+    documentText: string,
+    fileName: string,
+    options?: { skipReset?: boolean; sessionId?: string | null }
   ) {
+    const resolvedSessionId = options?.sessionId ?? activeSessionIdRef.current
+    try {
+      const result = await analyzeOneTenderText(documentText, fileName, options)
+      return applyExtractionResult(result, fileName, resolvedSessionId)
+    } catch (err) {
+      if (isActiveSession(resolvedSessionId)) {
+        setError(err instanceof Error ? err.message : "Unknown error")
+        setStreamingStatus("error")
+        setAnalyzing(false)
+      }
+      if (resolvedSessionId) {
+        removePendingTenderAnalysis(resolvedSessionId)
+        clearTenderBatchAnalysis(resolvedSessionId)
+        sessionAbortControllersRef.current.delete(resolvedSessionId)
+      }
+      return false
+    }
+  }
+
+  async function extractFromFile(
+    file: File,
+    options?: { skipReset?: boolean; sessionId?: string | null }
+  ) {
+    const resolvedSessionId = options?.sessionId ?? activeSessionIdRef.current
+    try {
+      const result = await analyzeOneTenderFile(file, options)
+      return applyExtractionResult(result, file.name, resolvedSessionId)
+    } catch (err) {
+      if (isActiveSession(resolvedSessionId)) {
+        setError(err instanceof Error ? err.message : "Unknown error")
+        setStreamingStatus("error")
+        setAnalyzing(false)
+      }
+      if (resolvedSessionId) {
+        removePendingTenderAnalysis(resolvedSessionId)
+        clearTenderBatchAnalysis(resolvedSessionId)
+        sessionAbortControllersRef.current.delete(resolvedSessionId)
+      }
+      return false
+    }
+  }
+
+  async function extractEmailAttachmentText(attachmentId: string) {
     if (!emailSource) return
     const att = emailSource.attachments.find((a) => a.id === attachmentId)
     if (!att) return
 
-    if (!options?.skipReset) {
-      setLoadingEmailExtract(true)
-      setError(null)
+    const res = await fetch(
+      `/api/email/attachments?action=extract&id=${encodeURIComponent(attachmentId)}`
+    )
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({})) as { error?: string; detail?: string }
+      throw new Error(errData.detail || errData.error || "Failed to extract attachment text")
     }
-    try {
-      const res = await fetch(
-        `/api/email/attachments?action=extract&id=${encodeURIComponent(attachmentId)}`
+    const data = (await res.json()) as { text?: string; fileName?: string }
+    if (!data.text?.trim()) {
+      throw new Error("No text could be extracted from the attachment")
+    }
+    return {
+      text: data.text,
+      fileName: data.fileName || att.fileName,
+    }
+  }
+
+  function buildBatchState(
+    totalFiles: number,
+    completedFiles: number,
+    fileNames: string[],
+    errors: TenderBatchError[]
+  ): TenderBatchAnalysisState {
+    return {
+      totalFiles,
+      completedFiles,
+      failedFiles: errors.length,
+      fileNames,
+      errors,
+    }
+  }
+
+  async function persistBatchProgress(
+    sessionId: string,
+    batchTenders: TenderItem[],
+    fileNames: string[],
+    errors: TenderBatchError[],
+    status: "processing" | "completed" | "failed"
+  ) {
+    const batchState = buildBatchState(
+      fileNames.length,
+      batchTenders.length,
+      fileNames,
+      errors
+    )
+    setTenderBatchAnalysis(sessionId, batchState)
+
+    const nextViewMode =
+      status === "completed"
+        ? normalizeTenderViewMode("compare", batchTenders.length)
+        : "edit"
+    updateCachedTenderSessionWorkspace(sessionId, {
+      tenders: batchTenders,
+      viewMode: nextViewMode,
+      streamingStatus: status === "processing" ? "thinking" : status === "failed" ? "error" : "done",
+      error: errors.length > 0 ? `${errors.length} document(s) failed to analyze.` : null,
+    })
+
+    if (isActiveSession(sessionId)) {
+      tendersRef.current = batchTenders
+      viewModeRef.current = nextViewMode
+      setTenders(batchTenders)
+      setViewMode(nextViewMode)
+      setStreamingStatus(status === "processing" ? "thinking" : status === "failed" ? "error" : "done")
+    }
+
+    await persistSessionSnapshot(batchTenders, {
+      sessionId,
+      viewMode: nextViewMode,
+      status,
+      allowEmpty: true,
+    })
+  }
+
+  function applyBatchFinalUiState(
+    sessionId: string,
+    batchTenders: TenderItem[],
+    errors: TenderBatchError[]
+  ) {
+    if (!isActiveSession(sessionId)) return
+
+    const nextViewMode = normalizeTenderViewMode("compare", batchTenders.length)
+    tendersRef.current = batchTenders
+    viewModeRef.current = nextViewMode
+    setTenders(batchTenders)
+    setViewMode(nextViewMode)
+    setAnalyzing(false)
+
+    if (batchTenders.length >= 2) {
+      setStreamingStatus("done")
+      setStatusBanner(
+        errors.length > 0
+          ? {
+              tone: "error",
+              message: `${batchTenders.length} document(s) analyzed, ${errors.length} failed.`,
+            }
+          : null
       )
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({})) as { error?: string; detail?: string }
-        throw new Error(errData.detail || errData.error || "Failed to extract attachment text")
-      }
-      const data = (await res.json()) as { text?: string; fileName?: string }
-      if (!data.text?.trim()) {
-        throw new Error("No text could be extracted from the attachment")
-      }
-      await runExtraction(data.text, data.fileName || att.fileName, options)
-    } catch (err) {
-      console.error("Email attachment analyze error:", err)
-      setError(err instanceof Error ? err.message : "Failed to analyze email attachment")
+    } else if (batchTenders.length === 1) {
+      setStreamingStatus("done")
+      setStatusBanner({
+        tone: errors.length > 0 ? "error" : "success",
+        message:
+          errors.length > 0
+            ? `Only 1 document analyzed successfully; ${errors.length} failed, so comparison is unavailable.`
+            : "1 document analyzed successfully.",
+      })
+    } else {
+      setError("No documents could be analyzed. Please upload text-based PDFs or DOCX files.")
       setStreamingStatus("error")
-      setAnalyzing(false)
-      throw err
-    } finally {
-      if (!options?.skipReset) {
-        setLoadingEmailExtract(false)
-      }
     }
+  }
+
+  async function runTenderBatch(params: {
+    sessionId: string
+    fileNames: string[]
+    analyzeOne: (index: number) => Promise<{ fileName: string; result: ExtractionResult }>
+  }) {
+    const { sessionId, fileNames, analyzeOne } = params
+    const batchTenders: TenderItem[] = []
+    const errors: TenderBatchError[] = []
+
+    setTenderBatchAnalysis(sessionId, buildBatchState(fileNames.length, 0, fileNames, errors))
+    setAnalyzing(true)
+    setStreamingStatus("thinking")
+    registerPendingTenderAnalysis({
+      sessionId,
+      fileName: fileNames[0] || "Tender Analysis",
+      startedAt: new Date().toISOString(),
+    })
+    window.dispatchEvent(new Event(TENDER_ANALYSIS_STARTED))
+    await persistProcessingMarker(sessionId, fileNames)
+
+    for (let i = 0; i < fileNames.length; i++) {
+      const currentFileName = fileNames[i]
+      if (isActiveSession(sessionId)) {
+        setThinkingText(`Analyzing ${i + 1}/${fileNames.length}: ${currentFileName}`)
+        setStreamingStatus("thinking")
+      }
+
+      try {
+        const { fileName, result } = await analyzeOne(i)
+        const analysis = buildTenderAnalysisResult(result, fileName)
+        batchTenders.push(analysis.tender)
+        if (analysis.confidence !== undefined && isActiveSession(sessionId)) {
+          setConfidence(analysis.confidence)
+        }
+        if (analysis.mockWarning && isActiveSession(sessionId)) {
+          setMockWarning(analysis.mockWarning)
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Unknown error"
+        errors.push({ fileName: currentFileName, error: message })
+        if (isActiveSession(sessionId)) {
+          setStatusBanner({
+            tone: "error",
+            message: `${currentFileName}: ${message}`,
+          })
+        }
+      }
+
+      await persistBatchProgress(sessionId, batchTenders, fileNames, errors, "processing")
+    }
+
+    const finalStatus = batchTenders.length > 0 ? "completed" : "failed"
+    await persistBatchProgress(sessionId, batchTenders, fileNames, errors, finalStatus)
+    removePendingTenderAnalysis(sessionId)
+    clearTenderBatchAnalysis(sessionId)
+    sessionAbortControllersRef.current.delete(sessionId)
+
+    applyBatchFinalUiState(sessionId, batchTenders, errors)
   }
 
   async function handleAnalyzeEmail() {
@@ -588,24 +1158,63 @@ function TenderPageContent() {
     )
 
     if (selected.length > 0) {
-      resetState()
+      resetForNewBatch()
       setLoadingEmailExtract(true)
       setError(null)
+      let sessionId: string | null = null
       try {
-        for (let i = 0; i < selected.length; i++) {
-          await loadEmailAttachmentAndAnalyze(selected[i].id, { skipReset: i > 0 })
+        sessionId = await ensureSessionId(
+          selected.length === 1
+            ? selected[0].fileName
+            : emailSource.subject || `Email (${selected.length} files)`
+        )
+        if (!sessionId) {
+          setError("Failed to create tender session")
+          setStreamingStatus("error")
+          return
         }
+        const fileNames = selected.map((a) => a.fileName)
+        await runTenderBatch({
+          sessionId,
+          fileNames,
+          analyzeOne: async (index) => {
+            const attachment = selected[index]
+            const extracted = await extractEmailAttachmentText(attachment.id)
+            if (!extracted) throw new Error("Attachment not found")
+            const result = await analyzeOneTenderText(extracted.text, extracted.fileName, {
+              sessionId,
+              skipReset: true,
+            })
+            return { fileName: extracted.fileName, result }
+          },
+        })
       } catch {
-        // Error already surfaced in loadEmailAttachmentAndAnalyze
+        // Error already surfaced by the batch runner.
       } finally {
         setLoadingEmailExtract(false)
-        setAnalyzing(false)
+        if (!sessionId || !isTenderBatchInProgress(sessionId)) {
+          setAnalyzing(false)
+        }
       }
       return
     }
 
     if (emailSource.body.trim()) {
-      await runExtraction(emailSource.body, `${emailSource.subject || "email"}.txt`)
+      const sessionId = await ensureSessionId(emailSource.subject)
+      if (sessionId) {
+        const fileName = `${emailSource.subject || "email"}.txt`
+        await runTenderBatch({
+          sessionId,
+          fileNames: [fileName],
+          analyzeOne: async () => ({
+            fileName,
+            result: await analyzeOneTenderText(emailSource.body, fileName, {
+              sessionId,
+              skipReset: true,
+            }),
+          }),
+        })
+      }
     } else {
       setError("Select at least one attachment to analyze")
       setStreamingStatus("error")
@@ -676,12 +1285,111 @@ function TenderPageContent() {
     setSelectedUploadFileIds(new Set())
   }
 
-  function clearPendingFiles() {
+  function clearUploadedFiles() {
     setPendingFiles([])
     setSelectedUploadFileIds(new Set())
+    resetForNewBatch()
   }
 
-  function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+  const buildCurrentSnapshot = useCallback((): TenderWorkspaceSnapshot => ({
+    viewMode: viewModeRef.current,
+    tenders: tendersRef.current,
+    model,
+    selectedTemplate,
+    activeSessionId: activeSessionIdRef.current,
+    error,
+    streamingStatus: analyzingRef.current ? "thinking" : streamingStatus,
+    confidence,
+    pendingFiles,
+    selectedUploadFileIds: Array.from(selectedUploadFileIds),
+    showDiffsOnly,
+    aiCompareResult,
+    mockWarning,
+    emailSource,
+    selectedAttachmentIds: Array.from(selectedAttachmentIds),
+  }), [
+    model,
+    selectedTemplate,
+    error,
+    streamingStatus,
+    confidence,
+    pendingFiles,
+    selectedUploadFileIds,
+    showDiffsOnly,
+    aiCompareResult,
+    mockWarning,
+    emailSource,
+    selectedAttachmentIds,
+  ])
+
+  const resetForNewAnalyze = useCallback(async () => {
+    abortAllSessionExtractions()
+    const previousSessionId = activeSessionIdRef.current
+    if (previousSessionId) {
+      const snapshot = buildCurrentSnapshot()
+      cacheTenderSessionWorkspace(previousSessionId, snapshot)
+
+      if (tendersRef.current.length > 0) {
+        await persistSessionSnapshot(tendersRef.current, {
+          sessionId: previousSessionId,
+          status:
+            analyzingRef.current || isTenderBatchInProgress(previousSessionId)
+              ? "processing"
+              : "completed",
+        })
+      } else if (
+        analyzingRef.current ||
+        isTenderBatchInProgress(previousSessionId)
+      ) {
+        const fileNames = pendingFiles
+          .filter((f) => selectedUploadFileIds.has(f.id))
+          .map((f) => f.file.name)
+        if (fileNames.length > 0) {
+          registerPendingTenderAnalysis({
+            sessionId: previousSessionId,
+            fileName: fileNames[0],
+            startedAt: new Date().toISOString(),
+          })
+          window.dispatchEvent(new Event(TENDER_ANALYSIS_STARTED))
+        }
+      }
+    }
+
+    clearTenderWorkspace()
+    activeSessionIdRef.current = null
+    ensureSessionInFlightRef.current = null
+    tendersRef.current = []
+    viewModeRef.current = "edit"
+    setViewMode("edit")
+    setTenders([])
+    setAnalyzing(false)
+    setActiveSessionId(null)
+    setModel(DEFAULT_MODELS.tender)
+    setSelectedTemplate(null)
+    setTraceEvents([])
+    setThinkingText("")
+    setError(null)
+    setStreamingStatus("idle")
+    setConfidence(null)
+    setPendingFiles([])
+    setSelectedUploadFileIds(new Set())
+    setShowDiffsOnly(true)
+    setAiCompareResult(null)
+    setMockWarning(null)
+    setEmailSource(null)
+    setSelectedAttachmentIds(new Set())
+    setStatusBanner(null)
+  }, [persistSessionSnapshot, buildCurrentSnapshot, pendingFiles, selectedUploadFileIds])
+
+  useEffect(() => {
+    const handler = () => {
+      void resetForNewAnalyze()
+    }
+    window.addEventListener(TENDER_NEW_ANALYZE_EVENT, handler)
+    return () => window.removeEventListener(TENDER_NEW_ANALYZE_EVENT, handler)
+  }, [resetForNewAnalyze])
+
+  async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? [])
     if (files.length === 0) return
 
@@ -696,7 +1404,7 @@ function TenderPageContent() {
 
     if (uniqueAdded.length === 0) return
 
-    resetState()
+    resetForNewBatch()
     setPendingFiles((prev) => {
       const existingIds = new Set(prev.map((p) => p.id))
       const merged = [...prev]
@@ -710,6 +1418,11 @@ function TenderPageContent() {
       for (const entry of uniqueAdded) next.add(entry.id)
       return next
     })
+    await ensureSessionId(
+      uniqueAdded.length === 1
+        ? uniqueAdded[0].file.name
+        : `Batch (${uniqueAdded.length} files)`
+    )
     if (fileInputRef.current) fileInputRef.current.value = ""
   }
 
@@ -721,11 +1434,55 @@ function TenderPageContent() {
       return
     }
 
-    resetState()
+    resetForNewBatch()
     setError(null)
-    for (let i = 0; i < selectedFiles.length; i++) {
-      await extractFromFile(selectedFiles[i].file, { skipReset: i > 0 })
+    const sessionId = await ensureSessionId(
+      selectedFiles.length === 1
+        ? selectedFiles[0].file.name
+        : `Batch (${selectedFiles.length} files)`
+    )
+    if (!sessionId) {
+      setError("Failed to create tender session")
+      setStreamingStatus("error")
+      return
     }
+
+    const fileNames = selectedFiles.map((f) => f.file.name)
+    await runTenderBatch({
+      sessionId,
+      fileNames,
+      analyzeOne: async (index) => ({
+        fileName: selectedFiles[index].file.name,
+        result: await analyzeOneTenderFile(selectedFiles[index].file, {
+          skipReset: true,
+          sessionId,
+        }),
+      }),
+    })
+  }
+
+  async function handleAnalyzeSingleUploadFile() {
+    if (pendingFiles.length !== 1) return
+    const file = pendingFiles[0].file
+    resetForNewBatch()
+    setError(null)
+    const sessionId = await ensureSessionId(file.name)
+    if (!sessionId) {
+      setError("Failed to create tender session")
+      setStreamingStatus("error")
+      return
+    }
+    await runTenderBatch({
+      sessionId,
+      fileNames: [file.name],
+      analyzeOne: async () => ({
+        fileName: file.name,
+        result: await analyzeOneTenderFile(file, {
+          skipReset: true,
+          sessionId,
+        }),
+      }),
+    })
   }
 
   function addField(ti: number, defaultFieldLabel?: string) {
@@ -764,11 +1521,13 @@ function TenderPageContent() {
         matchCount,
       }),
     })
-      .then((r) => {
+      .then(async (r) => {
+        if (await handleUnauthorizedResponse(r, refreshSession)) return null
         if (!r.ok) throw new Error("Export failed")
         return r.blob()
       })
       .then((blob) => {
+        if (!blob) return
         const url = URL.createObjectURL(blob)
         const a = document.createElement("a")
         a.href = url
@@ -797,6 +1556,7 @@ function TenderPageContent() {
             fields: tender.fields,
           }),
         })
+        if (await handleUnauthorizedResponse(res, refreshSession)) return
         if (!res.ok) throw new Error("PDF export failed")
 
         const blob = await res.blob()
@@ -825,6 +1585,24 @@ function TenderPageContent() {
     }
   }
 
+  useTenderWorkspaceSync({
+    viewMode,
+    tenders,
+    model,
+    selectedTemplate,
+    activeSessionId,
+    error,
+    streamingStatus,
+    confidence,
+    pendingFiles,
+    selectedUploadFileIds: Array.from(selectedUploadFileIds),
+    showDiffsOnly,
+    aiCompareResult,
+    mockWarning,
+    emailSource,
+    selectedAttachmentIds: Array.from(selectedAttachmentIds),
+  })
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between border-b px-6 py-3">
@@ -841,6 +1619,14 @@ function TenderPageContent() {
             <span className="text-xs text-muted-foreground">
               Confidence: {(confidence * 100).toFixed(0)}%
             </span>
+          )}
+          {activeSessionId && (
+            <Link
+              href={`/tender/${activeSessionId}`}
+              className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+            >
+              View session
+            </Link>
           )}
           {viewMode === "compare" && tenders.length >= 2 && (
             <span className="text-xs text-muted-foreground">
@@ -1081,125 +1867,47 @@ function TenderPageContent() {
             </div>
           )}
 
-          <div className={cn(analyzing && "opacity-50 pointer-events-none")}>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".pdf,.docx,.doc,.txt"
-              multiple
-              onChange={handleFileUpload}
-              className="hidden"
+          {!fromEmailId && (
+          <AgentUploadPanel
+            accept=".pdf,.docx,.doc,.txt"
+            disabled={analyzing}
+            fileInputRef={fileInputRef}
+            onFileChange={handleFileUpload}
+            hasFiles={pendingFiles.length > 0}
+            emptyDescription="PDF, DOCX, DOC, or TXT — pick one or more to analyze"
+            onAddMore={() => fileInputRef.current?.click()}
+            onClearAll={clearUploadedFiles}
+            summarySlot={
+              pendingFiles.length > 0 ? (
+                <div className="flex h-32 flex-col items-center justify-center rounded-lg bg-muted">
+                  <FileText className="h-10 w-10 text-muted-foreground/50" />
+                  <span className="mt-2 text-sm text-muted-foreground">
+                    {pendingFiles[0].file.name}
+                  </span>
+                  {pendingFiles.length > 1 ? (
+                    <span className="mt-1 text-xs text-muted-foreground/70">
+                      +{pendingFiles.length - 1} more in queue
+                    </span>
+                  ) : null}
+                </div>
+              ) : null
+            }
+          >
+            <AgentUploadQueue
+              pendingFiles={pendingFiles}
+              selectedFileIds={selectedUploadFileIds}
+              extracting={analyzing}
+              onToggleFile={toggleUploadFileSelection}
+              onSelectAll={selectAllUploadFiles}
+              onClearSelection={clearUploadFileSelection}
+              onRemoveSelected={removeSelectedUploadFiles}
+              onRemoveFile={removeUploadFile}
+              onAnalyzeSelected={handleAnalyzeSelectedUploadFiles}
+              onAnalyzeSingle={handleAnalyzeSingleUploadFile}
+              className="mt-0 text-left"
             />
-            <div
-              className="cursor-pointer rounded-lg border-2 border-dashed p-6 text-center transition-colors hover:border-primary/50 hover:bg-accent/50"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <Upload className="mx-auto h-8 w-8 text-muted-foreground" />
-              <p className="mt-2 text-sm font-medium">Upload Tender Documents</p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                PDF, DOCX, DOC, or TXT — pick one or more to batch analyze
-              </p>
-            </div>
-
-            {pendingFiles.length > 0 && (
-              <div className="mt-3 rounded-lg border bg-muted/20 p-3">
-                <div className="mb-2 flex items-center justify-between gap-2">
-                  <div className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                    <Paperclip className="h-3.5 w-3.5" />
-                    Upload Queue ({pendingFiles.length})
-                  </div>
-                  <div className="flex items-center gap-2 text-[10px]">
-                    <button
-                      type="button"
-                      onClick={selectAllUploadFiles}
-                      className="text-primary hover:underline"
-                    >
-                      All
-                    </button>
-                    <button
-                      type="button"
-                      onClick={clearUploadFileSelection}
-                      className="text-muted-foreground hover:underline"
-                    >
-                      Clear
-                    </button>
-                    <button
-                      type="button"
-                      onClick={removeSelectedUploadFiles}
-                      disabled={selectedUploadFileIds.size === 0}
-                      className="text-muted-foreground hover:underline disabled:opacity-50"
-                    >
-                      Remove selected
-                    </button>
-                  </div>
-                </div>
-                <div className="max-h-60 space-y-2 overflow-auto pr-1">
-                  {pendingFiles.map((entry) => {
-                    const selected = selectedUploadFileIds.has(entry.id)
-                    return (
-                      <div
-                        key={entry.id}
-                        className={cn(
-                          "flex items-start gap-2 rounded-md border p-2",
-                          selected && "border-primary bg-primary/5",
-                          "hover:bg-accent/40"
-                        )}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selected}
-                          onChange={() => toggleUploadFileSelection(entry.id)}
-                          className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary"
-                          aria-label={`Select ${entry.file.name}`}
-                        />
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-xs font-medium">{entry.file.name}</p>
-                          <p className="text-[10px] text-muted-foreground">
-                            {formatFileSize(entry.file.size)}
-                          </p>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => removeUploadFile(entry.id)}
-                          className="shrink-0 text-[10px] text-muted-foreground hover:text-destructive"
-                        >
-                          Remove
-                        </button>
-                      </div>
-                    )
-                  })}
-                </div>
-                <p className="mt-2 text-[10px] text-muted-foreground">
-                  {selectedUploadFileIds.size} selected for analysis
-                </p>
-                <div className="mt-3 flex items-center gap-2">
-                  <button
-                    onClick={handleAnalyzeSelectedUploadFiles}
-                    disabled={analyzing || selectedUploadFileIds.size === 0}
-                    className="inline-flex flex-1 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
-                  >
-                    {analyzing ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Sparkles className="h-4 w-4" />
-                    )}
-                    {analyzing
-                      ? "Analyzing..."
-                      : selectedUploadFileIds.size > 1
-                        ? `Analyze Selected (${selectedUploadFileIds.size})`
-                        : "Analyze Selected"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={clearPendingFiles}
-                    className="rounded-md border px-3 py-2 text-xs hover:bg-accent"
-                  >
-                    Clear list
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
+          </AgentUploadPanel>
+          )}
 
           {streamingStatus !== "idle" && (
             <div className="mt-3 space-y-3">
@@ -1299,7 +2007,7 @@ function TenderPageContent() {
 
         {/* Right: Edit or Compare */}
         <div className="flex-1 p-6 overflow-y-auto">
-          {viewMode === "compare" && comparisonResult ? (
+          {viewMode === "compare" && tenders.length >= 2 && comparisonResult ? (
             <TenderComparisonPanel
               comparisonResult={comparisonResult}
               tenderNames={tenders.map((t) => t.fileName || t.name)}
@@ -1312,12 +2020,6 @@ function TenderPageContent() {
               onEditFields={() => setViewMode("edit")}
               onSaveToKb={() => setKbImportOpen(true)}
             />
-          ) : viewMode === "compare" ? (
-            <div className="flex h-full flex-col items-center justify-center text-center">
-              <GitCompare className="h-12 w-12 text-muted-foreground/50" />
-              <h3 className="mt-4 text-lg font-semibold">Not enough tenders to compare</h3>
-              <p className="mt-1 text-sm text-muted-foreground">Upload at least 2 documents to compare.</p>
-            </div>
           ) : tenders.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center text-center">
               <FileText className="h-12 w-12 text-muted-foreground/50" />

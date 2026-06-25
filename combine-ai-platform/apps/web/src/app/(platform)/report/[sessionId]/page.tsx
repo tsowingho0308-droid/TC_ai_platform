@@ -18,6 +18,11 @@ import {
 import { cn } from "@combine-ai/shared-ui"
 import { ModelSelector } from "@/features/shared/model-selector"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
+import { useAuth } from "@/features/auth/auth-context"
+import {
+  getApiErrorMessage,
+  handleUnauthorizedResponse,
+} from "@/features/auth/handle-api-unauthorized"
 import { ReportDocumentPreview } from "@/features/report/components/report-document-preview"
 import type { ReportPreviewKind } from "@/features/report/lib/report-preview-kind"
 
@@ -56,6 +61,7 @@ interface SessionData {
 }
 
 export default function ReportSessionPage() {
+  const { refreshSession } = useAuth()
   const params = useParams()
   const sessionId = params?.sessionId as string
 
@@ -89,13 +95,10 @@ export default function ReportSessionPage() {
     if (!sessionId) return
     try {
       const res = await fetch("/api/report/sessions")
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        throw new Error(
-          (body as { detail?: string; error?: string }).detail ||
-            (body as { error?: string }).error ||
-            `Failed to load sessions (${res.status})`
-        )
+        throw new Error(getApiErrorMessage(res, body as { detail?: string; error?: string }))
       }
       const data = await res.json()
       const found = (data.sessions || []).find((s: SessionData) => s.id === sessionId)
@@ -125,7 +128,7 @@ export default function ReportSessionPage() {
     } finally {
       setLoading(false)
     }
-  }, [sessionId])
+  }, [sessionId, refreshSession])
 
   // Initial load
   useEffect(() => {
@@ -202,16 +205,20 @@ export default function ReportSessionPage() {
           fileName: session?.title,
         }),
       })
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
       if (res.ok) {
         const summary = (await res.json()) as ReportSummary
         setReportSummary(summary)
         setRowsManuallyEdited(false)
-        // Persist to DB so it's available on subsequent page loads
-        await fetch("/api/report/sessions", {
+        const patchRes = await fetch("/api/report/sessions", {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ id: sessionId, summary }),
-        }).catch((err) => console.error("Failed to persist summary:", err))
+        })
+        if (await handleUnauthorizedResponse(patchRes, refreshSession)) return
+        if (!patchRes.ok) {
+          console.error("Failed to persist summary:", patchRes.status)
+        }
       }
     } catch (err) {
       console.error("Failed to fetch summary:", err)
@@ -283,11 +290,16 @@ export default function ReportSessionPage() {
   async function persistRows(rows: TableRow[]) {
     if (!sessionId) return
     try {
-      await fetch("/api/report/sessions", {
+      const res = await fetch("/api/report/sessions", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: sessionId, rows }),
       })
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
+      if (!res.ok) {
+        const errData = (await res.json().catch(() => ({}))) as { error?: string; detail?: string }
+        console.error("Failed to persist rows:", getApiErrorMessage(res, errData))
+      }
     } catch (err) {
       console.error("Failed to persist rows:", err)
     }
@@ -307,9 +319,10 @@ export default function ReportSessionPage() {
           instructions: refineInstruction,
         }),
       })
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({})) as { error?: string }
-        throw new Error(errData.error || "Refinement failed")
+        const errData = await res.json().catch(() => ({})) as { error?: string; detail?: string }
+        throw new Error(getApiErrorMessage(res, errData))
       }
       const data = (await res.json()) as { rows?: TableRow[]; changes?: string; applied?: boolean }
       if (data.rows && data.rows.length > 0) {
@@ -353,7 +366,11 @@ export default function ReportSessionPage() {
           fileName: session?.title || fileMeta?.fileName || undefined,
         }),
       })
-      if (!res.ok) throw new Error("Export failed")
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({})) as { error?: string; detail?: string }
+        throw new Error(getApiErrorMessage(res, errData))
+      }
       await downloadExportBlob(await res.blob(), `report-summary-${Date.now()}.docx`)
     } catch (err) {
       console.error("Export Word error:", err)
@@ -371,7 +388,11 @@ export default function ReportSessionPage() {
           rows: extractedRows,
         }),
       })
-      if (!res.ok) throw new Error("Export failed")
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({})) as { error?: string; detail?: string }
+        throw new Error(getApiErrorMessage(res, errData))
+      }
       await downloadExportBlob(await res.blob(), `report-export-${Date.now()}.xlsx`)
     } catch (err) {
       console.error("Export Excel error:", err)

@@ -4,7 +4,6 @@ import { useState, useRef, useEffect, useCallback, useMemo, Suspense } from "rea
 import { useSearchParams } from "next/navigation"
 import Link from "next/link"
 import {
-  Upload,
   Download,
   Loader2,
   Brain,
@@ -32,6 +31,7 @@ import {
   buildUploadFileId,
   type PendingUploadFile,
 } from "@/features/report/components/report-upload-queue"
+import { AgentUploadPanel } from "@/features/shared/components/agent-upload-panel"
 import type { ExtractionRow } from "@/features/report/components/report-extraction-table"
 import type { PreviewDocument } from "@/features/report/components/pdf-highlight-viewer"
 import { ReportDocumentPreview } from "@/features/report/components/report-document-preview"
@@ -48,6 +48,12 @@ import {
   REPORT_NEW_ANALYZE_EVENT,
 } from "@/features/report/lib/report-workspace-store"
 import { useReportAnalyzeWorkspaceSync } from "@/features/report/hooks/use-report-analyze-workspace-sync"
+import { useAuth } from "@/features/auth/auth-context"
+import {
+  getApiErrorMessage,
+  handleUnauthorizedResponse,
+} from "@/features/auth/handle-api-unauthorized"
+import { readAgentSseStream } from "@/features/shared/lib/agent-sse"
 
 interface TableRow extends ExtractionRow {}
 
@@ -96,6 +102,7 @@ export default function ReportPage() {
 }
 
 function ReportPageContent() {
+  const { refreshSession } = useAuth()
   const searchParams = useSearchParams()
   const fromEmailId = searchParams.get("fromEmail")
   const emailSubjectParam = searchParams.get("emailSubject")
@@ -199,23 +206,29 @@ function ReportPageContent() {
     if (!activeSessionId) return
     setSavingRows(true)
     try {
-      await fetch("/api/report/sessions", {
+      const res = await fetch("/api/report/sessions", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: activeSessionId, rows }),
       })
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
+      if (!res.ok) {
+        const errData = (await res.json().catch(() => ({}))) as { error?: string; detail?: string }
+        console.error("Failed to save rows:", errData.error || errData.detail || res.status)
+        return
+      }
       window.dispatchEvent(new Event("report:sessions-updated"))
     } catch (err) {
       console.error("Failed to save rows:", err)
     } finally {
       setSavingRows(false)
     }
-  }, [activeSessionId])
+  }, [activeSessionId, refreshSession])
 
   const persistSessionSummary = useCallback(async (summary: ReportSummary) => {
     if (!activeSessionId) return
     try {
-      await fetch("/api/report/sessions", {
+      const res = await fetch("/api/report/sessions", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -224,11 +237,17 @@ function ReportPageContent() {
           draftNote: buildSummaryDraftNote(summary),
         }),
       })
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
+      if (!res.ok) {
+        const errData = (await res.json().catch(() => ({}))) as { error?: string; detail?: string }
+        console.error("Failed to save summary:", errData.error || errData.detail || res.status)
+        return
+      }
       window.dispatchEvent(new Event("report:sessions-updated"))
     } catch (err) {
       console.error("Failed to save summary:", err)
     }
-  }, [activeSessionId])
+  }, [activeSessionId, refreshSession])
 
   const ensureSessionId = useCallback(async (titleHint?: string): Promise<string | null> => {
     if (activeSessionId) return activeSessionId
@@ -240,6 +259,7 @@ function ReportPageContent() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id, title }),
       })
+      if (await handleUnauthorizedResponse(res, refreshSession)) return null
       if (res.ok) {
         setActiveSessionId(id)
         window.dispatchEvent(new Event("report:sessions-updated"))
@@ -249,7 +269,7 @@ function ReportPageContent() {
       console.error("Failed to create session:", err)
     }
     return null
-  }, [activeSessionId])
+  }, [activeSessionId, refreshSession])
 
   useEffect(() => {
     if (!activeSessionId || extractedRows.length === 0) return
@@ -334,9 +354,12 @@ function ReportPageContent() {
     const res = await fetch(
       `/api/email/attachments?action=download&id=${encodeURIComponent(attachmentId)}`
     )
+    if (await handleUnauthorizedResponse(res, refreshSession)) {
+      throw new Error("Unauthorized")
+    }
     if (!res.ok) {
-      const errData = await res.json().catch(() => ({})) as { error?: string }
-      throw new Error(errData.error || "Failed to download attachment")
+      const errData = await res.json().catch(() => ({})) as { error?: string; detail?: string }
+      throw new Error(getApiErrorMessage(res, errData))
     }
     const blob = await res.blob()
     const mimeType = att.mimeType || blob.type || "application/octet-stream"
@@ -356,41 +379,105 @@ function ReportPageContent() {
 
   async function consumeExtractStream(response: Response) {
     if (!response.ok) {
+      if (await handleUnauthorizedResponse(response, refreshSession)) return
       const errData = await response.json().catch(() => ({})) as { error?: string; detail?: string }
-      throw new Error(errData.detail || errData.error || `Server error: ${response.status}`)
+      throw new Error(getApiErrorMessage(response, errData))
     }
 
-    if (!response.body) {
-      throw new Error("Response body is not available for streaming")
-    }
+    await readAgentSseStream(response, (eventType, parsed) => {
+      if (!parsed) return
+      processSseEvent(eventType, parsed)
+    })
+  }
 
-    const bodyReader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ""
-
-    while (true) {
-      const { value, done } = await bodyReader.read()
-      if (value) {
-        buffer += decoder.decode(value, { stream: !done })
-      }
-
-      let boundary = buffer.indexOf("\n\n")
-      while (boundary >= 0) {
-        const record = buffer.slice(0, boundary).trim()
-        buffer = buffer.slice(boundary + 2)
-
-        if (record) {
-          processSseRecord(record)
+  function processSseEvent(eventType: string, parsed: Record<string, unknown>) {
+    try {
+      switch (eventType) {
+        case "trace": {
+          const trace = parsed.trace as TraceEvent | undefined
+          if (trace) {
+            const label = extractMergeRef.current.sourceLabel || previewFile?.name || "doc"
+            const seq = traceSeqRef.current++
+            setTraceEvents((prev) => [
+              ...prev,
+              { ...trace, id: `${trace.id}-${label}-${seq}` },
+            ])
+          }
+          break
         }
-
-        boundary = buffer.indexOf("\n\n")
+        case "thinking": {
+          const text = parsed.text as string | undefined
+          if (text) setThinkingText(text)
+          break
+        }
+        case "result": {
+          const result = parsed.result as {
+            sessionId?: string
+            rows?: TableRow[]
+            documentType?: string
+            confidence?: number
+            model?: string
+          } | undefined
+          if (result) {
+            if (result.model === "mock-template") {
+              setMockWarning(
+                "未連接大模型，目前為演示資料。請確認 combine-ai-platform/.env 中的 DASHSCOPE_API_KEY 並重啟 dev server。"
+              )
+            } else {
+              setMockWarning(null)
+            }
+            if (result.sessionId) setSessionId(result.sessionId)
+            const sourceLabel = extractMergeRef.current.sourceLabel
+            if (result.rows && result.rows.length > 0) {
+              const rows = sourceLabel
+                ? result.rows.map((row) => ({
+                    ...row,
+                    field: `${sourceLabel} · ${row.field}`,
+                  }))
+                : result.rows
+              setExtractedRows((prev) =>
+                extractMergeRef.current.appendRows ? [...prev, ...rows] : rows
+              )
+              if (!extractMergeRef.current.appendRows) {
+                setRowsManuallyEdited(false)
+              }
+            }
+            if (result.documentType) setDocumentType(result.documentType)
+            if (result.confidence !== undefined) setConfidence(result.confidence)
+            setStreamingStatus("highlighting")
+            if (!extractMergeRef.current.appendRows) {
+              setHighlightEnabled(true)
+            }
+          }
+          break
+        }
+        case "kbHighlights": {
+          const phrases = parsed.phrases as string[] | undefined
+          if (Array.isArray(phrases)) {
+            setKbHighlightPhrases(phrases)
+          }
+          break
+        }
+        case "summary": {
+          const summary = parsed.summary as ReportSummary | undefined
+          if (summary) {
+            setReportSummary(summary)
+            setRowsManuallyEdited(false)
+            setStreamingStatus("done")
+            void persistSessionSummary(summary)
+          }
+          break
+        }
+        case "error": {
+          const msg = (parsed.detail as string) || (parsed.error as string) || "Unknown error"
+          setError(msg)
+          setStreamingStatus("error")
+          break
+        }
       }
-
-      if (done) break
+    } catch {
+      // Skip unparseable records
     }
-
-    const remaining = buffer.trim()
-    if (remaining) processSseRecord(remaining)
   }
 
   async function extractFromEmailText() {
@@ -807,113 +894,6 @@ function ReportPageContent() {
     }
   }
 
-  function processSseRecord(raw: string) {
-    const lines = raw.split(/\r?\n/)
-    let eventType = "message"
-    const dataLines: string[] = []
-
-    for (const line of lines) {
-      if (line.startsWith("event:")) {
-        eventType = line.slice("event:".length).trim()
-      } else if (line.startsWith("data:")) {
-        dataLines.push(line.slice("data:".length).trim())
-      }
-    }
-
-    const data = dataLines.join("\n")
-    if (!data) return
-
-    try {
-      const parsed = JSON.parse(data)
-
-      switch (eventType) {
-        case "trace": {
-          const trace = parsed.trace as TraceEvent | undefined
-          if (trace) {
-            const label = extractMergeRef.current.sourceLabel || previewFile?.name || "doc"
-            const seq = traceSeqRef.current++
-            setTraceEvents((prev) => [
-              ...prev,
-              { ...trace, id: `${trace.id}-${label}-${seq}` },
-            ])
-          }
-          break
-        }
-        case "thinking": {
-          const text = parsed.text as string | undefined
-          if (text) setThinkingText(text)
-          break
-        }
-        case "result": {
-          const result = parsed.result as {
-            sessionId?: string
-            rows?: TableRow[]
-            documentType?: string
-            confidence?: number
-            model?: string
-          } | undefined
-          if (result) {
-            if (result.model === "mock-template") {
-              setMockWarning(
-                "未連接大模型，目前為演示資料。請確認 combine-ai-platform/.env 中的 DASHSCOPE_API_KEY 並重啟 dev server。"
-              )
-            } else {
-              setMockWarning(null)
-            }
-            if (result.sessionId) setSessionId(result.sessionId)
-            const sourceLabel = extractMergeRef.current.sourceLabel
-            if (result.rows && result.rows.length > 0) {
-              const rows = sourceLabel
-                ? result.rows.map((row) => ({
-                    ...row,
-                    field: `${sourceLabel} · ${row.field}`,
-                  }))
-                : result.rows
-              setExtractedRows((prev) =>
-                extractMergeRef.current.appendRows ? [...prev, ...rows] : rows
-              )
-              if (!extractMergeRef.current.appendRows) {
-                setRowsManuallyEdited(false)
-              }
-            }
-            if (result.documentType) setDocumentType(result.documentType)
-            if (result.confidence !== undefined) setConfidence(result.confidence)
-            setStreamingStatus("highlighting")
-            if (!extractMergeRef.current.appendRows) {
-              setHighlightEnabled(true)
-            }
-          }
-          break
-        }
-        case "kbHighlights": {
-          const payload = parsed as { phrases?: string[] }
-          if (Array.isArray(payload.phrases)) {
-            setKbHighlightPhrases(payload.phrases)
-          }
-          break
-        }
-        case "summary": {
-          const summary = parsed.summary as ReportSummary | undefined
-          if (summary) {
-            setReportSummary(summary)
-            setRowsManuallyEdited(false)
-            setStreamingStatus("done")
-            void persistSessionSummary(summary)
-          }
-          break
-        }
-        case "error": {
-          const msg = (parsed.detail as string) || (parsed.error as string) || "Unknown error"
-          setError(msg)
-          setStreamingStatus("error")
-          break
-        }
-      }
-    } catch {
-      // Skip unparseable records
-    }
-  }
-
   function startEditRow(index: number) {
     const row = extractedRows[index]
     if (!row) return
@@ -982,9 +962,10 @@ function ReportPageContent() {
           documentType: documentType || undefined,
         }),
       })
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({})) as { error?: string }
-        throw new Error(errData.error || "Summary refresh failed")
+        const errData = await res.json().catch(() => ({})) as { error?: string; detail?: string }
+        throw new Error(getApiErrorMessage(res, errData))
       }
       const summary = (await res.json()) as ReportSummary
       setReportSummary(summary)
@@ -1010,9 +991,10 @@ function ReportPageContent() {
           instructions: refineInstruction,
         }),
       })
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({})) as { error?: string }
-        throw new Error(errData.error || "Refinement failed")
+        const errData = await res.json().catch(() => ({})) as { error?: string; detail?: string }
+        throw new Error(getApiErrorMessage(res, errData))
       }
       const data = (await res.json()) as { rows?: TableRow[]; changes?: string; applied?: boolean }
       if (data.rows && data.rows.length > 0) {
@@ -1029,12 +1011,12 @@ function ReportPageContent() {
   }
 
   async function downloadExportBlob(blob: Blob, filename: string) {
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.href = url
     a.download = filename
-    a.click()
-    URL.revokeObjectURL(url)
+      a.click()
+      URL.revokeObjectURL(url)
   }
 
   async function exportWord() {
@@ -1052,7 +1034,11 @@ function ReportPageContent() {
           fileName: previewFile?.name || emailSource?.subject,
         }),
       })
-      if (!res.ok) throw new Error("Export failed")
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({})) as { error?: string; detail?: string }
+        throw new Error(getApiErrorMessage(res, errData))
+      }
       await downloadExportBlob(await res.blob(), `report-summary-${Date.now()}.docx`)
     } catch (err) {
       console.error("Export Word error:", err)
@@ -1070,7 +1056,11 @@ function ReportPageContent() {
           rows: extractedRows,
         }),
       })
-      if (!res.ok) throw new Error("Export failed")
+      if (await handleUnauthorizedResponse(res, refreshSession)) return
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({})) as { error?: string; detail?: string }
+        throw new Error(getApiErrorMessage(res, errData))
+      }
       await downloadExportBlob(await res.blob(), `report-export-${Date.now()}.xlsx`)
     } catch (err) {
       console.error("Export Excel error:", err)
@@ -1300,26 +1290,23 @@ function ReportPageContent() {
             )}
 
             {!fromEmailId && (
-            <div
-              className={cn(
-                "rounded-lg border-2 border-dashed p-6 text-center transition-colors",
-                "hover:border-primary/50 hover:bg-accent/50",
-                previewFile ? "border-solid" : ""
-              )}
-            >
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*,.pdf,.docx,.doc,.txt"
-                multiple
-                onChange={handleFileUpload}
-                className="hidden"
-              />
-              {previewFile ? (
-                <div className="space-y-4">
-                  {previewFile?.type.startsWith("image/") && previewUrl ? (
-                    <img src={previewUrl} alt="Preview" className="mx-auto max-h-48 rounded-lg object-contain" />
-                  ) : previewFile?.type === "application/pdf" ? (
+            <AgentUploadPanel
+              accept="image/*,.pdf,.docx,.doc,.txt"
+              fileInputRef={fileInputRef}
+              onFileChange={handleFileUpload}
+              hasFiles={pendingFiles.length > 0}
+              emptyDescription="PNG, JPEG, PDF, DOCX, or TXT — pick one or more to analyze"
+              onAddMore={() => fileInputRef.current?.click()}
+              onClearAll={clearUploadedFiles}
+              summarySlot={
+                previewFile ? (
+                  previewFile.type.startsWith("image/") && previewUrl ? (
+                    <img
+                      src={previewUrl}
+                      alt="Preview"
+                      className="mx-auto max-h-48 rounded-lg object-contain"
+                    />
+                  ) : previewFile.type === "application/pdf" ? (
                     <div className="flex h-32 flex-col items-center justify-center rounded-lg bg-muted">
                       <FileText className="h-10 w-10 text-muted-foreground/50" />
                       <span className="mt-2 text-sm text-muted-foreground">
@@ -1333,51 +1320,27 @@ function ReportPageContent() {
                     <div className="flex h-32 items-center justify-center rounded-lg bg-muted">
                       <FileText className="h-10 w-10 text-muted-foreground/50" />
                       <span className="ml-3 text-sm text-muted-foreground">
-                        {previewFile?.name || "Document"}
+                        {previewFile.name || "Document"}
                       </span>
                     </div>
-                  )}
-                  <ReportUploadQueue
-                    pendingFiles={pendingFiles}
-                    selectedFileIds={selectedUploadFileIds}
-                    extracting={isAnalyzing}
-                    onToggleFile={toggleUploadFileSelection}
-                    onSelectAll={selectAllUploadFiles}
-                    onClearSelection={clearUploadFileSelection}
-                    onRemoveSelected={removeSelectedUploadFiles}
-                    onRemoveFile={removeUploadFile}
-                    onAnalyzeSelected={handleBatchAnalyzeSelected}
-                    onAnalyzeSingle={handleAnalyzeFile}
-                    className="mt-0 text-left"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="text-sm text-primary hover:underline"
-                  >
-                    Add more files
-                  </button>
-                  <button
-                    type="button"
-                    onClick={clearUploadedFiles}
-                    className="block w-full text-sm text-muted-foreground hover:text-foreground"
-                  >
-                    Clear all
-                  </button>
-                </div>
-              ) : (
-                <div
-                  onClick={() => fileInputRef.current?.click()}
-                  className="cursor-pointer space-y-3"
-                >
-                  <Upload className="mx-auto h-10 w-10 text-muted-foreground" />
-                  <p className="text-sm font-medium">Upload document(s)</p>
-                  <p className="text-xs text-muted-foreground">
-                    PNG, JPEG, PDF, DOCX, or TXT — pick one or more to analyze
-                  </p>
-                </div>
-              )}
-            </div>
+                  )
+                ) : null
+              }
+            >
+              <ReportUploadQueue
+                pendingFiles={pendingFiles}
+                selectedFileIds={selectedUploadFileIds}
+                extracting={isAnalyzing}
+                onToggleFile={toggleUploadFileSelection}
+                onSelectAll={selectAllUploadFiles}
+                onClearSelection={clearUploadFileSelection}
+                onRemoveSelected={removeSelectedUploadFiles}
+                onRemoveFile={removeUploadFile}
+                onAnalyzeSelected={handleBatchAnalyzeSelected}
+                onAnalyzeSingle={handleAnalyzeFile}
+                className="mt-0 text-left"
+              />
+            </AgentUploadPanel>
             )}
 
             {streamingStatus !== "idle" && (
@@ -1477,17 +1440,17 @@ function ReportPageContent() {
                     </span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <button
+                <button
                       onClick={addRow}
                       className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
-                    >
+                >
                       <Plus className="h-3 w-3" />
                       Add Row
-                    </button>
+                </button>
                     {rowsManuallyEdited && (
                       <span className="text-[10px] text-amber-600">(edited)</span>
                     )}
-                  </div>
+              </div>
                 </div>
 
                 <div className="max-h-80 overflow-y-auto rounded-lg border">
@@ -1653,7 +1616,7 @@ function ReportPageContent() {
                       ))}
                     </tbody>
                   </table>
-                </div>
+          </div>
 
                 {/* Refine with AI */}
                 <div className="mt-3 space-y-2">
@@ -1704,7 +1667,7 @@ function ReportPageContent() {
                   )}
                 </div>
                 {rowsManuallyEdited && reportSummary && (
-                  <button
+                <button
                     type="button"
                     onClick={() => refreshSummaryFromRows(extractedRows)}
                     disabled={refreshingSummary || extractedRows.length === 0}
@@ -1716,7 +1679,7 @@ function ReportPageContent() {
                       <Sparkles className="h-3.5 w-3.5" />
                     )}
                     Refresh summary
-                  </button>
+                </button>
                 )}
               </div>
               {rowsManuallyEdited && reportSummary && (
@@ -1770,20 +1733,20 @@ function ReportPageContent() {
                       <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                         參考條文
                       </p>
-                      <div className="space-y-2">
+                <div className="space-y-2">
                         {reportSummary.kbReferences.map((ref, i) => (
                           <div key={i} className="rounded-md border bg-accent/20 px-3 py-2">
                             <p className="text-sm font-medium">{ref.articleTitle}</p>
                             <p className="text-xs text-muted-foreground">{ref.knowledgeBaseName}</p>
                             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{ref.relevance}</p>
-                          </div>
-                        ))}
-                      </div>
                     </div>
-                  )}
+                  ))}
+                      </div>
                 </div>
               )}
             </div>
+              )}
+          </div>
 
           </div>
 
@@ -1802,6 +1765,7 @@ function ReportPageContent() {
                 highlightEnabled={highlightEnabled}
                 onHighlightEnabledChange={handleHighlightEnabledChange}
                 focusTarget={focusTarget}
+                kbHighlightPhrases={kbHighlightPhrases}
                 className="h-full"
               />
             ) : (

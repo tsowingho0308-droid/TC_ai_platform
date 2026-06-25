@@ -7,6 +7,7 @@ import { parseAIJson } from "@/lib/server/parse-json"
 import type { Prisma } from "@prisma/client"
 import { DEFAULT_MODELS } from "@combine-ai/ai-provider"
 import { getDashScopeProvider, ensureAiEnvLoaded } from "@combine-ai/ai-provider/server"
+import { mergeExtractedTenderIntoWorkspace } from "@/features/tender/lib/tender-session-workspace"
 
 export const dynamic = "force-dynamic"
 export const maxDuration = 120
@@ -545,21 +546,34 @@ async function performExtraction(
       })
 
       if (existing) {
+        const previousInputs =
+          existing.fieldInputs &&
+          typeof existing.fieldInputs === "object" &&
+          !Array.isArray(existing.fieldInputs)
+            ? (existing.fieldInputs as Record<string, unknown>)
+            : {}
+        const preservedWorkspace = previousInputs.__workspace
+        const mergedWorkspace = mergeExtractedTenderIntoWorkspace(preservedWorkspace, {
+          fileName,
+          fields,
+          tenderTitle: extracted.tenderTitle,
+          tenderType: extracted.tenderType ?? null,
+        })
+
         await prisma.tenderSession.update({
           where: { id: sessionId },
           data: {
-            fieldInputs: fieldInputs as Prisma.InputJsonValue,
+            fieldInputs: {
+              ...fieldInputs,
+              __workspace: mergedWorkspace,
+            } as unknown as Prisma.InputJsonValue,
             tenderType: extracted.tenderType || existing.tenderType,
-            status: "completed",
+            status: "processing",
           },
         })
       }
     } catch (dbErr) {
       console.error("Failed to save tender extraction:", dbErr)
-      // Mark as failed on save error
-      if (sessionId) {
-        try { await prisma.tenderSession.update({ where: { id: sessionId }, data: { status: "failed" } }) } catch { /* best-effort */ }
-      }
     }
   }
 
@@ -720,12 +734,29 @@ async function handleStreamExtract(
               where: { id: sessionId, workspaceId: session.workspaceId },
             })
             if (existing) {
+              const previousInputs =
+                existing.fieldInputs &&
+                typeof existing.fieldInputs === "object" &&
+                !Array.isArray(existing.fieldInputs)
+                  ? (existing.fieldInputs as Record<string, unknown>)
+                  : {}
+              const preservedWorkspace = previousInputs.__workspace
+              const mergedWorkspace = mergeExtractedTenderIntoWorkspace(preservedWorkspace, {
+                fileName,
+                fields,
+                tenderTitle: extracted.tenderTitle,
+                tenderType: extracted.tenderType ?? null,
+              })
+
               await prisma.tenderSession.update({
                 where: { id: sessionId },
                 data: {
-                  fieldInputs: fieldInputs as Prisma.InputJsonValue,
+                  fieldInputs: {
+                    ...fieldInputs,
+                    __workspace: mergedWorkspace,
+                  } as unknown as Prisma.InputJsonValue,
                   tenderType: extracted.tenderType || existing.tenderType,
-                  status: "completed",
+                  status: "processing",
                 },
               })
             }

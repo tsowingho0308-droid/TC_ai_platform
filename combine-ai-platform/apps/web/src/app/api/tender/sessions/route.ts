@@ -7,11 +7,35 @@ export const dynamic = "force-dynamic"
 
 // ── GET /api/tender/sessions ──────────────────────────────────
 
-export async function GET() {
+export async function GET(request: Request) {
   const session = await requireSession().catch(() => null)
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
+  const { searchParams } = new URL(request.url)
+  const id = searchParams.get("id")
+
   try {
+    if (id) {
+      const tenderSession = await prisma.tenderSession.findFirst({
+        where: { id, workspaceId: session.workspaceId },
+        select: {
+          id: true,
+          title: true,
+          templateId: true,
+          tenderType: true,
+          fieldInputs: true,
+          status: true,
+          updatedAt: true,
+        },
+      })
+
+      if (!tenderSession) {
+        return NextResponse.json({ error: "Session not found" }, { status: 404 })
+      }
+
+      return NextResponse.json({ session: tenderSession })
+    }
+
     const sessions = await prisma.tenderSession.findMany({
       where: { workspaceId: session.workspaceId },
       orderBy: { updatedAt: "desc" },

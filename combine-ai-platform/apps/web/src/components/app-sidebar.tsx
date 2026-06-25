@@ -25,6 +25,7 @@ import { HelpdeskSidebarContent } from "@/features/helpdesk/components/helpdesk-
 import { WorkflowSidebarContent } from "@/features/workflow/components/workflow-sidebar-content"
 import { ContextSidebarContent } from "@/features/context/components/context-sidebar-content"
 import { getReportAgentHref } from "@/features/report/lib/report-workspace-store"
+import { getTenderAgentHref } from "@/features/tender/lib/tender-workspace-store"
 
 interface AgentNavItem {
   slug: string
@@ -96,7 +97,12 @@ export function AppSidebar() {
         <nav className="space-y-1">
           {AGENTS.map((agent) => {
             const isActive = agent.slug === activeAgent
-            const href = agent.slug === "report" ? getReportAgentHref() : agent.href
+            const href =
+              agent.slug === "report"
+                ? getReportAgentHref()
+                : agent.slug === "tender"
+                  ? getTenderAgentHref()
+                  : agent.href
             return (
               <Link
                 key={agent.slug}
