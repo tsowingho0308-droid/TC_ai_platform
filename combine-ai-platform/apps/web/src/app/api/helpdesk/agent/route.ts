@@ -18,11 +18,7 @@ import {
   HELPDESK_SYSTEM_PROMPT,
   HELPDESK_TOOLS,
 } from "@/features/helpdesk/api/helpdesk-tools"
-import {
-  pushTask,
-  getTaskStatus,
-  getTaskResult,
-} from "@/features/helpdesk/api/helpdesk-queue"
+import { pushTask } from "@/features/helpdesk/api/helpdesk-queue"
 
 export const dynamic = "force-dynamic"
 
@@ -1023,35 +1019,79 @@ ${suggestions.map((s) => `[Doc] ${s.title} (${s.department}, ${Math.round((s.sim
                   return
                 }
 
-                // ── Tool calls detected → auto-upgrade to async ──
-                // Push messages BEFORE the incomplete tool-call turn.
-                // The Python worker will re-do the AI call from scratch
-                // with a clean tool-calling loop — no orphaned tool calls.
-                const taskId = `task_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+                // ── Tool calls detected → execute in-process ──
+                // Append assistant message with tool calls to the conversation
+                currentMessages.push({
+                  role: "assistant",
+                  content: accumulatedContent || "",
+                  toolCalls: result.toolCalls,
+                } as ChatMessage)
 
-                await pushTask({
-                  taskId,
-                  conversationId: convId,
-                  workspaceId: session.workspaceId,
-                  userId: session.sub,
-                  department: streamDept || "GENERAL",
-                  model: (streamModel as string) || DEFAULT_MODELS.helpdesk,
-                  messages: currentMessages, // pre-tool-call state — clean
-                  tools: streamTools.length > 0 ? streamTools : undefined,
-                  systemPrompt,
-                  createdAt: new Date().toISOString(),
-                })
+                // Execute each tool call and append results
+                for (const tc of result.toolCalls) {
+                  const fnName = tc.function.name
 
-                // Notify frontend to switch to polling mode
-                sendSSE("upgrade_to_async", {
-                  taskId,
-                  conversationId: convId,
-                })
+                  // Track searches — remove tool after first use to prevent loops
+                  if (fnName === "search_knowledge_base") {
+                    searchedKB = true
+                    streamTools = streamTools.filter(
+                      (t) => t.function.name !== "search_knowledge_base"
+                    )
+                  }
 
-                if (!clientDisconnected) {
-                  controller.close()
+                  // Parse args for SSE tool_use event
+                  let toolArgs: Record<string, unknown> = {}
+                  try {
+                    toolArgs = JSON.parse(tc.function.arguments)
+                  } catch {
+                    // ignore parse error — executeToolCall handles it
+                  }
+
+                  sendSSE("tool_use", { name: fnName, args: toolArgs })
+
+                  // Execute tool in-process (same as synchronous chat handler)
+                  const { messages: toolResultMessages } = await executeToolCall(
+                    tc,
+                    session
+                  )
+
+                  // Extract a human-readable summary from the tool result
+                  let summary = "Done"
+                  const resultContent = toolResultMessages[0]?.content as string | undefined
+                  if (resultContent) {
+                    try {
+                      const parsed = JSON.parse(resultContent)
+                      if (parsed.error) {
+                        summary = `Error: ${parsed.error}`
+                      } else {
+                        summary =
+                          (parsed.message as string) ||
+                          (parsed.totalResults != null
+                            ? `Found ${parsed.totalResults} results`
+                            : parsed.ticketId
+                              ? `Ticket #${(parsed.ticketId as string).slice(0, 8)} created`
+                              : parsed.runId
+                                ? `Workflow started`
+                                : parsed.success === true
+                                  ? `Workflow started`
+                                  : "Done")
+                      }
+                    } catch {
+                      summary =
+                        resultContent.length > 200
+                          ? resultContent.slice(0, 200) + "…"
+                          : resultContent
+                    }
+                  }
+
+                  sendSSE("tool_result", { name: fnName, summary })
+
+                  // Append tool result messages to conversation
+                  currentMessages.push(...toolResultMessages)
                 }
-                return
+
+                // Continue the loop — make another AI call with updated messages
+                continue
               }
 
               // Max rounds exceeded
