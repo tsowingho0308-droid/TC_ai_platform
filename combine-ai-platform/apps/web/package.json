@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "postinstall": "node scripts/copy-pdf-worker.mjs",
-    "dev": "next dev -H 127.0.0.1",
+    "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",

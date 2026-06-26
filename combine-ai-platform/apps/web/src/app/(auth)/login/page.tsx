@@ -7,6 +7,7 @@ const LOGIN_ERROR_MESSAGES: Record<string, string> = {
   no_code: "Google sign-in was cancelled or incomplete.",
   access_denied: "Google sign-in was denied. Make sure your Gmail is added as a Test user in Google Cloud Console.",
   auth_failed: "Google sign-in failed. Please try again.",
+  session_expired: "登录已过期，请重新登录。",
 }
 
 export default function LoginPage() {
@@ -21,6 +22,11 @@ export default function LoginPage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
     const urlError = params.get("error")
+    const reason = params.get("reason")
+    if (reason && LOGIN_ERROR_MESSAGES[reason]) {
+      setError(LOGIN_ERROR_MESSAGES[reason])
+      return
+    }
     if (!urlError) return
     setError(LOGIN_ERROR_MESSAGES[urlError] || decodeURIComponent(urlError))
   }, [])

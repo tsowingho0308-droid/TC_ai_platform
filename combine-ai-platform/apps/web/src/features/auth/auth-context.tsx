@@ -1,6 +1,11 @@
 "use client"
 
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react"
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
+import {
+  getRequestPath,
+  redirectToLoginForUnauthorized,
+  shouldRedirectUnauthorizedApi,
+} from "@/features/auth/handle-api-unauthorized"
 
 interface SessionUser {
   id: string
@@ -29,6 +34,7 @@ const AuthContext = createContext<AuthContextValue>({
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<SessionUser | null>(null)
   const [loading, setLoading] = useState(true)
+  const redirectingRef = useRef(false)
 
   async function refreshSession() {
     try {
@@ -54,6 +60,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     refreshSession()
+  }, [])
+
+  useEffect(() => {
+    const originalFetch = window.fetch.bind(window)
+
+    window.fetch = async (input, init) => {
+      const response = await originalFetch(input, init)
+      const path = getRequestPath(input)
+
+      if (
+        response.status === 401 &&
+        shouldRedirectUnauthorizedApi(path) &&
+        !redirectingRef.current
+      ) {
+        redirectingRef.current = true
+        setUser(null)
+        await redirectToLoginForUnauthorized()
+      }
+
+      return response
+    }
+
+    return () => {
+      window.fetch = originalFetch
+    }
   }, [])
 
   return (

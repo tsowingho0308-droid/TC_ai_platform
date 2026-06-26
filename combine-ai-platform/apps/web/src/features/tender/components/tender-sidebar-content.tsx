@@ -1,10 +1,13 @@
 "use client"
 
-import { useEffect, useState, useCallback } from "react"
+import { useEffect, useState, useCallback, useRef } from "react"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@combine-ai/shared-ui"
-import { Plus, Trash2, FileText } from "lucide-react"
+import { Plus, Trash2, FileText, Loader2 } from "lucide-react"
+import { startNewTenderAnalyze, getTenderWorkspace } from "@/features/tender/lib/tender-workspace-store"
+import { isTenderAnalysisInProgress } from "@/features/tender/tender-analysis-tracker"
+import { isTenderBatchInProgress } from "@/features/tender/lib/tender-session-workspace"
 
 interface TenderSession {
   id: string
@@ -31,7 +34,8 @@ function StatusBadge({ status }: { status: string }) {
   }
   const cfg = config[status] || { label: status, className: "bg-muted text-muted-foreground" }
   return (
-    <span className={`rounded-full px-1.5 py-0 text-[10px] font-medium ${cfg.className}`}>
+    <span className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0 text-[10px] font-medium ${cfg.className}`}>
+      {status === "processing" && <Loader2 className="h-2.5 w-2.5 animate-spin" />}
       {cfg.label}
     </span>
   )
@@ -44,10 +48,16 @@ export function TenderSidebarContent() {
   const [templates, setTemplates] = useState<TenderTemplate[]>([])
   const [loading, setLoading] = useState(true)
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  const activeSessionId = pathname.startsWith("/tender/")
-    ? decodeURIComponent(pathname.split("/").pop() || "")
-    : null
+  const workspaceSessionId = getTenderWorkspace()?.activeSessionId
+
+  const activeSessionId =
+    pathname.startsWith("/tender/") &&
+    pathname !== "/tender/compare" &&
+    !pathname.startsWith("/tender/new")
+      ? decodeURIComponent(pathname.split("/").pop() || "")
+      : null
 
   const fetchData = useCallback(async () => {
     try {
@@ -57,7 +67,21 @@ export function TenderSidebarContent() {
       ])
       if (sessionsRes.ok) {
         const data = await sessionsRes.json()
-        setSessions(data.sessions || [])
+        const list: TenderSession[] = data.sessions || []
+        setSessions(list)
+
+        const hasProcessing = list.some(
+          (s) =>
+            s.status === "processing" ||
+            isTenderAnalysisInProgress(s.id) ||
+            isTenderBatchInProgress(s.id)
+        )
+        if (hasProcessing && !intervalRef.current) {
+          intervalRef.current = setInterval(fetchData, 3000)
+        } else if (!hasProcessing && intervalRef.current) {
+          clearInterval(intervalRef.current)
+          intervalRef.current = null
+        }
       }
       if (templatesRes.ok) {
         const data = await templatesRes.json()
@@ -74,22 +98,21 @@ export function TenderSidebarContent() {
     fetchData()
     const handler = () => fetchData()
     window.addEventListener("tender:sessions-updated", handler)
-    return () => window.removeEventListener("tender:sessions-updated", handler)
+    return () => {
+      window.removeEventListener("tender:sessions-updated", handler)
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+    }
   }, [fetchData])
 
-  const handleCreateSession = useCallback(async () => {
-    const id = `tender-${Date.now()}`
-    const res = await fetch("/api/tender/sessions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, title: `Tender Analysis ${new Date().toLocaleDateString()}` }),
-    })
-    if (res.ok) {
-      const data = await res.json()
-      setSessions(data.sessions || [])
-      router.push(`/tender/${id}`)
+  const handleNewAnalyze = useCallback(() => {
+    startNewTenderAnalyze()
+    if (pathname !== "/tender") {
+      router.push("/tender")
     }
-  }, [router])
+  }, [pathname, router])
 
   const handleDeleteSession = useCallback(async (sessionId: string) => {
     if (pendingDelete === sessionId) {
@@ -130,11 +153,16 @@ export function TenderSidebarContent() {
     <div className="px-2">
       {/* New Session */}
       <button
-        onClick={handleCreateSession}
-        className="mb-3 flex w-full items-center gap-2 rounded-md border border-dashed px-3 py-2 text-sm text-muted-foreground hover:border-primary/50 hover:bg-accent hover:text-accent-foreground"
+        onClick={handleNewAnalyze}
+        className={cn(
+          "mb-3 flex w-full items-center gap-2 rounded-md border border-dashed px-3 py-2 text-sm transition-colors",
+          pathname === "/tender"
+            ? "border-primary/50 bg-accent text-accent-foreground"
+            : "text-muted-foreground hover:border-primary/50 hover:bg-accent hover:text-accent-foreground"
+        )}
       >
         <Plus className="h-4 w-4" />
-        New Tender Analysis
+        New Tender Analyze
       </button>
 
       {/* Templates Quick Select */}
@@ -181,8 +209,16 @@ export function TenderSidebarContent() {
         ) : (
           <nav className="space-y-0.5">
             {sessions.map((session) => {
-              const isActive = session.id === activeSessionId
+              const isActive =
+                session.id === activeSessionId ||
+                (pathname === "/tender" && session.id === workspaceSessionId)
               const typeLabel = getTenderTypeLabel(session.tenderType)
+              const displayStatus =
+                session.status === "processing" ||
+                isTenderAnalysisInProgress(session.id) ||
+                isTenderBatchInProgress(session.id)
+                  ? "processing"
+                  : session.status
               return (
                 <div key={session.id} className="group relative">
                   <Link
@@ -201,7 +237,7 @@ export function TenderSidebarContent() {
                         <span>{formatDate(session.updatedAt)}</span>
                         {typeLabel && <span>· {typeLabel}</span>}
                         <span>·</span>
-                        <StatusBadge status={session.status} />
+                        <StatusBadge status={displayStatus} />
                       </div>
                     </div>
                   </Link>

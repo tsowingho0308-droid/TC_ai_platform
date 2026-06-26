@@ -49,6 +49,7 @@ interface PdfHighlightViewerProps {
   highlightEnabled?: boolean
   onHighlightEnabledChange?: (enabled: boolean) => void
   focusTarget?: { page?: number; field: string; value: string } | null
+  kbHighlightPhrases?: string[]
   className?: string
 }
 
@@ -80,6 +81,7 @@ export default function PdfHighlightViewer({
   highlightEnabled: highlightEnabledProp,
   onHighlightEnabledChange,
   focusTarget,
+  kbHighlightPhrases = [],
   className,
 }: PdfHighlightViewerProps) {
   const [internalHighlightEnabled, setInternalHighlightEnabled] = useState(false)
@@ -98,6 +100,15 @@ export default function PdfHighlightViewer({
   const [overlayRects, setOverlayRects] = useState<OverlayRect[]>([])
   const [searchTerms, setSearchTerms] = useState<string[]>([])
   const [searchInput, setSearchInput] = useState("")
+
+  useEffect(() => {
+    if (!kbHighlightPhrases.length) return
+    setSearchTerms((prev) => {
+      const merged = new Set([...kbHighlightPhrases, ...prev])
+      return Array.from(merged)
+    })
+  }, [kbHighlightPhrases])
+
   const [retryKey, setRetryKey] = useState(0)
   const [layerSize, setLayerSize] = useState<{ width: number; height: number } | null>(null)
 

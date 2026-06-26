@@ -34,6 +34,7 @@ export interface ReportDocumentPreviewProps {
   focusTarget?: { page?: number; field: string; value: string } | null
   highlightEnabled?: boolean
   onHighlightEnabledChange?: (enabled: boolean) => void
+  kbHighlightPhrases?: string[]
   className?: string
 }
 
@@ -52,6 +53,7 @@ export function ReportDocumentPreview({
   focusTarget,
   highlightEnabled,
   onHighlightEnabledChange,
+  kbHighlightPhrases,
   className,
 }: ReportDocumentPreviewProps) {
   const [htmlContent, setHtmlContent] = useState<string | null>(htmlContentProp ?? null)
@@ -169,6 +171,7 @@ export function ReportDocumentPreview({
         highlightEnabled={highlightEnabled}
         onHighlightEnabledChange={onHighlightEnabledChange}
         focusTarget={focusTarget}
+        kbHighlightPhrases={kbHighlightPhrases}
         className={className}
       />
     )

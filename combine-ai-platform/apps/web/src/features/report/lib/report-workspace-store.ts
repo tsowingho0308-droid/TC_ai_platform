@@ -1,4 +1,4 @@
-import type { PendingUploadFile } from "@/features/report/components/report-upload-queue"
+import type { PendingUploadFile } from "@/features/shared/components/agent-upload-queue"
 import { fileNeedsBlobUrl, previewKindFromFile } from "@/features/report/lib/report-preview-kind"
 
 const LAST_PATH_KEY = "report:last-path"
