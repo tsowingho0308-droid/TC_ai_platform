@@ -27,6 +27,7 @@ from .config import (
 )
 from .redis_client import get_redis
 from .dashscope_client import stream_completion
+from .parse_json import parse_ai_json
 
 
 class TaskProcessor:
@@ -186,11 +187,15 @@ class TaskProcessor:
                     messages.extend(tool_msgs)
 
             # ── Build final result ─────────────────────────────────
-            # Try to parse as JSON (the AI is instructed to return JSON)
+            # Try to parse as JSON (the AI is instructed to return JSON).
+            # Uses parse_ai_json which handles markdown code fences,
+            # leading/trailing noise, and malformed JSON — mirroring
+            # parseAIJson() in apps/web/src/lib/server/parse-json.ts
             result_data: dict = {}
-            try:
-                result_data = json.loads(accumulated_content) if accumulated_content else {}
-            except json.JSONDecodeError:
+            parsed = parse_ai_json(accumulated_content) if accumulated_content else None
+            if parsed:
+                result_data = parsed
+            else:
                 result_data = {
                     "answer": accumulated_content or "No response generated.",
                     "confidence": 0.5,

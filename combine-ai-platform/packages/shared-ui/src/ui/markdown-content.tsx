@@ -23,6 +23,11 @@ function preprocessContent(content: string): { text: string; isJson: boolean } {
     // If the unwrapped content is valid JSON, format it
     try {
       const parsed = JSON.parse(inner)
+      // Safety net: if this is a helpdesk agent response with an "answer" field,
+      // extract and render the answer as markdown instead of showing raw JSON
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "answer" in parsed && typeof parsed.answer === "string") {
+        return { text: parsed.answer, isJson: false }
+      }
       return {
         text: "```json\n" + JSON.stringify(parsed, null, 2) + "\n```",
         isJson: true,
@@ -41,6 +46,11 @@ function preprocessContent(content: string): { text: string; isJson: boolean } {
   ) {
     try {
       const parsed = JSON.parse(trimmed)
+      // Safety net: if this is a helpdesk agent response with an "answer" field,
+      // extract and render the answer as markdown instead of showing raw JSON
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "answer" in parsed && typeof parsed.answer === "string") {
+        return { text: parsed.answer, isJson: false }
+      }
       return {
         text: "```json\n" + JSON.stringify(parsed, null, 2) + "\n```",
         isJson: true,
